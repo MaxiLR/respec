@@ -29,7 +29,7 @@ from pathlib import Path
 
 import yaml
 
-from respec import items, profiles
+from respec import items, profiles, unknown
 from respec.errors import RespecError
 
 BASE_URL_ENV = profiles.GIT_BASE_URL_ENV
@@ -37,7 +37,7 @@ SHORTHAND = profiles.REPO_SHORTHAND
 SCP_LIKE = profiles.REPO_SCP_LIKE
 # Transports git may use: no remote helpers such as ``fd::`` or ``ext::``.
 ALLOWED_PROTOCOLS = "file:git:http:https:ssh"
-FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+FULL_SHA = re.compile(r"^[0-9a-f]{40}\Z")
 
 
 @dataclass(frozen=True)
@@ -114,8 +114,18 @@ LOCAL_GIT_ENV = (
 )
 
 
+# Commands that may contact a remote, and so may start ssh.
+REMOTE_COMMANDS = ("fetch", "ls-remote")
+BATCH_SSH = "ssh -o BatchMode=yes"
+
+
 def _git(*args: str, cwd: Path | None = None) -> str:
-    """Run git with prompts off and without the caller's repository variables.
+    """Run git without prompts and without the caller's repository variables.
+
+    ``GIT_TERMINAL_PROMPT=0`` stops git's own credential prompts, but not
+    ssh's host-key or password prompts, so remote commands run ssh in batch
+    mode unless the user configured their own ssh command (``GIT_SSH_COMMAND``,
+    ``GIT_SSH`` or ``core.sshCommand``). stdin is closed either way.
 
     Callers pass ``--end-of-options`` before any user-controlled value.
     """
@@ -128,20 +138,37 @@ def _git(*args: str, cwd: Path | None = None) -> str:
     }
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_ALLOW_PROTOCOL"] = ALLOWED_PROTOCOLS
+    if args[0] in REMOTE_COMMANDS and not _own_ssh(env, cwd):
+        env["GIT_SSH_COMMAND"] = BATCH_SSH
+    done = _run(["git", *args], cwd, env)
+    if done.returncode != 0:
+        raise RespecError(done.stderr.strip() or f"git {args[0]} failed")
+    return done.stdout
+
+
+def _run(
+    command: list[str], cwd: Path | None, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
     try:
-        done = subprocess.run(
-            ["git", *args],
+        return subprocess.run(
+            command,
             cwd=cwd,
             env=env,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             check=False,
         )
     except FileNotFoundError:
         raise RespecError("git is not installed or not on PATH") from None
-    if done.returncode != 0:
-        raise RespecError(done.stderr.strip() or f"git {args[0]} failed")
-    return done.stdout
+
+
+def _own_ssh(env: dict[str, str], cwd: Path | None) -> bool:
+    """Whether the user chose how git runs ssh."""
+    if env.get("GIT_SSH_COMMAND") or env.get("GIT_SSH"):
+        return True
+    found = _run(["git", "config", "--get", "core.sshCommand"], cwd, env)
+    return found.returncode == 0 and bool(found.stdout.strip())
 
 
 def remote_commit(url: str, ref: str | None, label: str) -> str:
@@ -211,7 +238,7 @@ def inside(tree: Path, path: str | None) -> Path:
 def _label(root: Path, entry: Path) -> str:
     """``entry`` relative to the repository root, for messages."""
     try:
-        return (entry.parent.resolve() / entry.name).relative_to(root).as_posix()
+        return unknown.real(entry).relative_to(root).as_posix()
     except ValueError:
         return entry.name
 
@@ -230,11 +257,17 @@ def copy_fetched(tree: Path, source: Path, destination: Path) -> None:
 
     Symlinks are never followed while copying out of the repository: the
     folder is first copied with links kept as links, then every link in that
-    copy must resolve (through any chain) to an entry strictly inside the
-    copied folder and must not point at a folder holding it. Only then is the
-    checked copy written to ``destination`` with links replaced by what they
-    point to, so the profile stays self-contained and a repository can never
-    make respec copy local files (such as ``~/.ssh`` keys) into a profile.
+    copy must resolve (through any chain) to a file strictly inside the
+    copied folder. Only then is the checked copy written to ``destination``
+    with links replaced by the files they point to, so the profile stays
+    self-contained and a repository can never make respec copy local files
+    (such as ``~/.ssh`` keys) into a profile.
+
+    Links to folders are refused rather than expanded: nested folder links
+    would copy their targets again at every level (a 100 kB repository could
+    write gigabytes) and sibling folder links can form copy loops. Each file
+    link adds at most one copy of one file, which a repository could also
+    get from duplicate files at the same fetch cost.
     Every failure is a :class:`RespecError` and leaves no ``destination``.
     """
     root = tree.resolve()
@@ -254,12 +287,29 @@ def copy_fetched(tree: Path, source: Path, destination: Path) -> None:
             shutil.rmtree(destination, ignore_errors=True)
             raise RespecError(
                 f"could not copy {_label(root, source)!r} from the repository: "
-                f"{error}"
+                f"{_reason(error)}"
             ) from None
 
 
+def _reason(error: OSError | shutil.Error) -> str:
+    """A one-line cause without the temporary paths ``shutil.Error`` lists."""
+    if (
+        isinstance(error, shutil.Error)
+        and error.args
+        and isinstance(error.args[0], list)
+    ):
+        failures = error.args[0]
+        first = str(failures[0][-1]) if failures else "copy failed"
+        more = f" (and {len(failures) - 1} more)" if len(failures) > 1 else ""
+        return first + more
+    if isinstance(error, OSError) and error.strerror:
+        return error.strerror
+    return str(error)
+
+
 def _check_links(folder: Path) -> None:
-    """Refuse symlinks in ``folder`` that leave it, dangle, or form loops."""
+    """Refuse symlinks in ``folder`` that leave it, dangle, loop, or name a
+    folder."""
     base = folder.resolve()
     for current, dirs, files in os.walk(folder):
         for name in dirs + files:
@@ -279,21 +329,25 @@ def _check_links(folder: Path) -> None:
                     f"symlink {label!r} points outside the skill folder; "
                     "refusing to copy it"
                 )
-            parent = entry.parent.resolve()
-            if target == parent or target in parent.parents:
+            if target.is_dir():
                 raise RespecError(
-                    f"symlink {label!r} points at a folder holding it; "
-                    "refusing to copy it"
+                    f"symlink {label!r} points to a folder; only links to files "
+                    "inside the skill folder are copied"
                 )
 
 
 # --- content -----------------------------------------------------------------
 
 
-def digest(folder: Path) -> str:
+def fetched_digest(folder: Path) -> str:
     """A hash of the folder's tree: every entry's relative path and kind, file
     contents and executable bits, and symlink targets (symlinks are not
-    followed), so added empty folders and symlinks count as edits too."""
+    followed), so added empty folders and symlinks count as edits too.
+
+    This is ``source.digest`` in ``profile.yaml``: the profile's copy as
+    fetched. It is not :func:`respec.unknown.digest`, which fingerprints
+    installed copies in target folders; the two are never compared.
+    """
     hasher = hashlib.sha256()
     entries: list[Path] = []
     for root, dirs, files in os.walk(folder):
@@ -384,7 +438,7 @@ def add(
                         path=path,
                         ref=ref,
                         commit=commit,
-                        digest=digest(staged),
+                        digest=fetched_digest(staged),
                     )
                     items.add_local(respec_home, name, staged, origin=source)
                     added.append(item)
@@ -442,7 +496,7 @@ def _modified(profile: profiles.Profile, item: str) -> bool:
     """Whether the item's files differ from what was fetched (unknown: True)."""
     source = profile.skills[item].source
     folder = profile.path / profiles.SKILLS_DIR / item
-    return source is None or source.digest != digest(folder)
+    return source is None or source.digest != fetched_digest(folder)
 
 
 def _latest(source: profiles.Source, cache: dict[tuple[str, str | None], str]) -> str:
@@ -581,7 +635,7 @@ def _replace(
         shutil.rmtree(incoming, ignore_errors=True)
         raise RespecError(f"could not replace {live}: {error}") from None
     replaced.append((live, old))
-    return dataclasses.replace(source, commit=commit, digest=digest(live))
+    return dataclasses.replace(source, commit=commit, digest=fetched_digest(live))
 
 
 def _restore(profile: profiles.Profile, replaced: list[tuple[Path, Path]]) -> None:

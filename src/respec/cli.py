@@ -1024,11 +1024,16 @@ def update(
         raise typer.Exit(code=1)
 
 
+def _short(commit: str | None) -> str:
+    """A commit for messages; items installed without one show as unknown."""
+    return commit[:12] if commit else "unknown"
+
+
 def _update_line(row: dict[str, Any]) -> str:
     name = row["item"]
     outcome = row["result"]
     if outcome == "updated":
-        return f"{name}  updated {row['current'][:12]} -> {row['latest'][:12]}"
+        return f"{name}  updated {_short(row['current'])} -> {_short(row['latest'])}"
     if outcome == "up-to-date":
         return f"{name}  up to date"
     if outcome == "skipped-local-edits":
@@ -1053,7 +1058,9 @@ def _update_check(
             if row.error:
                 state = f"error: {row.error}"
             elif row.update_available:
-                state = f"update available {row.current[:12]} -> {row.latest[:12]}"
+                state = (
+                    f"update available {_short(row.current)} -> {_short(row.latest)}"
+                )
             else:
                 state = "up to date"
             typer.echo(f"{row.item}  {state}{edits}")

@@ -1093,3 +1093,196 @@ def test_update_in_copy_mode_refreshes_copies_and_records_their_digest(
     assert recorded["tdd"]["digest"] == unknown.digest(copy)
     # The refreshed copy counts as managed: a later switch is not blocked.
     ok(run("use", "work"))
+
+
+# --- fix-4: hardening -------------------------------------------------------
+
+
+def tree_bytes(root: Path) -> int:
+    return sum(
+        file.stat().st_size
+        for file in root.rglob("*")
+        if file.is_file() and not file.is_symlink()
+    )
+
+
+def test_nested_folder_links_cannot_multiply_the_copied_files(
+    run, upstream, profiles_root
+):
+    repo = upstream("acme/bomb")
+    repo.write("SKILL.md", "# bomb\n")
+    repo.write("l0/blob", "x" * 10_000)
+    for level in range(1, 7):
+        (repo.work / f"l{level}").mkdir()
+        for name in ("a", "b"):
+            (repo.work / f"l{level}" / name).symlink_to(f"../l{level - 1}")
+    repo.commit()
+    new_profile(run)
+
+    result = fails(run("add", "acme/bomb", "-p", "work"))
+
+    assert "symlink" in result.output and "folder" in result.output
+    # Expanding the links would write 2**6 copies of the 10 kB blob.
+    assert tree_bytes(profiles_root) < 10_000
+    assert read_yaml(profiles_root, "work")["skills"] == {}
+
+
+def test_sibling_folder_link_loop_is_a_short_readable_error(
+    run, upstream, profiles_root
+):
+    repo = upstream("acme/loops")
+    repo.write("SKILL.md", "# loops\n")
+    for one, other in (("a", "e"), ("e", "a")):
+        (repo.work / one).mkdir()
+        (repo.work / one / "c").symlink_to(f"../{other}")
+    repo.commit()
+    new_profile(run)
+
+    result = fails(run("add", "acme/loops", "-p", "work"))
+
+    message = result.output.strip()
+    assert "symlink" in message
+    assert "respec-check-" not in message and "Errno" not in message
+    assert len(message) < 300, message
+    assert read_yaml(profiles_root, "work")["skills"] == {}
+
+
+def strip_commit(upstream, skills_repo):
+    pack = make_modpack(upstream, skills_repo)
+    data = yaml.safe_load((pack.work / "profile.yaml").read_text())
+    del data["skills"]["tdd"]["source"]["commit"]
+    pack.write("profile.yaml", yaml.safe_dump(data))
+    pack.commit()
+
+
+def test_check_of_item_without_recorded_commit_reports_unknown(
+    run, upstream, skills_repo
+):
+    strip_commit(upstream, skills_repo)
+    ok(run("profile", "install", "acme/modpack"))
+
+    result = ok(run("update", "--check", "-p", "modpack"))
+
+    assert f"tdd  update available unknown -> {skills_repo.first[:12]}" in (
+        result.output
+    )
+
+
+def test_update_of_item_without_recorded_commit_fetches_and_records_it(
+    run, upstream, skills_repo, profiles_root
+):
+    strip_commit(upstream, skills_repo)
+    ok(run("profile", "install", "acme/modpack"))
+
+    result = ok(run("update", "-p", "modpack", "--yes"))
+
+    assert f"tdd  updated unknown -> {skills_repo.first[:12]}" in result.output
+    source = read_yaml(profiles_root, "modpack")["skills"]["tdd"]["source"]
+    assert source["commit"] == skills_repo.first
+    assert source["digest"].startswith("sha256:")
+
+
+def test_failed_update_of_item_without_commit_changes_nothing(
+    run, upstream, skills_repo, profiles_root
+):
+    strip_commit(upstream, skills_repo)
+    ok(run("profile", "install", "acme/modpack"))
+    (skills_repo.work / "tdd" / "SKILL.md").unlink()
+    skills_repo.write("tdd/README.md", "moved\n")
+    skills_repo.commit()
+    folder = profiles_root / "modpack"
+    before = (folder / "profile.yaml").read_text()
+
+    result = fails(run("update", "-p", "modpack", "--yes"))
+
+    assert "tdd  error:" in result.output
+    assert (folder / "profile.yaml").read_text() == before
+    assert (folder / "skills" / "tdd" / "SKILL.md").read_text() == "# tdd v1\n"
+    assert sorted(p.name for p in (folder / "skills").iterdir()) == ["house", "tdd"]
+
+
+def test_names_with_a_trailing_newline_are_rejected(run, profiles_root):
+    result = run("profile", "new", "bad\n", "--target", "agents")
+
+    assert result.exit_code != 0
+    assert not any(profiles_root.glob("bad*"))
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("repo", "acme/skills\n"),
+        ("repo", "https://example.invalid/r\n"),
+        ("repo", "git@example.invalid:acme/r\n"),
+        ("ref", "main\n"),
+    ],
+)
+def test_source_values_with_a_trailing_newline_are_rejected(key, value):
+    from respec import profiles
+
+    assert profiles.source_value_problem(key, value) is not None
+
+
+def test_commit_ref_with_a_trailing_newline_is_not_taken_as_a_commit(skills_repo):
+    from respec import sources
+    from respec.errors import RespecError
+
+    with pytest.raises(RespecError):
+        sources.remote_commit(skills_repo.url, skills_repo.first + "\n", "skills")
+
+
+@pytest.mark.parametrize("repo", ["../x", "./x", "acme/..", "acme/.", "../.."])
+def test_shorthand_with_dot_segments_is_rejected(run, sourced, profiles_root, repo):
+    data = read_yaml(profiles_root, "work")
+    data["skills"]["tdd"]["source"]["repo"] = repo
+    write_profile_yaml(profiles_root, "work", data)
+
+    result = fails(run("update", "--check", "-p", "work"))
+
+    assert "repo" in result.output and "URL" in result.output
+
+
+@pytest.fixture
+def fake_ssh(tmp_path, monkeypatch):
+    """An ``ssh`` on PATH that records how git ran it and then fails."""
+    bin_dir = tmp_path / "ssh-bin"
+    bin_dir.mkdir()
+    log = tmp_path / "ssh.log"
+    script = bin_dir / "ssh"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'echo "ssh $* prompt=$GIT_TERMINAL_PROMPT" >> "{log}"\n'
+        "exit 255\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+    monkeypatch.delenv("GIT_SSH", raising=False)
+    return log
+
+
+def test_ssh_runs_in_batch_mode_with_prompts_off(fake_ssh):
+    from respec import sources
+    from respec.errors import RespecError
+
+    with pytest.raises(RespecError):
+        sources.remote_commit("git@example.invalid:acme/x", None, "acme/x")
+
+    logged = fake_ssh.read_text()
+    assert "BatchMode=yes" in logged
+    assert "prompt=0" in logged
+
+
+def test_users_own_ssh_command_is_kept(fake_ssh):
+    from respec import sources
+    from respec.errors import RespecError
+
+    config = Path(os.environ["GIT_CONFIG_GLOBAL"])
+    config.write_text("[core]\n\tsshCommand = ssh -o User=mine\n")
+
+    with pytest.raises(RespecError):
+        sources.remote_commit("git@example.invalid:acme/x", None, "acme/x")
+
+    logged = fake_ssh.read_text()
+    assert "User=mine" in logged
+    assert "BatchMode" not in logged

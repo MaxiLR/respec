@@ -42,7 +42,8 @@ from respec.targets import known_names, registry
 
 PROFILE_FILE = "profile.yaml"
 SKILLS_DIR = "skills"
-NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# ``\Z``, not ``$``: ``$`` also matches before a trailing newline.
+NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 NAME_RULE = "use letters, digits, '.', '_' or '-', starting with a letter or digit"
 
 TOP_LEVEL_KEYS = ("targets", "skills", "layers")
@@ -236,9 +237,10 @@ def _unknown_keys(where: str, data: dict[Any, Any], allowed: tuple[str, ...]):
 
 GIT_BASE_URL_ENV = "RESPEC_GIT_BASE_URL"
 DEFAULT_GIT_BASE_URL = "https://github.com"
-REPO_SHORTHAND = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+# ``owner/repo`` where neither part is ``.`` or ``..``.
+REPO_SHORTHAND = re.compile(r"^(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?\Z)[A-Za-z0-9_.-]+\Z")
 REPO_SCP_LIKE = re.compile(r"^[\w.-]+@[\w.-]+:")
-REPO_URL = re.compile(r"^(https?|ssh|git|file)://\S+$")
+REPO_URL = re.compile(r"^(https?|ssh|git|file)://\S+\Z")
 
 
 def git_base_url() -> str:
@@ -281,6 +283,8 @@ def source_value_problem(key: str, value: str) -> str | None:
     """
     if value.startswith("-"):
         return f"source {key} {value!r} must not start with '-'"
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        return f"source {key} {value!r} must not contain control characters"
     if key == "repo":
         return _repo_problem(value)
     if key == "path" and (
