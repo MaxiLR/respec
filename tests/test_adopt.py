@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 
 import pytest
 import yaml
@@ -298,6 +299,75 @@ def test_item_change_is_rolled_back_when_replaced_link_blocks_refresh(
     assert profile_skills(respec_home, "a")["lint"] == {"enabled": True}
     assert active_profile(respec_home) == "a"
     assert (dirs["claude-code"] / "lint").is_symlink()
+
+
+# --- a recorded copy replaced or edited by something else -----------------
+
+
+@pytest.fixture
+def activated_as_copy(run, respec_home, dirs, monkeypatch):
+    """Like ``activated``, but symlinks fail so tdd is installed as a copy."""
+    make_profile(respec_home, "a", ["claude-code"], ["tdd"])
+    make_profile(respec_home, "b", ["claude-code"], ["lint"])
+
+    def refuse(*args, **kwargs):
+        raise OSError("symlinks not permitted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "symlink", refuse)
+        ok(run("use", "a"))
+    copy = dirs["claude-code"] / "tdd"
+    assert copy.is_dir() and not copy.is_symlink()
+    return copy
+
+
+def test_replaced_copy_is_reported_as_unknown_not_as_managed(
+    run, activated_as_copy, dirs
+):
+    shutil.rmtree(activated_as_copy)
+    drop_skill(dirs["claude-code"], "tdd", "FOREIGN TOOL CONTENT\n")
+
+    folder = folder_report(status_json(run), "claude-code")
+
+    assert folder["items"] == []
+    assert [(u["name"], u["replaced"]) for u in folder["unknown"]] == [("tdd", True)]
+
+
+def test_replaced_copy_blocks_switch_and_is_not_deleted(
+    run, activated_as_copy, respec_home, dirs
+):
+    shutil.rmtree(activated_as_copy)
+    drop_skill(dirs["claude-code"], "tdd", "FOREIGN TOOL CONTENT\n")
+
+    blocked = run("use", "b")
+
+    assert blocked.exit_code == 1
+    assert str(activated_as_copy) in blocked.output
+    assert (activated_as_copy / "SKILL.md").read_text() == "FOREIGN TOOL CONTENT\n"
+    assert active_profile(respec_home) == "a"
+
+
+def test_edited_copy_is_backed_up_before_the_switch_removes_it(
+    run, activated_as_copy, respec_home, dirs
+):
+    (activated_as_copy / "SKILL.md").write_text("edited by hand\n")
+
+    ok(run("use", "b", "--unknown", "backup"))
+
+    assert sorted(p.name for p in dirs["claude-code"].iterdir()) == ["lint"]
+    assert "edited by hand\n" in backup_files(respec_home).values()
+
+
+def test_unmodified_copy_stays_managed_and_is_replaced_on_switch(
+    run, activated_as_copy, dirs
+):
+    folder = folder_report(status_json(run), "claude-code")
+    assert [(i["name"], i["mode"]) for i in folder["items"]] == [("tdd", "copy")]
+    assert folder["unknown"] == []
+
+    ok(run("use", "b"))
+
+    assert sorted(p.name for p in dirs["claude-code"].iterdir()) == ["lint"]
 
 
 # --- respec adopt -----------------------------------------------------------

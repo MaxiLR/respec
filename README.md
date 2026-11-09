@@ -26,8 +26,10 @@ folder, then installs the new profile into its own targets. The first time
 respec takes over a target folder it copies the folder's full contents to
 `~/.respec/backups/<timestamp>/<target>/`. Installing respec changes nothing.
 
-Entries in an owned folder that respec did not create are _unknown_: `status`
-lists them, and before a switch each one needs a choice: `add` (copy it into
+Entries in an owned folder that respec did not create are _unknown_. So is a
+recorded path that no longer holds what respec put there: a symlink replaced by
+something else, or a copy whose content was edited or replaced. `status` lists
+them, and before a switch each one needs a choice: `add` (copy it into
 the profile being activated, then manage it), `backup` (move it to
 `~/.respec/backups/<timestamp>/<target>/`) or `keep` (leave it, unmanaged, and
 stop asking). A terminal asks per entry; other runs stop unless
