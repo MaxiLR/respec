@@ -35,20 +35,8 @@ class Homes:
 
 
 @app.callback(invoke_without_command=True)
-def main(
-    ctx: typer.Context,
-    home: Annotated[
-        Optional[Path],
-        typer.Option(
-            "--home",
-            envvar=paths.USER_HOME_ENV,
-            help="Home directory that target skill folders resolve against.",
-            show_default="~",
-        ),
-    ] = None,
-) -> None:
-    user_home = paths.user_home(home)
-    ctx.obj = Homes(respec_home=paths.respec_home(), user_home=user_home)
+def main(ctx: typer.Context) -> None:
+    ctx.obj = Homes(respec_home=paths.respec_home(), user_home=paths.user_home())
     if ctx.invoked_subcommand is None:
         if not _interactive():
             # No terminal (pipe, script, CI): print help instead of the TUI.

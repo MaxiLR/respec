@@ -3,7 +3,7 @@
 # Shaped after the skills.sh agent registry (vercel-labs/skills, src/agents.ts,
 # MIT): each entry has a name, a display name and its global skills directory.
 # Directories starting with "~/" resolve against the user home, which tests and
-# experiments can relocate with RESPEC_USER_HOME or `respec --home`.
+# experiments can relocate with the RESPEC_USER_HOME environment variable.
 # Add more targets by pull request.
 targets:
   - name: claude-code
