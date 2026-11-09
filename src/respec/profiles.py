@@ -12,6 +12,7 @@ schema of ``profile.yaml``::
           path: skills/my-skill      # optional
           ref: main                  # optional
           commit: 0123abcd           # optional resolved commit
+          digest: sha256:...         # optional hash of the files as fetched
     layers:                          # optional; named groups of skills
       design-principles:             # built-in: only items and active allowed
         items: [my-skill]
@@ -46,7 +47,7 @@ NAME_RULE = "use letters, digits, '.', '_' or '-', starting with a letter or dig
 
 TOP_LEVEL_KEYS = ("targets", "skills", "layers")
 SKILL_KEYS = ("enabled", "source")
-SOURCE_KEYS = ("repo", "path", "ref", "commit")
+SOURCE_KEYS = ("repo", "path", "ref", "commit", "digest")
 LAYER_KEYS = ("exclusive", "description", "items", "active")
 BUILTIN_LAYER_KEYS = ("items", "active")
 
@@ -83,6 +84,7 @@ class Source:
     path: str | None = None
     ref: str | None = None
     commit: str | None = None
+    digest: str | None = None
 
     def to_dict(self) -> dict[str, str]:
         return {key: value for key, value in vars(self).items() if value is not None}

@@ -62,12 +62,15 @@ def add_local(
     source: Path,
     enabled: bool = True,
     name: str | None = None,
+    origin: profiles.Source | None = None,
 ) -> profiles.Profile:
     """Copy the skill folder ``source`` into a profile and record it.
 
     The item is called ``name``, or after the source folder (after resolving
-    symlinks) when no name is given. Target folders are not touched. Returns
-    the updated profile. On failure nothing is left behind in the profile.
+    symlinks) when no name is given. ``origin`` is recorded as the item's
+    ``source`` (where it was fetched from). Target folders are not touched.
+    Returns the updated profile. On failure nothing is left behind in the
+    profile.
     """
     profile = profiles.load_profile(respec_home, profile_name)
     source = Path(source).expanduser().resolve()
@@ -98,7 +101,7 @@ def add_local(
     try:
         shutil.copytree(source, destination)
         skills = dict(profile.skills)
-        skills[item] = profiles.SkillEntry(enabled=enabled)
+        skills[item] = profiles.SkillEntry(enabled=enabled, source=origin)
         updated = dataclasses.replace(profile, skills=skills)
         profiles.save_profile(updated)
     except (OSError, shutil.Error) as error:
@@ -134,6 +137,21 @@ def _refresh(
     installed = {item.path for item in result.installed}
     change.linked = sorted(installed - removed)
     change.unlinked = sorted(removed - installed)
+
+
+def refresh_active(
+    respec_home: Path,
+    user_home: Path,
+    change: object,
+    undo: Callable[[], None],
+) -> None:
+    """Re-apply ``change.profile`` if it is the active profile.
+
+    Fills in ``change.active``, ``linked`` and ``unlinked``. When the switch
+    preflight refuses, ``undo()`` runs and :class:`switch.SwitchBlocked` is
+    raised. For callers whose undo needs more than restoring ``profile.yaml``.
+    """
+    _refresh(respec_home, user_home, change, undo)
 
 
 def commit(
