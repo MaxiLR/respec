@@ -33,7 +33,7 @@ Clock = Callable[[], datetime]
 UnknownHandler = Callable[[list[unknown.Unknown]], None]
 
 
-def _utc_now() -> datetime:
+def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
@@ -73,7 +73,7 @@ def backups_dir(respec_home: Path) -> Path:
     return respec_home / "backups"
 
 
-def _new_backup_run(respec_home: Path, moment: datetime) -> Path:
+def new_backup_run(respec_home: Path, moment: datetime) -> Path:
     """Create a fresh backup run folder; never reuse one from the same second."""
     stamp = moment.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     parent = backups_dir(respec_home)
@@ -153,7 +153,7 @@ def _take_over(
         backup: str | None = None
         if folder.is_dir():
             if run_dir is None:
-                run_dir = _new_backup_run(respec_home, moment)
+                run_dir = new_backup_run(respec_home, moment)
             destination = run_dir / target
             try:
                 shutil.copytree(folder, destination, symlinks=True)
@@ -175,7 +175,7 @@ def _take_over(
     return backups
 
 
-def _remove(respec_home: Path, item: Installed) -> bool:
+def remove_installed(respec_home: Path, item: Installed) -> bool:
     """Remove one recorded path that still holds what respec created there.
 
     Never follows links into profile folders. A path that was replaced or
@@ -241,7 +241,7 @@ def use(
     respec_home: Path,
     user_home: Path,
     name: str,
-    now: Clock = _utc_now,
+    now: Clock = utc_now,
     on_unknown: UnknownHandler | None = None,
 ) -> SwitchResult:
     """Activate profile ``name``; see the module docstring for the order.
@@ -269,7 +269,7 @@ def use(
     state.active_profile = None
     try:
         for item in list(state.installed):
-            if _remove(respec_home, item):
+            if remove_installed(respec_home, item):
                 result.removed.append(item)
             state.installed.remove(item)
             save_state(respec_home, state)

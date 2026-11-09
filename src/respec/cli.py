@@ -13,6 +13,7 @@ import typer
 
 from respec import adopt as adopt_entries
 from respec import items, layers, paths, profiles, switch, targets, unknown
+from respec import restore as restore_backups
 from respec.errors import RespecError
 from respec.state import load_state
 
@@ -808,3 +809,125 @@ def adopt(
         typer.echo("Choose with --add, --backup or --keep <name>, or --all <choice>.")
     elif not result.resolved:
         typer.echo("No unknown entries.")
+
+
+@app.command("restore")
+def restore(
+    ctx: typer.Context,
+    backup: Annotated[
+        Optional[str],
+        typer.Argument(
+            help="Backup run to restore (default: each folder's takeover backup).",
+            show_default=False,
+        ),
+    ] = None,
+    list_only: Annotated[
+        bool, typer.Option("--list", help="List available backups and stop.")
+    ] = False,
+    on_unknown: Annotated[
+        Optional[UnknownChoice],
+        typer.Option(
+            "--unknown",
+            help=(
+                "What to do with every unknown entry the backup would overwrite: "
+                "add (to the profile), backup (and remove) or keep (unmanaged)."
+            ),
+            show_default=False,
+        ),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Back up entries the backup would overwrite, then replace them.",
+        ),
+    ] = False,
+    profile: Annotated[
+        Optional[str],
+        typer.Option(
+            "--profile",
+            "-p",
+            help="Profile that 'add' copies into (default: the active profile).",
+            show_default=False,
+        ),
+    ] = None,
+    as_json: JsonOption = False,
+) -> None:
+    """Put a backup back and release every folder respec owns."""
+    homes = _homes(ctx)
+    if list_only:
+        try:
+            found = restore_backups.list_backups(homes.respec_home)
+        except RespecError as error:
+            _fail(error)
+        if as_json:
+            _print_json([b.to_dict() for b in found])
+            return
+        if not found:
+            typer.echo("No backups.")
+        for entry in found:
+            kind = f"takeover of {', '.join(entry.takeover)}" if entry.takeover else ""
+            typer.echo(f"{entry.name}  {', '.join(entry.targets)}  {kind}".rstrip())
+        return
+    interactive = _interactive() and not as_json
+    resolutions: list[adopt_entries.Resolution] = []
+    decide: adopt_entries.Decide | None = None
+    if on_unknown is not None:
+        policy = on_unknown.value
+        decide = lambda entry: policy  # noqa: E731
+    elif interactive and not overwrite:
+        label = profile or load_state(homes.respec_home).active_profile
+        decide = lambda entry: _prompt_choice(entry, label)  # noqa: E731
+
+    handler: switch.UnknownHandler | None = None
+    if decide is not None:
+        chosen = decide
+
+        def handler(entries: list[unknown.Unknown]) -> None:
+            resolutions.extend(
+                adopt_entries.resolve(homes.respec_home, entries, chosen, profile)
+            )
+
+    def attempt(confirmed: bool) -> restore_backups.RestoreResult:
+        return restore_backups.restore(
+            homes.respec_home,
+            homes.user_home,
+            backup,
+            on_unknown=handler,
+            overwrite=confirmed,
+        )
+
+    try:
+        try:
+            result = attempt(overwrite)
+        except restore_backups.RestoreBlocked as blocked:
+            if not interactive:
+                raise
+            typer.echo(str(blocked))
+            if not typer.confirm("Back these up and overwrite them?"):
+                raise
+            result = attempt(True)
+    except RespecError as error:
+        for resolution in resolutions:
+            _report_resolution(resolution)
+        _fail(error)
+    if as_json:
+        _print_json(
+            {
+                "backup": result.backup,
+                "restored": result.restored,
+                "removed": [item.path for item in result.removed],
+                "overwritten": [r.to_dict() for r in result.set_aside],
+                "unknown": [r.to_dict() for r in resolutions],
+                "released": result.released,
+            }
+        )
+        return
+    for resolution in resolutions + result.set_aside:
+        _report_resolution(resolution)
+    if result.removed:
+        typer.echo(f"Removed {len(result.removed)} respec items")
+    for target, source in result.restored.items():
+        origin = source if source else "nothing (folder did not exist)"
+        typer.echo(f"Restored {target} from {origin}")
+    typer.echo("respec released its folders; no profile is active.")
