@@ -58,7 +58,7 @@ class UnknownEntries(SwitchBlocked):
         self.entries = entries
         lines = "\n".join(
             f"  - {entry.path} ({entry.kind}"
-            + (", replaced an item respec installed)" if entry.replaced else ")")
+            + (", replaced a skill respec installed)" if entry.replaced else ")")
             for entry in entries
         )
         super().__init__(
@@ -320,7 +320,7 @@ def use(
         save_state(respec_home, state)
         raise RespecError(
             f"switch to profile {profile.name!r} did not complete: {error}\n"
-            "No profile is active. Items installed so far are recorded in "
+            "No profile is active. Skills installed so far are recorded in "
             "state.json and are removed by the next 'respec use'."
         ) from None
 
@@ -330,7 +330,7 @@ def use(
 
 
 def status(respec_home: Path) -> dict[str, object]:
-    """Active profile, its targets and the items respec placed in each folder."""
+    """Active profile, its targets and the skills respec placed in each folder."""
     state = load_state(respec_home)
     active_targets: list[str] = []
     if state.active_profile is not None:
@@ -351,7 +351,7 @@ def status(respec_home: Path) -> dict[str, object]:
         {
             "target": target,
             "skills_dir": entry.skills_dir,
-            "items": [
+            "skills": [
                 {"name": item.name, "path": item.path, "mode": item.mode}
                 for item in sorted(state.installed, key=lambda i: i.name)
                 if item.target in sharing.get(target, ())

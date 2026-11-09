@@ -7,8 +7,8 @@ Switchable global profiles of agent skills across coding harnesses (Claude Code,
 ```sh
 respec               # open the TUI (also: respec tui)
 respec profile new work --target claude-code --target agents
-respec use work      # switch: remove the previous profile's items, link this one's
-respec status        # active profile, targets and managed items per folder
+respec use work      # switch: remove the previous profile's skills, link this one's
+respec status        # active profile, targets and managed skills per folder
 respec add ./my-skill [-p work]   # copy a skill folder (with SKILL.md) into a profile
 respec disable my-skill [-p work] # stop linking it; files and metadata stay
 respec enable my-skill [-p work]
@@ -16,7 +16,7 @@ respec remove my-skill [-p work]  # drop it from profile.yaml and delete its fol
 respec adopt [--add|--backup|--keep <entry>] [--all <choice>] [-p work]
 respec restore [<backup>] [--list] [--unknown add|backup|keep] [--overwrite]
 respec add owner/repo[#path] [--ref main] [-p work]  # fetch skill(s) from git
-respec update --check [-p work]   # which sourced items have newer commits
+respec update --check [-p work]   # which sourced skills have newer commits
 respec update [my-skill] [-p work] [--yes]  # apply; --yes overwrites local edits
 respec profile install owner/repo[#path] [--name mine]  # copy a whole profile once
 ```
@@ -29,20 +29,20 @@ refreshed right away. Every command accepts `--json`.
 default `https://github.com`) or a git URL with an optional `#path`; an
 existing local folder of the same name wins. A path holding `SKILL.md` adds that
 skill; otherwise every subfolder (or `skills/` subfolder) holding one is added.
-Each item records its source repo, path, ref, resolved commit and a digest of
-the fetched files in `profile.yaml`. Updates are explicit and never touch items
-without a source. When an item's files no longer match the digest, `update`
+Each skill records its source repo, path, ref, resolved commit and a digest of
+the fetched files in `profile.yaml`. Updates are explicit and never touch skills
+without a source. When a skill's files no longer match the digest, `update`
 asks before overwriting them (with `--json` it skips them unless `--yes`).
 Fetched skills may only contain symlinks to files inside the skill's own
 folder; they are copied as plain files, and links to folders are refused. Git
 never prompts: ssh runs with `BatchMode=yes` unless you set your own ssh
 command (`GIT_SSH_COMMAND`, `GIT_SSH` or `core.sshCommand`). A source `repo`
 must be `owner/repo`, `user@host:path` or an https, http, ssh or git URL; local
-paths and other git transports are refused. Items installed by
+paths and other git transports are refused. Skills installed by
 `profile install` have no recorded digest, so their first `update` asks before
 overwriting.
 `profile install` copies a repository's `profile.yaml` and listed `skills/`
-once; the profile is then owned locally and its items keep their own sources.
+once; the profile is then owned locally and its skills keep their own sources.
 
 `respec use` links every enabled skill of the profile into each of its targets'
 folders (symlinks, or copies where symlinking fails) and records every created
@@ -63,11 +63,11 @@ resolves unknown entries outside a switch (`--add` copies into the active
 profile unless `-p` names another). Nothing is removed before it is copied into
 a profile or a backup.
 
-`respec restore` undoes respec: it removes every item respec manages, puts each
+`respec restore` undoes respec: it removes every skill respec manages, puts each
 owned folder back to the backup taken when respec first took it over (a folder
 that did not exist then is removed again once empty), clears `state.json` and
 leaves no profile active. `respec restore <backup>` restores the target folders
-of that run instead; `--list` shows the runs. respec's own items in a backup are
+of that run instead; `--list` shows the runs. respec's own skills in a backup are
 skipped and reported: symlinks into profiles, and copies that the run's
 `manifest.json` records as installed by respec when the backup was taken.
 Entries the backup would overwrite (unknown ones, edited copies, or kept entries
@@ -91,18 +91,18 @@ resolves them outside a switch, `r` refreshes and `q` quits.
 respec layer list [-p work]                     # built-in and custom layers
 respec layer use design-principles my-design    # exclusive: the others are disabled
 respec layer add review --additive -d "Code review helpers"
-respec layer add-item review my-review          # group items; enable/disable as one
+respec layer add-skill review my-review         # group skills; enable/disable as one
 respec layer disable review
-respec layer off design-principles              # its rules lapse; items stay
+respec layer off design-principles              # its rules lapse; skills stay
 ```
 
-A layer is a named group inside one profile that only decides which items are
+A layer is a named group inside one profile that only decides which skills are
 enabled; it never changes where they are installed. An exclusive layer keeps at
-most one item enabled. Built-in layers are `design-principles` (design principles
+most one skill enabled. Built-in layers are `design-principles` (design principles
 only, never component libraries or project tokens) and `output-style`, which
-accepts no items until output styles are supported. Built-ins cannot be removed,
-only turned off. Items outside layers, and items of a layer that is off, are
-plain additive items.
+accepts no skills until output styles are supported. Built-ins cannot be
+removed, only turned off. Skills outside layers, and skills of a layer that is
+off, are plain additive skills.
 
 ## Development
 

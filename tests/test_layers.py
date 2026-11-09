@@ -66,7 +66,7 @@ def test_new_profile_lists_builtin_layers_with_descriptions(run):
     assert set(by_name) == {"design-principles", "output-style"}
     design = by_name["design-principles"]
     assert design["exclusive"] is True and design["builtin"] is True
-    assert design["active"] is True and design["items"] == []
+    assert design["active"] is True and design["skills"] == []
     assert "principles" in design["description"]
     assert "component libraries" in design["description"]
     assert "tokens" in design["description"]
@@ -96,7 +96,7 @@ def test_adding_enabled_item_to_exclusive_layer_keeps_current_choice(
 ):
     ok(run("layer", "use", "design-principles", "a"))
 
-    ok(run("layer", "add-item", "design-principles", "b"))
+    ok(run("layer", "add-skill", "design-principles", "b"))
 
     assert read_yaml(profiles_root)["layers"]["design-principles"]["items"] == [
         "a",
@@ -110,7 +110,7 @@ def test_plain_enable_of_exclusive_member_disables_the_previous_one(
     run, work, profiles_root, claude_dir
 ):
     ok(run("layer", "use", "design-principles", "a"))
-    ok(run("layer", "add-item", "design-principles", "b"))
+    ok(run("layer", "add-skill", "design-principles", "b"))
 
     ok(run("enable", "b"))
 
@@ -131,8 +131,8 @@ def test_custom_additive_layer_enables_and_disables_as_a_group(
             "Code review helpers",
         )
     )
-    ok(run("layer", "add-item", "review", "a"))
-    ok(run("layer", "add-item", "review", "b"))
+    ok(run("layer", "add-skill", "review", "a"))
+    ok(run("layer", "add-skill", "review", "b"))
 
     ok(run("layer", "disable", "review"))
     assert enabled_items(profiles_root) == {"c"}
@@ -162,7 +162,7 @@ def test_custom_exclusive_layer_show_and_rm(run, work, profiles_root, claude_dir
         "description": "Writing tone",
         "builtin": False,
         "active": True,
-        "items": [
+        "skills": [
             {"name": "a", "enabled": False},
             {"name": "b", "enabled": True},
         ],
@@ -183,7 +183,7 @@ def test_builtin_layer_cannot_be_removed_but_can_be_turned_off(
     assert "built-in" in fails(run("layer", "rm", "design-principles"))
 
     ok(run("layer", "use", "design-principles", "a"))
-    ok(run("layer", "add-item", "design-principles", "b"))
+    ok(run("layer", "add-skill", "design-principles", "b"))
     ok(run("layer", "off", "design-principles"))
 
     assert read_yaml(profiles_root)["layers"]["design-principles"]["active"] is False
@@ -202,10 +202,10 @@ def test_builtin_layer_cannot_be_removed_but_can_be_turned_off(
     assert "active" not in read_yaml(profiles_root)["layers"]["design-principles"]
 
 
-def test_output_style_layer_accepts_no_items(run, work, profiles_root):
+def test_output_style_layer_accepts_no_skills(run, work, profiles_root):
     before = read_yaml(profiles_root)
 
-    for command in ("use", "add-item"):
+    for command in ("use", "add-skill"):
         output = fails(run("layer", command, "output-style", "a"))
         assert "output styles are not supported yet" in output
 
@@ -214,7 +214,7 @@ def test_output_style_layer_accepts_no_items(run, work, profiles_root):
 
 def test_layers_never_change_install_locations(run, work, claude_dir, tmp_path):
     ok(run("layer", "add", "review", "--additive", "--description", "Review"))
-    ok(run("layer", "add-item", "review", "a"))
+    ok(run("layer", "add-skill", "review", "a"))
     ok(run("layer", "use", "design-principles", "b"))
 
     for name in ("a", "b", "c"):
@@ -232,7 +232,7 @@ def test_removing_an_item_drops_it_from_its_layer(run, work, profiles_root):
     ok(run("remove", "a"))
 
     shown = json.loads(ok(run("layer", "show", "design-principles", "--json")).output)
-    assert shown["items"] == []
+    assert shown["skills"] == []
     assert "a" not in read_yaml(profiles_root)["skills"]
 
 
@@ -251,7 +251,7 @@ def test_schema_rejects_bad_layers(run, work, profiles_root):
 
     assert "layers.design-principles: unknown key 'exclusive'" in output
     assert "layers.design-principles" in output and "exclusive" in output
-    assert "output-style" in output and "accepts no items" in output
+    assert "output-style" in output and "accepts no skills" in output
     assert "layers.review.exclusive must be true or false" in output
     assert "layers.review.description is required" in output
     assert "'zzz'" in output
@@ -263,7 +263,7 @@ def test_switch_refused_when_preflight_blocks_leaves_profile_unchanged(
     run, work, profiles_root, claude_dir
 ):
     ok(run("layer", "add", "review", "--additive", "--description", "Review"))
-    ok(run("layer", "add-item", "review", "a"))
+    ok(run("layer", "add-skill", "review", "a"))
     ok(run("layer", "disable", "review"))
     (claude_dir / "a").mkdir()  # an unmanaged entry occupies a's install path
     before = read_yaml(profiles_root)

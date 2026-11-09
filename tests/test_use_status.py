@@ -303,7 +303,7 @@ def test_status_json_shows_profile_targets_and_items_per_folder(
             {
                 "target": "claude-code",
                 "skills_dir": str(dirs["claude-code"]),
-                "items": [],
+                "skills": [],
                 "same_as": None,
                 "unknown": [],
                 "unmanaged": [],
@@ -311,7 +311,7 @@ def test_status_json_shows_profile_targets_and_items_per_folder(
             {
                 "target": "agents",
                 "skills_dir": str(dirs["agents"]),
-                "items": [
+                "skills": [
                     {
                         "name": "lint",
                         "path": str(dirs["agents"] / "lint"),
