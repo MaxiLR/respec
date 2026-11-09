@@ -5,6 +5,7 @@ Switchable global profiles of agent skills across coding harnesses (Claude Code,
 ## Usage
 
 ```sh
+respec               # open the TUI (also: respec tui)
 respec profile new work --target claude-code --target agents
 respec use work      # switch: remove the previous profile's items, link this one's
 respec status        # active profile, targets and managed items per folder
@@ -37,6 +38,14 @@ stop asking). A terminal asks per entry; other runs stop unless
 resolves unknown entries outside a switch (`--add` copies into the active
 profile unless `-p` names another). Nothing is removed before it is copied into
 a profile or a backup.
+
+### TUI
+
+`respec` without a command (or `respec tui`) opens a terminal UI: profiles on
+the left with the active one marked, each owned target folder on the right.
+Select a profile with the arrow keys or a click, then press Enter or click
+**Activate**. Unknown entries open a dialog with the same three choices; `a`
+resolves them outside a switch, `r` refreshes and `q` quits.
 
 ### Layers
 

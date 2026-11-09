@@ -17,8 +17,7 @@ from respec.errors import RespecError
 from respec.state import load_state
 
 app = typer.Typer(
-    help="Switchable global profiles of agent skills.",
-    no_args_is_help=True,
+    help="Switchable global profiles of agent skills. Without a command, opens the TUI.",
     pretty_exceptions_enable=False,
 )
 profile_app = typer.Typer(help="Create and inspect profiles.", no_args_is_help=True)
@@ -35,7 +34,7 @@ class Homes:
     user_home: Path
 
 
-@app.callback()
+@app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
     home: Annotated[
@@ -50,6 +49,31 @@ def main(
 ) -> None:
     user_home = paths.user_home(home)
     ctx.obj = Homes(respec_home=paths.respec_home(), user_home=user_home)
+    if ctx.invoked_subcommand is None:
+        if not _interactive():
+            # No terminal (pipe, script, CI): print help instead of the TUI.
+            typer.echo(ctx.get_help())
+            raise typer.Exit()
+        _open_tui(ctx.obj)
+
+
+def _open_tui(homes: Homes) -> None:
+    if not _interactive():
+        typer.echo(
+            "error: the TUI needs a terminal (stdin and stdout must be a TTY); "
+            "use the respec commands instead (see 'respec --help')",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    from respec.tui import RespecApp
+
+    RespecApp(respec_home=homes.respec_home, user_home=homes.user_home).run()
+
+
+@app.command("tui")
+def tui(ctx: typer.Context) -> None:
+    """Open the terminal UI (same as running respec without a command)."""
+    _open_tui(_homes(ctx))
 
 
 def _homes(ctx: typer.Context) -> Homes:
