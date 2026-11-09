@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Annotated, Any, NoReturn, Optional
 
 import typer
 
-from respec import items, layers, paths, profiles, switch, targets
+from respec import adopt as adopt_entries
+from respec import items, layers, paths, profiles, switch, targets, unknown
 from respec.errors import RespecError
+from respec.state import load_state
 
 app = typer.Typer(
     help="Switchable global profiles of agent skills.",
@@ -197,17 +201,89 @@ def profile_show(
         typer.echo(f"  {skill:<{width}}  {state}{origin}".rstrip())
 
 
+def _interactive() -> bool:
+    """Whether a person can answer prompts on this terminal."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _prompt_choice(entry: unknown.Unknown, profile: str | None) -> str:
+    """Ask what to do with one unknown entry."""
+    replaced = ", replaced an item respec installed" if entry.replaced else ""
+    typer.echo(
+        f"Unknown entry {entry.path} ({entry.kind} in "
+        f"{', '.join(entry.targets)}{replaced})"
+    )
+    destination = f"profile {profile!r}" if profile else "profile (needs -p)"
+    while True:
+        answer = typer.prompt(
+            f"  add: add to {destination} / backup: back up and remove / "
+            "keep: keep unmanaged [add/backup/keep]"
+        ).strip()
+        if answer in adopt_entries.CHOICES:
+            return answer
+        typer.echo(f"  please answer one of: {', '.join(adopt_entries.CHOICES)}")
+
+
+def _report_resolution(resolution: adopt_entries.Resolution) -> None:
+    entry = resolution.entry
+    if resolution.choice == "add":
+        typer.echo(f"Added {entry.path} to profile {resolution.profile!r}")
+    elif resolution.choice == "backup":
+        typer.echo(f"Backed up {entry.path} to {resolution.backup} and removed it")
+    else:
+        typer.echo(f"Kept {entry.path} unmanaged")
+
+
+class UnknownChoice(str, Enum):
+    add = "add"
+    backup = "backup"
+    keep = "keep"
+
+
 @app.command("use")
 def use(
     ctx: typer.Context,
     name: Annotated[str, typer.Argument(help="Profile to activate.")],
+    on_unknown: Annotated[
+        Optional[UnknownChoice],
+        typer.Option(
+            "--unknown",
+            help=(
+                "What to do with every unknown entry in owned folders: add "
+                "(to this profile), backup (and remove) or keep (unmanaged). "
+                "Without it, a terminal asks per entry; other runs stop."
+            ),
+            show_default=False,
+        ),
+    ] = None,
     as_json: JsonOption = False,
 ) -> None:
     """Activate a profile: remove the previous profile's items, install this one."""
     homes = _homes(ctx)
+    resolutions: list[adopt_entries.Resolution] = []
+    decide: adopt_entries.Decide | None = None
+    if on_unknown is not None:
+        policy = on_unknown.value
+        decide = lambda entry: policy  # noqa: E731
+    elif _interactive() and not as_json:
+        decide = lambda entry: _prompt_choice(entry, name)  # noqa: E731
+
+    handler: switch.UnknownHandler | None = None
+    if decide is not None:
+        chosen = decide
+
+        def handler(entries: list[unknown.Unknown]) -> None:
+            resolutions.extend(
+                adopt_entries.resolve(homes.respec_home, entries, chosen, name)
+            )
+
     try:
-        result = switch.use(homes.respec_home, homes.user_home, name)
+        result = switch.use(
+            homes.respec_home, homes.user_home, name, on_unknown=handler
+        )
     except RespecError as error:
+        for resolution in resolutions:
+            _report_resolution(resolution)
         _fail(error)
     if as_json:
         _print_json(
@@ -217,9 +293,12 @@ def use(
                 "backups": result.backups,
                 "removed": [item.path for item in result.removed],
                 "installed": [vars(item) for item in result.installed],
+                "unknown": [resolution.to_dict() for resolution in resolutions],
             }
         )
         return
+    for resolution in resolutions:
+        _report_resolution(resolution)
     for target, backup in result.backups.items():
         typer.echo(f"Backed up {target} folder to {backup}")
     if result.removed:
@@ -247,12 +326,27 @@ def status(ctx: typer.Context, as_json: JsonOption = False) -> None:
     else:
         typer.echo(f"Active profile: {report['active_profile']}")
         typer.echo(f"Targets: {', '.join(report['targets'])}")
+    any_unknown = False
     for folder in report["folders"]:
         typer.echo(f"{folder['target']}  {folder['skills_dir']}")
+        if folder["same_as"]:
+            typer.echo(f"  (same folder as {folder['same_as']})")
+            continue
         if not folder["items"]:
             typer.echo("  (no managed items)")
         for item in folder["items"]:
             typer.echo(f"  {item['name']}  {item['mode']}")
+        for entry in folder["unknown"]:
+            any_unknown = True
+            replaced = ", replaced a managed item" if entry["replaced"] else ""
+            typer.echo(f"  {entry['name']}  unknown {entry['kind']}{replaced}")
+        for entry in folder["unmanaged"]:
+            typer.echo(f"  {entry['name']}  unmanaged (kept)")
+    if any_unknown:
+        typer.echo(
+            "Unknown entries were not placed by respec. Resolve them with "
+            "'respec adopt' (add to profile, back up and remove, or keep)."
+        )
 
 
 ProfileOption = Annotated[
@@ -584,3 +678,109 @@ def layer_off(
 ) -> None:
     """Turn a layer off: its items become plain additive items."""
     _layer_flag_command(ctx, layers.set_active, name, False, profile, as_json)
+
+
+def _selector_matches(selector: str, entry: unknown.Unknown) -> bool:
+    if selector == entry.name or selector == entry.path:
+        return True
+    return unknown.real(Path(selector).expanduser().absolute()) == unknown.real(
+        entry.path
+    )
+
+
+@app.command("adopt")
+def adopt(
+    ctx: typer.Context,
+    add_entries: Annotated[
+        list[str],
+        typer.Option(
+            "--add", help="Add this entry (name or path) to the profile. Repeatable."
+        ),
+    ] = [],
+    backup_entries: Annotated[
+        list[str],
+        typer.Option(
+            "--backup", help="Back up and remove this entry (name or path). Repeatable."
+        ),
+    ] = [],
+    keep_entries: Annotated[
+        list[str],
+        typer.Option(
+            "--keep", help="Keep this entry (name or path) unmanaged. Repeatable."
+        ),
+    ] = [],
+    all_choice: Annotated[
+        Optional[UnknownChoice],
+        typer.Option(
+            "--all",
+            help="Choice for every entry not named by --add, --backup or --keep.",
+            show_default=False,
+        ),
+    ] = None,
+    profile: Annotated[
+        Optional[str],
+        typer.Option(
+            "--profile",
+            "-p",
+            help="Profile that --add copies into (default: the active profile).",
+            show_default=False,
+        ),
+    ] = None,
+    as_json: JsonOption = False,
+) -> None:
+    """Resolve unknown entries in folders respec owns.
+
+    Without choices, a terminal asks per entry; other runs only list them.
+    """
+    homes = _homes(ctx)
+    try:
+        entries = adopt_entries.find(homes.respec_home)
+        chosen: dict[str, str] = {}
+        for choice, selectors in (
+            ("add", add_entries),
+            ("backup", backup_entries),
+            ("keep", keep_entries),
+        ):
+            for selector in selectors:
+                matches = [e for e in entries if _selector_matches(selector, e)]
+                if not matches:
+                    raise RespecError(f"no unknown entry matches {selector!r}")
+                for entry in matches:
+                    if chosen.get(entry.path, choice) != choice:
+                        raise RespecError(f"{entry.path} was given two choices")
+                    chosen[entry.path] = choice
+        prompt = _interactive() and not as_json
+        label = profile or load_state(homes.respec_home).active_profile
+
+        def decide(entry: unknown.Unknown) -> str | None:
+            if entry.path in chosen:
+                return chosen[entry.path]
+            if all_choice is not None:
+                return all_choice.value
+            return _prompt_choice(entry, label) if prompt else None
+
+        result = adopt_entries.adopt(
+            homes.respec_home, homes.user_home, decide, profile
+        )
+    except RespecError as error:
+        _fail(error)
+    if as_json:
+        _print_json(
+            {
+                "resolved": [r.to_dict() for r in result.resolved],
+                "linked": result.linked,
+                "unknown": [e.to_dict() for e in result.unknown],
+            }
+        )
+        return
+    for resolution in result.resolved:
+        _report_resolution(resolution)
+    for path in result.linked:
+        typer.echo(f"  linked {path}")
+    if result.unknown:
+        typer.echo("Unknown entries left as they are:")
+        for entry in result.unknown:
+            typer.echo(f"  {entry.path}  ({entry.kind})")
+        typer.echo("Choose with --add, --backup or --keep <name>, or --all <choice>.")
+    elif not result.resolved:
+        typer.echo("No unknown entries.")

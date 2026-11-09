@@ -152,8 +152,9 @@ def test_folder_is_backed_up_only_on_first_takeover(run, isolated_homes, dirs):
     make_profile(isolated_homes.respec_home, "a", ["claude-code"], {"tdd": True})
     make_profile(isolated_homes.respec_home, "b", ["claude-code"], {"lint": True})
 
+    # loose.txt stays in the owned folder; keep it unmanaged when asked.
     assert run("use", "a").exit_code == 0
-    assert run("use", "b").exit_code == 0
+    assert run("use", "b", "--unknown", "keep").exit_code == 0
     assert run("use", "a").exit_code == 0
 
     backups = isolated_homes.respec_home / "backups"
@@ -177,7 +178,8 @@ def test_backups_taken_in_the_same_second_do_not_collide(
 
     homes = (isolated_homes.respec_home, isolated_homes.home)
     switch.use(*homes, "a", now=lambda: frozen)
-    switch.use(*homes, "b", now=lambda: frozen)
+    # first.txt stays in the owned claude-code folder; leave it as it is.
+    switch.use(*homes, "b", now=lambda: frozen, on_unknown=lambda entries: None)
 
     runs = sorted((isolated_homes.respec_home / "backups").iterdir())
     assert len(runs) == 2
@@ -236,7 +238,7 @@ def test_switch_only_removes_recorded_paths_and_keeps_profile_folders(
     (dirs["claude-code"] / "foreign" / "SKILL.md").write_text("foreign\n")
     profile_a_before = tree(profile_a)
 
-    assert run("use", "b").exit_code == 0
+    assert run("use", "b", "--unknown", "keep").exit_code == 0
 
     assert sorted(p.name for p in dirs["claude-code"].iterdir()) == [
         "foreign",
@@ -302,6 +304,9 @@ def test_status_json_shows_profile_targets_and_items_per_folder(
                 "target": "claude-code",
                 "skills_dir": str(dirs["claude-code"]),
                 "items": [],
+                "same_as": None,
+                "unknown": [],
+                "unmanaged": [],
             },
             {
                 "target": "agents",
@@ -318,6 +323,9 @@ def test_status_json_shows_profile_targets_and_items_per_folder(
                         "mode": "symlink",
                     },
                 ],
+                "same_as": None,
+                "unknown": [],
+                "unmanaged": [],
             },
         ],
     }
