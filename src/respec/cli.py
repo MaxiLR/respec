@@ -50,10 +50,21 @@ def main(
     user_home = paths.user_home(home)
     ctx.obj = Homes(respec_home=paths.respec_home(), user_home=user_home)
     if ctx.invoked_subcommand is None:
+        if not _interactive():
+            # No terminal (pipe, script, CI): print help instead of the TUI.
+            typer.echo(ctx.get_help())
+            raise typer.Exit()
         _open_tui(ctx.obj)
 
 
 def _open_tui(homes: Homes) -> None:
+    if not _interactive():
+        typer.echo(
+            "error: the TUI needs a terminal (stdin and stdout must be a TTY); "
+            "use the respec commands instead (see 'respec --help')",
+            err=True,
+        )
+        raise typer.Exit(code=1)
     from respec.tui import RespecApp
 
     RespecApp(respec_home=homes.respec_home, user_home=homes.user_home).run()

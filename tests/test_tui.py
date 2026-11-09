@@ -6,6 +6,8 @@ Driven headless through Textual's Pilot against the temporary homes from
 
 import asyncio
 import json
+import subprocess
+import sys
 
 import pytest
 import yaml
@@ -86,15 +88,43 @@ def two_profiles(respec_home, run):
 
 
 @pytest.mark.parametrize("args", [[], ["tui"]])
-def test_respec_without_command_or_tui_opens_the_tui(args, run, monkeypatch):
+def test_respec_without_command_or_tui_opens_the_tui_on_a_terminal(
+    args, run, monkeypatch
+):
+    from respec import cli
     from respec.tui import RespecApp
 
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
     opened = []
     monkeypatch.setattr(RespecApp, "run", lambda self, **kwargs: opened.append(self))
 
     ok(run(*args))
 
     assert len(opened) == 1
+
+
+def run_without_terminal(*args):
+    """Run the real respec CLI in a subprocess with piped, non-TTY streams."""
+    code = "import sys; from respec.cli import app; sys.argv[0] = 'respec'; app()"
+    return subprocess.run(
+        [sys.executable, "-c", code, *args],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+
+def test_bare_respec_without_terminal_prints_help_and_exits():
+    result = run_without_terminal()
+    assert result.returncode == 0, result.stderr
+    assert "Usage" in result.stdout and "use" in result.stdout
+
+
+def test_respec_tui_without_terminal_fails_with_a_clear_error():
+    result = run_without_terminal("tui")
+    assert result.returncode != 0
+    assert "terminal" in result.stderr
 
 
 def test_help_still_lists_commands(run):
@@ -310,3 +340,53 @@ def test_status_panel_flags_unknown_and_adopt_key_keeps_it(
     assert claude["unknown"] == []
     assert [entry["name"] for entry in claude["unmanaged"]] == ["stray"]
     assert (dirs["claude-code"] / "stray").is_dir()
+
+
+def test_entry_appearing_after_the_dialog_opened_blocks_the_switch(
+    isolated_homes, two_profiles, dirs, run
+):
+    first = drop_skill(dirs["claude-code"], "stray")
+
+    async def scenario(app, pilot):
+        await pilot.click("#profile-beta")
+        await pilot.click("#activate")
+        await pilot.pause()
+        await pilot.click("#unknown-0-backup")
+        late = drop_skill(dirs["agents"], "late")
+        await pilot.click("#apply")
+        await pilot.pause()
+        # Asked again, now about every entry, before anything changed.
+        paths = [text_of(w) for w in app.screen.query(".unknown-path")]
+        assert any(str(late) in path for path in paths)
+        assert any(str(first) in path for path in paths)
+
+    drive(isolated_homes, scenario)
+
+    assert status_json(run)["active_profile"] == "alpha"
+    assert (first / "SKILL.md").read_text() == "foreign\n"
+    assert (dirs["agents"] / "late" / "SKILL.md").read_text() == "foreign\n"
+
+
+def test_failed_switch_after_choices_reports_what_was_resolved(
+    isolated_homes, respec_home, two_profiles, dirs, run
+):
+    drop_skill(dirs["claude-code"], "stray")
+    # beta's enabled skill has no folder: the switch fails after the choices.
+    (respec_home / "profiles" / "beta" / "skills" / "b1" / "SKILL.md").unlink()
+    (respec_home / "profiles" / "beta" / "skills" / "b1").rmdir()
+
+    async def scenario(app, pilot):
+        await pilot.click("#profile-beta")
+        await pilot.click("#activate")
+        await pilot.pause()
+        await pilot.click("#unknown-0-backup")
+        await pilot.click("#apply")
+        await pilot.pause()
+        feedback = text_of(app.query_one("#feedback"))
+        assert "error" in feedback.lower()
+        assert "Backed up" in feedback and "stray" in feedback
+
+    drive(isolated_homes, scenario)
+
+    assert status_json(run)["active_profile"] == "alpha"
+    assert not (dirs["claude-code"] / "stray").exists()
