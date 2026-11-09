@@ -9,7 +9,7 @@ from typing import Annotated, Any, NoReturn, Optional
 
 import typer
 
-from respec import paths, profiles, targets
+from respec import paths, profiles, switch, targets
 from respec.errors import RespecError
 
 app = typer.Typer(
@@ -195,3 +195,61 @@ def profile_show(
         state = "enabled " if entry.enabled else "disabled"
         origin = f"  {_source_label(entry.source)}" if entry.source else ""
         typer.echo(f"  {skill:<{width}}  {state}{origin}".rstrip())
+
+
+@app.command("use")
+def use(
+    ctx: typer.Context,
+    name: Annotated[str, typer.Argument(help="Profile to activate.")],
+    as_json: JsonOption = False,
+) -> None:
+    """Activate a profile: remove the previous profile's items, install this one."""
+    homes = _homes(ctx)
+    try:
+        result = switch.use(homes.respec_home, homes.user_home, name)
+    except RespecError as error:
+        _fail(error)
+    if as_json:
+        _print_json(
+            {
+                "active_profile": result.profile,
+                "previous_profile": result.previous,
+                "backups": result.backups,
+                "removed": [item.path for item in result.removed],
+                "installed": [vars(item) for item in result.installed],
+            }
+        )
+        return
+    for target, backup in result.backups.items():
+        typer.echo(f"Backed up {target} folder to {backup}")
+    if result.removed:
+        previous = f" of profile {result.previous!r}" if result.previous else ""
+        typer.echo(f"Removed {len(result.removed)} items{previous}")
+    typer.echo(
+        f"Switched to profile {result.profile!r}: "
+        f"installed {len(result.installed)} items"
+    )
+
+
+@app.command("status")
+def status(ctx: typer.Context, as_json: JsonOption = False) -> None:
+    """Show the active profile, its targets and the items in each folder."""
+    homes = _homes(ctx)
+    try:
+        report = switch.status(homes.respec_home)
+    except RespecError as error:
+        _fail(error)
+    if as_json:
+        _print_json(report)
+        return
+    if report["active_profile"] is None:
+        typer.echo("No active profile. Activate one with 'respec use <profile>'.")
+    else:
+        typer.echo(f"Active profile: {report['active_profile']}")
+        typer.echo(f"Targets: {', '.join(report['targets'])}")
+    for folder in report["folders"]:
+        typer.echo(f"{folder['target']}  {folder['skills_dir']}")
+        if not folder["items"]:
+            typer.echo("  (no managed items)")
+        for item in folder["items"]:
+            typer.echo(f"  {item['name']}  {item['mode']}")
