@@ -110,7 +110,11 @@ def _refresh(
     change: ItemChange,
     undo: Callable[[], None],
 ) -> None:
-    """Re-apply the profile when it is active; fill in the link changes."""
+    """Re-apply the profile when it is active; fill in the link changes.
+
+    ``change`` is any object with ``profile``, ``active``, ``linked`` and
+    ``unlinked`` attributes (an :class:`ItemChange` or a layer change).
+    """
     if load_state(respec_home).active_profile != change.profile:
         return
     change.active = True
@@ -125,6 +129,18 @@ def _refresh(
     installed = {item.path for item in result.installed}
     change.linked = sorted(installed - removed)
     change.unlinked = sorted(removed - installed)
+
+
+def commit(
+    respec_home: Path,
+    user_home: Path,
+    before: profiles.Profile,
+    after: profiles.Profile,
+    change: ItemChange,
+) -> None:
+    """Save ``after`` and refresh an active profile; restore ``before`` if refused."""
+    profiles.save_profile(after)
+    _refresh(respec_home, user_home, change, lambda: profiles.save_profile(before))
 
 
 def add(
@@ -182,13 +198,11 @@ def set_enabled(
         path=str(_skill_folder(profile, item)),
         active=load_state(respec_home).active_profile == profile.name,
     )
-    entry = profile.skills[item]
-    if entry.enabled == enabled:
+    if profile.skills[item].enabled == enabled:
         return change
-    skills = dict(profile.skills)
-    skills[item] = dataclasses.replace(entry, enabled=enabled)
-    profiles.save_profile(dataclasses.replace(profile, skills=skills))
-    _refresh(respec_home, user_home, change, lambda: profiles.save_profile(profile))
+    # Enabling a member of an active exclusive layer disables the previous one.
+    after = profiles.with_enabled(profile, [item], enabled)
+    commit(respec_home, user_home, profile, after, change)
     return change
 
 
@@ -205,7 +219,13 @@ def remove(
         profile=profile.name, item=item, action="remove", enabled=None, path=str(folder)
     )
     skills = {name: entry for name, entry in profile.skills.items() if name != item}
-    profiles.save_profile(dataclasses.replace(profile, skills=skills))
+    layers = {
+        name: dataclasses.replace(
+            layer, items=tuple(member for member in layer.items if member != item)
+        )
+        for name, layer in profile.layers.items()
+    }
+    profiles.save_profile(dataclasses.replace(profile, skills=skills, layers=layers))
     try:
         _refresh(respec_home, user_home, change, lambda: profiles.save_profile(profile))
     except switch.SwitchBlocked:

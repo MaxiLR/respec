@@ -25,6 +25,25 @@ folder, then installs the new profile into its own targets. The first time
 respec takes over a target folder it copies the folder's full contents to
 `~/.respec/backups/<timestamp>/<target>/`. Installing respec changes nothing.
 
+### Layers
+
+```sh
+respec layer list [-p work]                     # built-in and custom layers
+respec layer use design-principles my-design    # exclusive: the others are disabled
+respec layer add review --additive -d "Code review helpers"
+respec layer add-item review my-review          # group items; enable/disable as one
+respec layer disable review
+respec layer off design-principles              # its rules lapse; items stay
+```
+
+A layer is a named group inside one profile that only decides which items are
+enabled; it never changes where they are installed. An exclusive layer keeps at
+most one item enabled. Built-in layers are `design-principles` (design principles
+only, never component libraries or project tokens) and `output-style`, which
+accepts no items until output styles are supported. Built-ins cannot be removed,
+only turned off. Items outside layers, and items of a layer that is off, are
+plain additive items.
+
 ## Development
 
 ```sh
