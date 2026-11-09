@@ -761,3 +761,173 @@ def test_check_sees_added_folders_and_symlinks_as_local_edits(
         (folder / "link").symlink_to(tmp_path / "target")
 
     assert check(run)["tdd"]["modified"] is True
+
+
+# --- unknown entries (ticket 004) and symlinks ------------------------------
+
+
+def test_add_from_git_into_active_profile_is_blocked_by_unknown_entries(
+    run, upstream, profiles_root, claude_dir
+):
+    repo = upstream("acme/tdd")
+    repo.write("SKILL.md", "# tdd\n")
+    repo.commit()
+    new_profile(run)
+    ok(run("use", "work"))
+    (claude_dir / "stranger").mkdir(parents=True)
+    (claude_dir / "stranger" / "SKILL.md").write_text("# not respec\n")
+
+    result = fails(run("add", "acme/tdd"))
+
+    assert "stranger" in result.output
+    assert read_yaml(profiles_root, "work")["skills"] == {}
+    assert not (profiles_root / "work" / "skills" / "tdd").exists()
+    assert not (claude_dir / "tdd").exists()
+    assert (claude_dir / "stranger" / "SKILL.md").read_text() == "# not respec\n"
+
+
+def test_update_of_active_profile_is_blocked_by_unknown_entries(
+    run, sourced, profiles_root, claude_dir
+):
+    ok(run("use", "work"))
+    sourced.write("tdd/SKILL.md", "# tdd v2\n")
+    sourced.commit()
+    (claude_dir / "stranger").mkdir()
+
+    result = fails(run("update", "tdd", "--yes"))
+
+    assert "stranger" in result.output
+    skills = profiles_root / "work" / "skills"
+    assert (skills / "tdd" / "SKILL.md").read_text() == "# tdd v1\n"
+    assert sorted(p.name for p in skills.iterdir()) == ["lint", "mine", "tdd"]
+    source = read_yaml(profiles_root, "work")["skills"]["tdd"]["source"]
+    assert source["commit"] == sourced.first
+    assert (claude_dir / "tdd" / "SKILL.md").read_text() == "# tdd v1\n"
+
+
+@pytest.fixture
+def secret(tmp_path):
+    folder = tmp_path / "private"
+    folder.mkdir()
+    (folder / "id_rsa").write_text("PRIVATE KEY\n")
+    return folder
+
+
+def symlinked_repo(upstream, secret, slug, prefix=""):
+    repo = upstream(slug)
+    repo.write(f"{prefix}SKILL.md", "# evil\n")
+    (repo.work / prefix / "key.txt").symlink_to(secret / "id_rsa")
+    (repo.work / prefix / "keys").symlink_to(secret)
+    repo.commit()
+    return repo
+
+
+def no_secret_copied(root):
+    for file in root.rglob("*"):
+        if file.is_file() and not file.is_symlink():
+            assert "PRIVATE KEY" not in file.read_text(errors="ignore"), file
+
+
+def test_add_refuses_symlinks_pointing_outside_the_repository(
+    run, upstream, secret, profiles_root
+):
+    symlinked_repo(upstream, secret, "acme/evil")
+    new_profile(run)
+
+    result = fails(run("add", "acme/evil", "-p", "work"))
+
+    assert "symlink" in result.output
+    no_secret_copied(profiles_root)
+    assert read_yaml(profiles_root, "work")["skills"] == {}
+    assert not (profiles_root / "work" / "skills" / "evil").exists()
+
+
+def test_add_keeps_symlinks_inside_the_skill(run, upstream, profiles_root):
+    repo = upstream("acme/linked")
+    repo.write("SKILL.md", "# linked\n")
+    repo.write("docs/guide.md", "guide\n")
+    (repo.work / "guide.md").symlink_to("docs/guide.md")
+    repo.commit()
+    new_profile(run)
+
+    ok(run("add", "acme/linked", "-p", "work"))
+
+    copied = profiles_root / "work" / "skills" / "linked" / "guide.md"
+    assert copied.read_text() == "guide\n"
+
+
+def test_update_refuses_symlinks_pointing_outside_the_repository(
+    run, sourced, secret, profiles_root
+):
+    (sourced.work / "tdd" / "key.txt").symlink_to(secret / "id_rsa")
+    sourced.commit()
+
+    result = fails(run("update", "tdd", "-p", "work", "--yes"))
+
+    assert "symlink" in result.output
+    no_secret_copied(profiles_root)
+    skills = profiles_root / "work" / "skills"
+    assert (skills / "tdd" / "SKILL.md").read_text() == "# tdd v1\n"
+    assert sorted(p.name for p in skills.iterdir()) == ["lint", "mine", "tdd"]
+
+
+def test_profile_install_refuses_symlinks_pointing_outside_the_repository(
+    run, upstream, secret, profiles_root
+):
+    pack = upstream("acme/evilpack")
+    pack.write(
+        "profile.yaml",
+        yaml.safe_dump({"targets": ["agents"], "skills": {"a": {"enabled": True}}}),
+    )
+    pack.write("skills/a/SKILL.md", "# a\n")
+    (pack.work / "skills" / "a" / "keys").symlink_to(secret)
+    pack.commit()
+
+    result = fails(run("profile", "install", "acme/evilpack"))
+
+    assert "symlink" in result.output
+    no_secret_copied(profiles_root)
+    assert not (profiles_root / "evilpack").exists()
+
+
+def test_profile_install_refuses_symlinked_profile_file_and_item_folder(
+    run, upstream, secret, profiles_root
+):
+    (secret / "profile.yaml").write_text(
+        yaml.safe_dump({"targets": ["agents"], "skills": {"a": {"enabled": True}}})
+    )
+    (secret / "skills" / "a").mkdir(parents=True)
+    (secret / "skills" / "a" / "SKILL.md").write_text("PRIVATE KEY\n")
+    pack = upstream("acme/linkedpack")
+    pack.write("README.md", "x\n")
+    (pack.work / "profile.yaml").symlink_to(secret / "profile.yaml")
+    pack.commit()
+    other = upstream("acme/linkeditem")
+    other.write(
+        "profile.yaml",
+        yaml.safe_dump({"targets": ["agents"], "skills": {"a": {"enabled": True}}}),
+    )
+    (other.work / "skills").mkdir()
+    (other.work / "skills" / "a").symlink_to(secret / "skills" / "a")
+    other.commit()
+
+    assert "symlink" in fails(run("profile", "install", "acme/linkedpack")).output
+    assert "symlink" in fails(run("profile", "install", "acme/linkeditem")).output
+
+    no_secret_copied(profiles_root)
+    assert not (profiles_root / "linkedpack").exists()
+    assert not (profiles_root / "linkeditem").exists()
+
+
+def test_add_path_to_folder_of_skills_adds_each(run, upstream, profiles_root):
+    repo = upstream("acme/nested")
+    repo.write("packs/web/one/SKILL.md", "# one\n")
+    repo.write("packs/web/two/SKILL.md", "# two\n")
+    repo.commit()
+    new_profile(run)
+
+    ok(run("add", "acme/nested#packs/web", "-p", "work"))
+
+    skills = read_yaml(profiles_root, "work")["skills"]
+    assert skills["one"]["source"]["path"] == "packs/web/one"
+    assert skills["two"]["source"]["path"] == "packs/web/two"

@@ -169,7 +169,7 @@ def remote_commit(url: str, ref: str | None, label: str) -> str:
 def checkout(url: str, ref: str | None, label: str) -> Iterator[tuple[Path, str]]:
     """Fetch ``ref`` of ``url`` into a temporary work tree; yield (tree, commit)."""
     with tempfile.TemporaryDirectory(prefix="respec-git-") as temporary:
-        tree = Path(temporary) / "repo"
+        tree = Path(temporary).resolve() / "repo"
         try:
             _git("init", "-q", str(tree))
             if ref is not None and FULL_SHA.match(ref):
@@ -203,7 +203,48 @@ def inside(tree: Path, path: str | None) -> Path:
     target = (tree / path).resolve()
     if target != root and root not in target.parents:
         raise RespecError(f"source path {path!r} must stay inside the repository")
-    return target
+    return tree / path
+
+
+def _label(root: Path, entry: Path) -> str:
+    """``entry`` relative to the repository root, for messages."""
+    try:
+        return (entry.parent.resolve() / entry.name).relative_to(root).as_posix()
+    except ValueError:
+        return entry.name
+
+
+def _within(root: Path, entry: Path) -> None:
+    target = entry.resolve()
+    if target != root and root not in target.parents:
+        raise RespecError(
+            f"symlink {_label(root, entry)!r} points outside the repository; "
+            "refusing to copy it"
+        )
+
+
+def copy_fetched(tree: Path, source: Path, destination: Path) -> None:
+    """Copy ``source`` (inside the fetched ``tree``) to ``destination``.
+
+    Symlinks are refused unless they resolve inside ``tree`` and do not point
+    at a folder containing them, so a repository cannot make respec copy local
+    files (such as ``~/.ssh`` keys) into a profile. Links that pass are copied
+    as the files and folders they point to, keeping the profile self-contained.
+    """
+    root = tree.resolve()
+    _within(root, source)
+    for folder, dirs, files in os.walk(source):
+        for name in dirs + files:
+            entry = Path(folder) / name
+            if not entry.is_symlink():
+                continue
+            _within(root, entry)
+            target, parent = entry.resolve(), entry.parent.resolve()
+            if target == parent or target in parent.parents:
+                raise RespecError(
+                    f"symlink {_label(root, entry)!r} points at a " "folder holding it"
+                )
+    shutil.copytree(source, destination)
 
 
 # --- content -----------------------------------------------------------------
@@ -297,7 +338,7 @@ def add(
             with tempfile.TemporaryDirectory(prefix="respec-stage-") as staging:
                 for item, path in found:
                     staged = Path(staging) / item
-                    shutil.copytree(inside(tree, path), staged)
+                    copy_fetched(tree, inside(tree, path), staged)
                     source = profiles.Source(
                         repo=spec.repo,
                         path=path,
@@ -488,7 +529,7 @@ def _replace(
                 f"{source.repo} at {commit[:12]} has no {items.SKILL_FILE} "
                 f"in {source.path or 'its root'}"
             )
-        shutil.copytree(upstream, incoming)
+        copy_fetched(tree, upstream, incoming)
     os.replace(live, old)
     try:
         os.replace(incoming, live)
@@ -532,6 +573,7 @@ def install_profile(
         file = folder / profiles.PROFILE_FILE
         if not file.is_file():
             raise RespecError(f"{where} has no {profiles.PROFILE_FILE}")
+        _within(tree.resolve(), file)
         try:
             data = yaml.safe_load(file.read_text("utf-8"))
         except yaml.YAMLError as error:
@@ -553,11 +595,15 @@ def install_profile(
         try:
             (destination / profiles.SKILLS_DIR).mkdir(parents=True)
             for item in profile.skills:
-                shutil.copytree(
+                copy_fetched(
+                    tree,
                     folder / profiles.SKILLS_DIR / item,
                     destination / profiles.SKILLS_DIR / item,
                 )
             profiles.save_profile(profile)
+        except RespecError:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise
         except (OSError, shutil.Error) as error:
             shutil.rmtree(destination, ignore_errors=True)
             raise RespecError(f"could not install profile {name!r}: {error}") from None
