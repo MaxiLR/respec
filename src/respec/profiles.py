@@ -12,13 +12,25 @@ schema of ``profile.yaml``::
           path: skills/my-skill      # optional
           ref: main                  # optional
           commit: 0123abcd           # optional resolved commit
+    layers:                          # optional; named groups of skills
+      design-principles:             # built-in: only items and active allowed
+        items: [my-skill]
+      my-layer:                      # custom layer
+        exclusive: false             # required boolean
+        description: What belongs    # required string
+        items: [other-skill]         # optional; each skill in at most one layer
+        active: false                # optional; false turns the layer's rules off
+
+Layers only decide which items are enabled, never where they are installed.
+An active exclusive layer has at most one enabled item. Items outside layers,
+and items of a layer that is turned off, are plain additive items.
 """
 
 from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -32,9 +44,27 @@ SKILLS_DIR = "skills"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 NAME_RULE = "use letters, digits, '.', '_' or '-', starting with a letter or digit"
 
-TOP_LEVEL_KEYS = ("targets", "skills")
+TOP_LEVEL_KEYS = ("targets", "skills", "layers")
 SKILL_KEYS = ("enabled", "source")
 SOURCE_KEYS = ("repo", "path", "ref", "commit")
+LAYER_KEYS = ("exclusive", "description", "items", "active")
+BUILTIN_LAYER_KEYS = ("items", "active")
+
+OUTPUT_STYLE = "output-style"
+OUTPUT_STYLE_UNSUPPORTED = (
+    "output styles are not supported yet; "
+    f"the {OUTPUT_STYLE!r} layer accepts no items until they are"
+)
+BUILTIN_LAYERS: dict[str, str] = {
+    "design-principles": (
+        "Design principles only: how interfaces should look, read and behave. "
+        "Never component libraries or project tokens."
+    ),
+    OUTPUT_STYLE: (
+        "How the agent writes its replies. Reserved: accepts no items until "
+        "output styles are supported."
+    ),
+}
 
 
 class ProfileError(RespecError):
@@ -71,17 +101,98 @@ class SkillEntry:
 
 
 @dataclass(frozen=True)
+class Layer:
+    exclusive: bool
+    description: str
+    items: tuple[str, ...] = ()
+    active: bool = True
+    builtin: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {}
+        if not self.builtin:
+            data["exclusive"] = self.exclusive
+            data["description"] = self.description
+        if self.items or self.builtin:
+            data["items"] = list(self.items)
+        if not self.active:
+            data["active"] = False
+        return data
+
+
+def builtin_layers() -> dict[str, Layer]:
+    return {
+        name: Layer(exclusive=True, description=description, builtin=True)
+        for name, description in BUILTIN_LAYERS.items()
+    }
+
+
+@dataclass(frozen=True)
 class Profile:
     name: str
     path: Path
     targets: list[str]
     skills: dict[str, SkillEntry] = field(default_factory=dict)
+    layers: dict[str, Layer] = field(default_factory=builtin_layers)
 
     def to_yaml_data(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "targets": list(self.targets),
             "skills": {name: entry.to_dict() for name, entry in self.skills.items()},
         }
+        layers = {
+            name: layer.to_dict()
+            for name, layer in self.layers.items()
+            if not (layer.builtin and not layer.items and layer.active)
+        }
+        if layers:
+            data["layers"] = layers
+        return data
+
+    def layer_of(self, item: str) -> str | None:
+        """Name of the layer listing ``item``, or ``None``."""
+        for name, layer in self.layers.items():
+            if item in layer.items:
+                return name
+        return None
+
+
+def exclusivity_problems(profile: Profile) -> list[str]:
+    """Active exclusive layers with more than one enabled item."""
+    problems: list[str] = []
+    for name, layer in profile.layers.items():
+        if not (layer.exclusive and layer.active):
+            continue
+        enabled = [
+            item
+            for item in layer.items
+            if item in profile.skills and profile.skills[item].enabled
+        ]
+        if len(enabled) > 1:
+            problems.append(
+                f"layer {name!r} is exclusive but has {len(enabled)} enabled items "
+                f"({', '.join(enabled)}); keep at most one enabled"
+            )
+    return problems
+
+
+def with_enabled(profile: Profile, items: list[str], enabled: bool) -> Profile:
+    """``profile`` with ``items`` set to ``enabled``, applying layer rules.
+
+    Enabling an item of an active exclusive layer disables that layer's other
+    items, so the newly enabled item becomes the layer's single choice.
+    """
+    skills = dict(profile.skills)
+    for item in items:
+        if enabled:
+            layer_name = profile.layer_of(item)
+            layer = profile.layers[layer_name] if layer_name else None
+            if layer is not None and layer.exclusive and layer.active:
+                for other in layer.items:
+                    if other != item and other in skills and skills[other].enabled:
+                        skills[other] = replace(skills[other], enabled=False)
+        skills[item] = replace(skills[item], enabled=enabled)
+    return replace(profile, skills=skills)
 
 
 def profiles_dir(respec_home: Path) -> Path:
@@ -163,6 +274,101 @@ def _parse_skill(name: Any, raw: Any, problems: list[str]) -> SkillEntry | None:
     return SkillEntry(enabled=enabled, source=source)
 
 
+def _parse_layer(
+    name: Any, raw: Any, skills: dict[str, Any], problems: list[str]
+) -> Layer | None:
+    where = f"layers.{name}"
+    if not isinstance(name, str) or not NAME_PATTERN.match(name):
+        problems.append(f"layer name {name!r} is invalid: {NAME_RULE}")
+        return None
+    builtin = name in BUILTIN_LAYERS
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        problems.append(f"{where} must be a mapping")
+        return None
+    allowed = BUILTIN_LAYER_KEYS if builtin else LAYER_KEYS
+    unknown = _unknown_keys(where, raw, allowed)
+    if builtin and unknown:
+        unknown = [
+            f"{problem}; exclusive and description of built-in layers are fixed"
+            for problem in unknown
+        ]
+    problems.extend(unknown)
+
+    exclusive: Any = True
+    description: Any = BUILTIN_LAYERS.get(name, "")
+    if not builtin:
+        exclusive = raw.get("exclusive")
+        if "exclusive" not in raw:
+            problems.append(f"{where}.exclusive is required (true or false)")
+        elif not isinstance(exclusive, bool):
+            problems.append(f"{where}.exclusive must be true or false")
+        description = raw.get("description")
+        if "description" not in raw:
+            problems.append(
+                f"{where}.description is required (what belongs in this layer)"
+            )
+        elif not isinstance(description, str):
+            problems.append(f"{where}.description must be a string")
+
+    active = raw.get("active", True)
+    if not isinstance(active, bool):
+        problems.append(f"{where}.active must be true or false")
+
+    items: list[str] = []
+    raw_items = raw.get("items")
+    if raw_items is None:
+        raw_items = []
+    if not isinstance(raw_items, list):
+        problems.append(f"{where}.items must be a list of skill names")
+        raw_items = []
+    for item in raw_items:
+        if not isinstance(item, str) or item not in skills:
+            problems.append(f"{where}.items: {item!r} is not a skill of this profile")
+        elif item in items:
+            problems.append(f"{where}.items: {item!r} is listed more than once")
+        else:
+            items.append(item)
+    if name == OUTPUT_STYLE and raw_items:
+        problems.append(f"{where}: {OUTPUT_STYLE_UNSUPPORTED}")
+
+    if not isinstance(exclusive, bool) or not isinstance(description, str):
+        return None
+    if not isinstance(active, bool):
+        return None
+    return Layer(
+        exclusive=exclusive,
+        description=description,
+        items=tuple(items),
+        active=active,
+        builtin=builtin,
+    )
+
+
+def _parse_layers(raw: Any, skills: dict[str, Any], problems: list[str]):
+    layers = builtin_layers()
+    if raw is None:
+        return layers
+    if not isinstance(raw, dict):
+        problems.append("'layers' must be a mapping of layer name to entry")
+        return layers
+    owner: dict[str, str] = {}
+    for layer_name, raw_layer in raw.items():
+        layer = _parse_layer(layer_name, raw_layer, skills, problems)
+        if layer is None:
+            continue
+        layers[layer_name] = layer
+        for item in layer.items:
+            if item in owner:
+                problems.append(
+                    f"layers: {item!r} is listed in more than one layer "
+                    f"({owner[item]}, {layer_name})"
+                )
+            owner.setdefault(item, layer_name)
+    return layers
+
+
 def parse_profile(name: str, folder: Path, data: Any) -> Profile:
     """Validate loaded YAML data, collecting every problem before failing."""
     file = folder / PROFILE_FILE
@@ -192,9 +398,19 @@ def parse_profile(name: str, folder: Path, data: Any) -> Profile:
             if entry is not None:
                 skills[skill_name] = entry
 
+    layers = _parse_layers(
+        data.get("layers"),
+        raw_skills if isinstance(raw_skills, dict) else {},
+        problems,
+    )
+    profile = Profile(
+        name=name, path=folder, targets=targets, skills=skills, layers=layers
+    )
+    if not problems:
+        problems.extend(exclusivity_problems(profile))
     if problems:
         raise ProfileError(file, problems)
-    return Profile(name=name, path=folder, targets=targets, skills=skills)
+    return profile
 
 
 def load_profile(respec_home: Path, name: str) -> Profile:
