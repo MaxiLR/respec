@@ -18,6 +18,7 @@ Order of a switch:
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from collections.abc import Callable
@@ -132,6 +133,34 @@ def _preflight(
     return plan
 
 
+BACKUP_MANIFEST = "manifest.json"
+
+
+def _record_backed_up_items(
+    run_dir: Path, target: str, folder: Path, state: State
+) -> None:
+    """Note, next to a takeover backup, which entries respec had installed in
+    the folder when it was copied (a folder another target already owns).
+    Without such items no manifest is written.
+
+    ``respec restore`` uses this record of backup time to leave respec's own
+    items out; it never guesses from current profiles.
+    """
+    real_folder = folder.resolve()
+    items = [
+        item.to_dict()
+        for item in state.installed
+        if unknown.real(item.path).parent == real_folder
+    ]
+    if not items:
+        return
+    manifest = run_dir / BACKUP_MANIFEST
+    data = json.loads(manifest.read_text("utf-8")) if manifest.exists() else {}
+    data.setdefault("version", 1)
+    data.setdefault("installed", {})[target] = items
+    manifest.write_text(json.dumps(data, indent=2) + "\n", "utf-8")
+
+
 def _take_over(
     respec_home: Path,
     user_home: Path,
@@ -157,6 +186,7 @@ def _take_over(
             destination = run_dir / target
             try:
                 shutil.copytree(folder, destination, symlinks=True)
+                _record_backed_up_items(run_dir, target, folder, state)
             except (OSError, shutil.Error) as error:
                 # Nothing has changed yet: drop the partial backup run and stop.
                 shutil.rmtree(run_dir, ignore_errors=True)

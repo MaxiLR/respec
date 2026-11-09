@@ -920,6 +920,8 @@ def restore(
                 "overwritten": [r.to_dict() for r in result.set_aside],
                 "unknown": [r.to_dict() for r in resolutions],
                 "released": result.released,
+                "skipped": result.skipped,
+                "left": result.left,
             }
         )
         return
@@ -930,4 +932,8 @@ def restore(
     for target, source in result.restored.items():
         origin = source if source else "nothing (folder did not exist)"
         typer.echo(f"Restored {target} from {origin}")
+    for path in result.skipped:
+        typer.echo(f"Skipped {path}: respec's own item, not restored")
+    for path in result.left:
+        typer.echo(f"Left {path} in place: kept or hidden, not in the backup")
     typer.echo("respec released its folders; no profile is active.")

@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import stat
 from datetime import datetime, timezone
 
 import pytest
@@ -41,7 +42,10 @@ def make_profile(respec_home, name, targets, skills):
 
 
 def snapshot(folder):
-    """Every entry below folder: files by content, links by target, never followed."""
+    """Every entry below folder: kind, permissions, file bytes, link targets.
+
+    Symlinks are recorded by target and never followed.
+    """
     if not os.path.lexists(folder):
         return None
     found = {}
@@ -49,12 +53,14 @@ def snapshot(folder):
         for name in subdirs + files:
             path = os.path.join(root, name)
             relative = os.path.relpath(path, folder)
+            mode = stat.S_IMODE(os.lstat(path).st_mode)
             if os.path.islink(path):
                 found[relative] = ("link", os.readlink(path))
             elif os.path.isdir(path):
-                found[relative] = ("dir",)
+                found[relative] = ("dir", mode)
             else:
-                found[relative] = ("file", open(path).read())
+                with open(path, "rb") as handle:
+                    found[relative] = ("file", mode, handle.read())
     return found
 
 
@@ -65,6 +71,12 @@ def populate(dirs, elsewhere):
     (claude / "mine" / "SKILL.md").write_text("my own skill\n")
     (claude / "mine" / "refs" / "a.md").write_text("ref a\n")
     (claude / "notes.txt").write_text("loose file\n")
+    (claude / "tool" / "empty").mkdir(parents=True)
+    (claude / "tool" / "run.sh").write_text("#!/bin/sh\necho hi\n")
+    (claude / "tool" / "run.sh").chmod(0o755)
+    (claude / "tool" / "data.bin").write_bytes(bytes(range(256)) * 4)
+    (claude / "tool" / "secret.txt").write_text("private\n")
+    (claude / "tool" / "secret.txt").chmod(0o600)
     elsewhere.mkdir()
     (elsewhere / "SKILL.md").write_text("linked by me\n")
     (claude / "linked").symlink_to(elsewhere, target_is_directory=True)
@@ -293,33 +305,30 @@ def test_restoring_a_backup_holding_respec_links_does_not_recreate_them(
 ):
     original, runs = shared_folder
 
-    ok(run("restore", runs[1]))
+    out = json.loads(ok(run("restore", runs[1], "--json")).stdout)
 
+    skipped = str(respec_home / "backups" / runs[1] / "claude-code" / "tdd")
+    assert out["skipped"] == [skipped]
     assert respec_links(dirs["agents"], respec_home) == []
     assert snapshot(dirs["agents"]) == original
     assert read_state(respec_home)["installed"] == []
 
 
 def test_failed_restore_keeps_state_true_to_disk_and_can_be_rerun(
-    run, respec_home, dirs, taken_over, monkeypatch
+    run, respec_home, dirs, taken_over
 ):
-    real_put_back = restore._put_back
-    calls = []
-
-    def flaky(source, destination):
-        calls.append(source.name)
-        if len(calls) == 2:
-            raise OSError("disk full")
-        real_put_back(source, destination)
-
-    shutil.rmtree(dirs["claude-code"] / "mine")  # so something must be put back
-    shutil.rmtree(dirs["agents"] / "shared")
-    with monkeypatch.context() as patch:
-        patch.setattr(restore, "_put_back", flaky)
+    # An unreadable file in the backup makes putting "mine" back fail.
+    shutil.rmtree(dirs["claude-code"] / "mine")
+    backed_up = next((respec_home / "backups").glob("*/claude-code/mine/SKILL.md"))
+    backed_up.chmod(0)
+    try:
         failed = run("restore")
+    finally:
+        backed_up.chmod(0o644)
 
     assert failed.exit_code == 1
-    assert "disk full" in failed.output and "respec restore" in failed.output
+    assert "mine" in failed.output and "respec restore" in failed.output
+    assert not os.path.lexists(dirs["claude-code"] / "mine")
     state = read_state(respec_home)
     assert state["active_profile"] is None
     assert state["installed"] == []
@@ -384,7 +393,11 @@ def test_restoring_a_backup_holding_respec_copies_does_not_recreate_them(
     later = backup_runs(respec_home)[1]
     assert (respec_home / "backups" / later / "claude-code" / "tdd").is_dir()
 
-    ok(run("restore", later))
+    out = ok(run("restore", later)).stdout
+
+    assert (
+        "Skipped " + str(respec_home / "backups" / later / "claude-code" / "tdd") in out
+    )
 
     assert snapshot(dirs["agents"]) == original
 
@@ -428,3 +441,73 @@ def test_after_release_a_later_backup_still_leaves_respec_copies_out(
     ok(run("restore", later))
 
     assert snapshot(dirs["agents"]) == original
+
+
+def test_named_pre_respec_run_from_an_earlier_ownership_cycle_restores_exactly(
+    run, respec_home, dirs
+):
+    (dirs["claude-code"] / "mine").mkdir(parents=True)
+    (dirs["claude-code"] / "mine" / "SKILL.md").write_text("my own skill\n")
+    original = snapshot(dirs["claude-code"])
+    make_profile(respec_home, "a", ["claude-code"], ["tdd"])
+    ok(run("use", "a"))
+    ok(run("adopt", "--add", "mine"))
+    ok(run("restore"))
+    assert snapshot(dirs["claude-code"]) == original
+    shutil.rmtree(dirs["claude-code"] / "mine")
+    ok(run("use", "a"))  # second ownership cycle, a new takeover run
+    first = backup_runs(respec_home)[0]
+
+    ok(run("restore", first))
+
+    assert snapshot(dirs["claude-code"]) == original
+
+
+def test_kept_entry_with_changed_permissions_is_not_identical(run, dirs, taken_over):
+    (dirs["claude-code"] / "tool" / "run.sh").chmod(0o600)
+
+    blocked = run("restore")
+
+    assert blocked.exit_code == 1
+    assert str(dirs["claude-code"] / "tool") in blocked.output
+    ok(run("restore", "--overwrite"))
+    assert snapshot(dirs["claude-code"]) == taken_over["claude-code"]
+
+
+def test_restore_puts_back_modes_binary_content_and_empty_folders(
+    run, dirs, taken_over
+):
+    shutil.rmtree(dirs["claude-code"] / "tool")
+
+    ok(run("restore"))
+
+    assert snapshot(dirs["claude-code"]) == taken_over["claude-code"]
+    tool = dirs["claude-code"] / "tool"
+    assert stat.S_IMODE((tool / "run.sh").stat().st_mode) == 0o755
+    assert stat.S_IMODE((tool / "secret.txt").stat().st_mode) == 0o600
+    assert (tool / "data.bin").read_bytes() == bytes(range(256)) * 4
+    assert (tool / "empty").is_dir()
+
+
+def test_kept_and_hidden_leftovers_are_reported(run, respec_home, dirs, taken_over):
+    (dirs["claude-code"] / "stray").mkdir()
+    (dirs["claude-code"] / "stray" / "SKILL.md").write_text("dropped later\n")
+    (dirs["claude-code"] / ".hidden").write_text("x\n")
+
+    out = json.loads(ok(run("restore", "--unknown", "keep", "--json")).stdout)
+
+    assert sorted(out["left"]) == sorted(
+        [str(dirs["claude-code"] / ".hidden"), str(dirs["claude-code"] / "stray")]
+    )
+    assert (dirs["claude-code"] / "stray" / "SKILL.md").read_text() == "dropped later\n"
+
+
+def test_kept_leftover_is_named_in_human_output(run, dirs, taken_over):
+    (dirs["claude-code"] / "stray").mkdir()
+
+    out = ok(run("restore", "--unknown", "keep")).stdout
+
+    assert any(
+        line.startswith("Left ") and "stray" in line and "not in the backup" in line
+        for line in out.splitlines()
+    )

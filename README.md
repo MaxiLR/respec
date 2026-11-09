@@ -44,13 +44,15 @@ a profile or a backup.
 owned folder back to the backup taken when respec first took it over (a folder
 that did not exist then is removed again once empty), clears `state.json` and
 leaves no profile active. `respec restore <backup>` restores the target folders
-of that run instead; `--list` shows the runs. Symlinks into profiles, and copies
-of profile items in a backup taken after respec owned the folder, are never put
-back. Entries the backup would overwrite (unknown ones, edited copies, or kept
-entries that differ from the backup) stop the restore until they are resolved
-with `--unknown` or `respec adopt`, or until `--overwrite` (or a yes in a
-terminal) backs them up and replaces them. A restore that fails part way can be
-run again to finish.
+of that run instead; `--list` shows the runs. respec's own items in a backup are
+skipped and reported: symlinks into profiles, and copies that the run's
+`manifest.json` records as installed by respec when the backup was taken.
+Entries the backup would overwrite (unknown ones, edited copies, or kept entries
+whose content or permissions differ from the backup) stop the restore until
+they are resolved with `--unknown` or `respec adopt`, or until `--overwrite` (or
+a yes in a terminal) backs them up and replaces them. Kept and hidden entries
+the backup does not hold stay in place and are reported. A restore that fails
+part way can be run again to finish.
 
 ### TUI
 

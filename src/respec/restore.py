@@ -14,13 +14,16 @@ folders only lose respec's items.
 Order of a restore:
 
 0. Plan (nothing changes): pick the backup for each folder and the entries to
-   put back. Entries respec itself created never come back: a symlink into the
-   profiles folder, and, in a backup taken after the folder was already owned,
-   a copy matching one respec records.
+   put back. Entries respec itself created never come back, judged only by
+   facts from backup time: a symlink into the profiles folder, or a copy whose
+   digest matches one the backup run's ``manifest.json`` says respec had
+   installed there. Skipped entries are reported.
 1. Conflicts: an entry in a folder being restored that respec does not manage
    and that differs from (or is absent from) the backup would be overwritten.
    Unknown entries go to ``on_unknown`` (the adopt flow: add, backup, keep);
-   entries kept unmanaged stay unless the backup holds the same name. Whatever
+   entries kept unmanaged (and hidden ones) stay, and are reported, unless the
+   backup holds the same name. Entries count as identical only with the same
+   bytes, link targets and permissions. Whatever
    still conflicts refuses the restore with :class:`RestoreBlocked`, unless
    ``overwrite`` confirms it: then each is backed up to a fresh run first.
 2. Apply (:func:`_apply`): back up confirmed conflicts, deactivate, remove
@@ -32,6 +35,7 @@ Order of a restore:
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from dataclasses import dataclass, field
@@ -64,6 +68,7 @@ class FolderPlan:
     folder: Path
     source: Path | None  # backup folder; None: the folder did not exist
     entries: tuple[str, ...]  # names in ``source`` to put back
+    skipped: tuple[str, ...]  # names in ``source`` that are respec's own items
 
 
 @dataclass
@@ -73,6 +78,8 @@ class RestoreResult:
     removed: list[Installed] = field(default_factory=list)
     set_aside: list[adopt.Resolution] = field(default_factory=list)
     released: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)  # backup paths left out
+    left: list[str] = field(default_factory=list)  # kept/hidden, not in backup
 
 
 class RestoreBlocked(RespecError):
@@ -129,7 +136,7 @@ def _within(path: Path, root: Path) -> bool:
 
 
 def _respec_link(respec_home: Path, entry: Path, folder: Path) -> bool:
-    """Whether a backed-up entry is a symlink respec made into a profile."""
+    """Whether a backed-up entry is a symlink into respec's profiles folder."""
     if not entry.is_symlink():
         return False
     target = Path(os.readlink(entry))
@@ -141,59 +148,66 @@ def _respec_link(respec_home: Path, entry: Path, folder: Path) -> bool:
     )
 
 
+def _modes(path: Path) -> list[tuple[str, int]]:
+    """Permission bits of an entry and everything below it (links not followed)."""
+    found = [(".", os.lstat(path).st_mode)]
+    if path.is_dir() and not path.is_symlink():
+        for root, subdirs, files in os.walk(path):
+            for name in sorted(subdirs + files):
+                child = os.path.join(root, name)
+                found.append((os.path.relpath(child, path), os.lstat(child).st_mode))
+    return sorted(found)
+
+
 def _same(left: Path, right: Path) -> bool:
+    """Same names, bytes, link targets and permissions."""
     try:
-        return unknown.digest(left) == unknown.digest(right)
+        if unknown.digest(left) != unknown.digest(right):
+            return False
+        return _modes(left) == _modes(right)
     except OSError:
         return False
 
 
-def _respec_copy(respec_home: Path, state: State, entry: Path) -> bool:
-    """Whether a backed-up entry matches a copy respec installs: one recorded
-    in ``state.json``, or any profile's item of that name."""
-    known = {item.digest for item in state.installed if item.name == entry.name}
-    for skills in profiles.profiles_dir(respec_home).glob(
-        f"*/{profiles.SKILLS_DIR}/{entry.name}"
-    ):
-        try:
-            known.add(unknown.digest(skills))
-        except OSError:
-            continue
+def _recorded_at_backup(run: Path, target: str) -> list[dict[str, object]]:
+    """Items respec had installed in ``target``'s folder when ``run`` was taken."""
+    manifest = run / switch.BACKUP_MANIFEST
+    if not manifest.is_file():
+        return []
     try:
-        return unknown.digest(entry) in known
-    except OSError:
-        return False
+        data = json.loads(manifest.read_text("utf-8"))
+        items = data["installed"].get(target, [])
+    except (OSError, ValueError, KeyError, AttributeError) as error:
+        raise RespecError(f"invalid backup manifest {manifest}: {error}") from None
+    return [item for item in items if isinstance(item, dict)]
 
 
 def _entries(
-    respec_home: Path, state: State, source: Path, folder: Path, pre_respec: bool
-) -> tuple[str, ...]:
-    """Names in ``source`` to put back; respec's own items are left out.
+    respec_home: Path, source: Path, target: str, folder: Path
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(names to put back, names left out as respec's own items).
 
-    Copies are only recognised in a backup taken after respec already owned
-    the folder (``pre_respec`` false): a pre-respec backup may hold the user's
-    original of an item later adopted into a profile, which must come back.
+    Left out are symlinks into the profiles folder and copies whose content
+    matches a copy respec had recorded in that folder when the backup was
+    taken (see :func:`respec.switch._record_backed_up_items`). Nothing is
+    judged by current profiles.
     """
+    copies = {
+        item.get("name"): item.get("digest")
+        for item in _recorded_at_backup(source.parent, target)
+        if item.get("mode") == "copy" and item.get("digest")
+    }
     names: list[str] = []
+    skipped: list[str] = []
     for entry in sorted(source.iterdir(), key=lambda child: child.name):
-        if _respec_link(respec_home, entry, folder):
-            continue
-        if not pre_respec and _respec_copy(respec_home, state, entry):
-            continue
-        names.append(entry.name)
-    return tuple(names)
-
-
-def _oldest_run_holding(respec_home: Path, user_home: Path, key: Path) -> Path:
-    """The oldest backup run holding a target whose folder resolves to ``key``."""
-    registry = targets.registry()
-    for backup in list_backups(respec_home):
-        for target in backup.targets:
-            if target in registry and (
-                registry[target].skills_dir(user_home).resolve() == key
-            ):
-                return Path(backup.path)
-    raise RespecError(f"no backup holds {key}")
+        respec_own = _respec_link(respec_home, entry, folder)
+        if not respec_own and entry.name in copies and not entry.is_symlink():
+            try:
+                respec_own = unknown.digest(entry) == copies[entry.name]
+            except OSError:
+                respec_own = False
+        (skipped if respec_own else names).append(entry.name)
+    return tuple(names), tuple(skipped)
 
 
 def _plan(
@@ -203,32 +217,30 @@ def _plan(
         folder.resolve(): (folder, group)
         for folder, group in unknown.folder_groups(state)
     }
-    earliest: dict[Path, str | None] = {}
-    for key, (_, group) in groups.items():
-        first = min(
-            group,
-            key=lambda t: (state.owned[t].taken_over_at, state.owned[t].backup is None),
-        )
-        earliest[key] = state.owned[first].backup
+    plans: list[FolderPlan] = []
     if run is None:
-        plans = []
-        for key, (folder, group) in groups.items():
-            backup = earliest[key]
-            source = Path(backup) if backup is not None else None
-            if source is not None and not source.is_dir():
+        for folder, group in groups.values():
+            first = min(
+                group,
+                key=lambda t: (
+                    state.owned[t].taken_over_at,
+                    state.owned[t].backup is None,
+                ),
+            )
+            backup = state.owned[first].backup
+            if backup is None:
+                plans.append(FolderPlan(tuple(group), folder, None, (), ()))
+                continue
+            source = Path(backup)
+            if not source.is_dir():
                 raise RespecError(
                     f"the takeover backup of {folder} is missing: {source}; "
                     "name another with 'respec restore <backup>'"
                 )
-            entries = (
-                _entries(respec_home, state, source, folder, pre_respec=True)
-                if source is not None
-                else ()
-            )
-            plans.append(FolderPlan(tuple(group), folder, source, entries))
+            entries, skipped = _entries(respec_home, source, first, folder)
+            plans.append(FolderPlan(tuple(group), folder, source, entries, skipped))
         return plans
     registry = targets.registry()
-    plans = []
     seen: set[Path] = set()
     held = [t for t in registry if (run / t).is_dir()]
     if not held:
@@ -244,19 +256,16 @@ def _plan(
         seen.add(key)
         source = run / target
         group = groups.get(key, (folder, [target]))[1]
-        if key in earliest:
-            pre_respec = earliest[key] == str(source)
-        else:
-            pre_respec = _oldest_run_holding(respec_home, user_home, key) == run
-        entries = _entries(respec_home, state, source, folder, pre_respec)
-        plans.append(FolderPlan(tuple(group), folder, source, entries))
+        entries, skipped = _entries(respec_home, source, target, folder)
+        plans.append(FolderPlan(tuple(group), folder, source, entries, skipped))
     return plans
 
 
 def _conflicts(
     respec_home: Path, state: State, plans: list[FolderPlan]
-) -> tuple[list[unknown.Unknown], list[unknown.Unknown]]:
-    """(unknown entries, kept entries) that the restore would overwrite."""
+) -> tuple[list[unknown.Unknown], list[unknown.Unknown], list[str]]:
+    """(unknown entries, kept entries) the restore would overwrite, and the
+    kept or hidden entries it leaves in place because the backup lacks them."""
     managed = {
         unknown.real(item.path)
         for item in state.installed
@@ -266,6 +275,7 @@ def _conflicts(
     kept = {unknown.real(path) for path in state.unmanaged}
     found: list[unknown.Unknown] = []
     kept_found: list[unknown.Unknown] = []
+    left: list[str] = []
     for plan in plans:
         if not plan.folder.is_dir():
             continue
@@ -277,6 +287,7 @@ def _conflicts(
             if backed_up and _same(entry, plan.source / entry.name):
                 continue
             if (key in kept or entry.name.startswith(".")) and not backed_up:
+                left.append(str(entry))
                 continue
             conflict = unknown.Unknown(
                 name=entry.name,
@@ -286,7 +297,7 @@ def _conflicts(
                 replaced=key in recorded,
             )
             (kept_found if key in kept else found).append(conflict)
-    return found, kept_found
+    return found, kept_found, left
 
 
 def _kind(entry: Path) -> str:
@@ -379,15 +390,21 @@ def restore(
         )
     run = _find_run(respec_home, backup) if backup is not None else None
     plans = _plan(respec_home, user_home, state, run)
-    found, kept = _conflicts(respec_home, state, plans)
+    found, kept, left = _conflicts(respec_home, state, plans)
     if found and on_unknown is not None:
         on_unknown(found)
         state = load_state(respec_home)
         plans = _plan(respec_home, user_home, state, run)
-        found, kept = _conflicts(respec_home, state, plans)
+        found, kept, left = _conflicts(respec_home, state, plans)
     blocking = found + kept
     if blocking and not overwrite:
         raise RestoreBlocked(blocking)
-    result = RestoreResult(backup=run.name if run is not None else None)
+    result = RestoreResult(backup=run.name if run is not None else None, left=left)
+    result.skipped = [
+        str(plan.source / name)
+        for plan in plans
+        if plan.source is not None
+        for name in plan.skipped
+    ]
     _apply(respec_home, plans, blocking, result, now)
     return result
