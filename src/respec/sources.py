@@ -32,10 +32,11 @@ import yaml
 from respec import items, profiles
 from respec.errors import RespecError
 
-BASE_URL_ENV = "RESPEC_GIT_BASE_URL"
-DEFAULT_BASE_URL = "https://github.com"
-SHORTHAND = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-SCP_LIKE = re.compile(r"^[\w.-]+@[\w.-]+:")
+BASE_URL_ENV = profiles.GIT_BASE_URL_ENV
+SHORTHAND = profiles.REPO_SHORTHAND
+SCP_LIKE = profiles.REPO_SCP_LIKE
+# Transports git may use: no remote helpers such as ``fd::`` or ``ext::``.
+ALLOWED_PROTOCOLS = "file:git:http:https:ssh"
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -49,7 +50,7 @@ class Spec:
 
 
 def base_url() -> str:
-    return os.environ.get(BASE_URL_ENV) or DEFAULT_BASE_URL
+    return profiles.git_base_url()
 
 
 def is_git_spec(text: str) -> bool:
@@ -126,6 +127,7 @@ def _git(*args: str, cwd: Path | None = None) -> str:
         and not key.startswith("GIT_CONFIG_VALUE_")
     }
     env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ALLOW_PROTOCOL"] = ALLOWED_PROTOCOLS
     try:
         done = subprocess.run(
             ["git", *args],
@@ -226,25 +228,63 @@ def _within(root: Path, entry: Path) -> None:
 def copy_fetched(tree: Path, source: Path, destination: Path) -> None:
     """Copy ``source`` (inside the fetched ``tree``) to ``destination``.
 
-    Symlinks are refused unless they resolve inside ``tree`` and do not point
-    at a folder containing them, so a repository cannot make respec copy local
-    files (such as ``~/.ssh`` keys) into a profile. Links that pass are copied
-    as the files and folders they point to, keeping the profile self-contained.
+    Symlinks are never followed while copying out of the repository: the
+    folder is first copied with links kept as links, then every link in that
+    copy must resolve (through any chain) to an entry strictly inside the
+    copied folder and must not point at a folder holding it. Only then is the
+    checked copy written to ``destination`` with links replaced by what they
+    point to, so the profile stays self-contained and a repository can never
+    make respec copy local files (such as ``~/.ssh`` keys) into a profile.
+    Every failure is a :class:`RespecError` and leaves no ``destination``.
     """
     root = tree.resolve()
     _within(root, source)
-    for folder, dirs, files in os.walk(source):
+    if os.path.lexists(destination):
+        raise RespecError(f"{destination} already exists")
+    with tempfile.TemporaryDirectory(prefix="respec-check-") as scratch:
+        checked = Path(scratch) / "item"
+        try:
+            shutil.copytree(source, checked, symlinks=True)
+            _check_links(checked)
+            shutil.copytree(checked, destination)
+        except RespecError:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise
+        except (OSError, shutil.Error) as error:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise RespecError(
+                f"could not copy {_label(root, source)!r} from the repository: "
+                f"{error}"
+            ) from None
+
+
+def _check_links(folder: Path) -> None:
+    """Refuse symlinks in ``folder`` that leave it, dangle, or form loops."""
+    base = folder.resolve()
+    for current, dirs, files in os.walk(folder):
         for name in dirs + files:
-            entry = Path(folder) / name
+            entry = Path(current) / name
             if not entry.is_symlink():
                 continue
-            _within(root, entry)
-            target, parent = entry.resolve(), entry.parent.resolve()
+            label = entry.relative_to(folder).as_posix()
+            try:
+                target = entry.resolve(strict=True)
+            except (OSError, RuntimeError):
+                raise RespecError(
+                    f"symlink {label!r} is broken, loops or points outside the "
+                    "skill folder; refusing to copy it"
+                ) from None
+            if base not in target.parents:
+                raise RespecError(
+                    f"symlink {label!r} points outside the skill folder; "
+                    "refusing to copy it"
+                )
+            parent = entry.parent.resolve()
             if target == parent or target in parent.parents:
                 raise RespecError(
-                    f"symlink {_label(root, entry)!r} points at a " "folder holding it"
+                    f"symlink {label!r} points at a folder holding it; "
+                    "refusing to copy it"
                 )
-    shutil.copytree(source, destination)
 
 
 # --- content -----------------------------------------------------------------
@@ -349,9 +389,12 @@ def add(
                     items.add_local(respec_home, name, staged, origin=source)
                     added.append(item)
                     sources[item] = source.to_dict()
-        except (RespecError, OSError, shutil.Error):
+        except RespecError:
             _forget(before, added)
             raise
+        except (OSError, shutil.Error) as error:
+            _forget(before, added)
+            raise RespecError(f"could not add from {spec.repo}: {error}") from None
 
     change = SourceChange(profile=name, items=added, sources=sources)
     items.refresh_active(respec_home, user_home, change, lambda: _forget(before, added))

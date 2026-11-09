@@ -234,6 +234,45 @@ def _unknown_keys(where: str, data: dict[Any, Any], allowed: tuple[str, ...]):
     ]
 
 
+GIT_BASE_URL_ENV = "RESPEC_GIT_BASE_URL"
+DEFAULT_GIT_BASE_URL = "https://github.com"
+REPO_SHORTHAND = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+REPO_SCP_LIKE = re.compile(r"^[\w.-]+@[\w.-]+:")
+REPO_URL = re.compile(r"^(https?|ssh|git|file)://\S+$")
+
+
+def git_base_url() -> str:
+    """Base URL for ``owner/repo``; read at call time so tests can inject it."""
+    return os.environ.get(GIT_BASE_URL_ENV) or DEFAULT_GIT_BASE_URL
+
+
+def _repo_problem(repo: str) -> str | None:
+    """Only remote repositories: 'owner/repo', ``user@host:path`` or a URL.
+
+    ``file://`` is accepted only below a ``file://`` base URL (the injectable
+    test seam), so a profile cannot point respec at local repositories.
+    """
+    if REPO_SHORTHAND.match(repo) or REPO_SCP_LIKE.match(repo):
+        return None
+    match = REPO_URL.match(repo)
+    if match and match.group(1) != "file":
+        return None
+    base = git_base_url().rstrip("/")
+    if (
+        match
+        and base.startswith("file://")
+        and repo.startswith(base + "/")
+        and "%" not in repo
+        and not any(part in (".", "..") for part in repo.split("/"))
+    ):
+        return None
+    return (
+        f"source repo {repo!r} must be 'owner/repo', 'user@host:path' or an "
+        "https, http, ssh or git URL (local paths, file URLs and other "
+        "transports are refused)"
+    )
+
+
 def source_value_problem(key: str, value: str) -> str | None:
     """Why a source ``repo``, ``ref`` or ``path`` value is unsafe, or None.
 
@@ -242,6 +281,8 @@ def source_value_problem(key: str, value: str) -> str | None:
     """
     if value.startswith("-"):
         return f"source {key} {value!r} must not start with '-'"
+    if key == "repo":
+        return _repo_problem(value)
     if key == "path" and (
         value.startswith("/")
         or "\\" in value

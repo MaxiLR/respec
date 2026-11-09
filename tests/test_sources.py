@@ -8,6 +8,7 @@ shorthand resolves through ``RESPEC_GIT_BASE_URL`` so no test touches GitHub.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -931,3 +932,138 @@ def test_add_path_to_folder_of_skills_adds_each(run, upstream, profiles_root):
     skills = read_yaml(profiles_root, "work")["skills"]
     assert skills["one"]["source"]["path"] == "packs/web/one"
     assert skills["two"]["source"]["path"] == "packs/web/two"
+
+
+# --- review round 2: symlinks behind in-repo links, transports, local repos -
+
+
+def nested_escape(repo, secret, skill="skill", variant="file"):
+    """``skill/link -> ../other`` (inside the repo) hiding an escaping link."""
+    repo.write(f"{skill}/SKILL.md", "# skill\n")
+    other = repo.work / "other"
+    other.mkdir(exist_ok=True)
+    if variant == "file":
+        (other / "evil").symlink_to(secret)
+    elif variant == "chain":
+        (other / "c1").symlink_to("c2")
+        (other / "c2").symlink_to(secret / "id_rsa")
+    elif variant == "dir":
+        (other / "keys").symlink_to(secret, target_is_directory=True)
+    depth = "../" * (skill.count("/") + 1)
+    (repo.work / skill / "link").symlink_to(f"{depth}other")
+    repo.write("other/plain.md", "plain\n")
+
+
+@pytest.mark.parametrize("variant", ["file", "chain", "dir"])
+def test_add_refuses_escaping_symlink_behind_in_repo_folder_link(
+    run, upstream, secret, profiles_root, variant
+):
+    repo = upstream("acme/nest")
+    nested_escape(repo, secret, variant=variant)
+    repo.commit()
+    new_profile(run)
+
+    result = fails(run("add", "acme/nest#skill", "-p", "work"))
+
+    assert "symlink" in result.output
+    no_secret_copied(profiles_root)
+    assert read_yaml(profiles_root, "work")["skills"] == {}
+    assert not (profiles_root / "work" / "skills" / "skill").exists()
+
+
+def test_profile_install_refuses_escaping_symlink_behind_folder_link(
+    run, upstream, secret, profiles_root
+):
+    pack = upstream("acme/pk")
+    pack.write(
+        "profile.yaml",
+        yaml.safe_dump({"targets": ["agents"], "skills": {"a": {"enabled": True}}}),
+    )
+    nested_escape(pack, secret, skill="skills/a")
+    pack.commit()
+
+    result = fails(run("profile", "install", "acme/pk"))
+
+    assert "symlink" in result.output
+    no_secret_copied(profiles_root)
+    assert not (profiles_root / "pk").exists()
+
+
+def test_update_refuses_escaping_symlink_behind_folder_link(
+    run, sourced, secret, profiles_root
+):
+    other = sourced.work / "other"
+    other.mkdir()
+    (other / "evil").symlink_to(secret)
+    (sourced.work / "tdd" / "link").symlink_to("../other")
+    sourced.commit()
+
+    result = fails(run("update", "tdd", "-p", "work", "--yes"))
+
+    assert "symlink" in result.output
+    no_secret_copied(profiles_root)
+    skills = profiles_root / "work" / "skills"
+    assert (skills / "tdd" / "SKILL.md").read_text() == "# tdd v1\n"
+    assert sorted(p.name for p in skills.iterdir()) == ["lint", "mine", "tdd"]
+
+
+def test_symlink_loop_is_a_clean_error_and_adds_nothing(run, upstream, profiles_root):
+    repo = upstream("acme/loop")
+    repo.write("skill/SKILL.md", "# skill\n")
+    (repo.work / "other").mkdir()
+    (repo.work / "other" / "back").symlink_to("../skill")
+    (repo.work / "skill" / "link").symlink_to("../other")
+    repo.commit()
+    new_profile(run)
+
+    result = run("add", "acme/loop#skill", "-p", "work")
+
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit), result.exception
+    assert "symlink" in result.output
+    assert read_yaml(profiles_root, "work")["skills"] == {}
+    assert list((profiles_root / "work" / "skills").iterdir()) == []
+
+
+def test_remote_helper_transports_are_refused(tmp_path, monkeypatch):
+    from respec import sources
+    from respec.errors import RespecError
+
+    marker = tmp_path / "HELPER_RAN"
+    helpers = tmp_path / "bin"
+    helpers.mkdir()
+    helper = helpers / "git-remote-evil"
+    helper.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n")
+    helper.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{helpers}:{os.environ['PATH']}")
+
+    with pytest.raises(RespecError):
+        sources.remote_commit("evil::anything", None, "evil")
+
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("kind", ["absolute", "relative", "file-url", "helper"])
+def test_profile_repo_naming_a_local_path_is_rejected(
+    run, sourced, profiles_root, tmp_path, kind
+):
+    local = tmp_path / "elsewhere" / "repo"
+    local.parent.mkdir()
+    git(tmp_path, "clone", "-q", "--bare", sourced.url, str(local))
+    repo = {
+        "absolute": str(local),
+        "relative": "../elsewhere/repo",
+        "file-url": local.as_uri(),
+        "helper": "fd::3",
+    }[kind]
+    data = read_yaml(profiles_root, "work")
+    data["skills"]["tdd"]["source"]["repo"] = repo
+    write_profile_yaml(profiles_root, "work", data)
+
+    result = fails(run("update", "--check", "-p", "work"))
+
+    assert "repo" in result.output and "URL" in result.output
+
+
+def test_file_url_under_the_configured_base_url_is_allowed(run, sourced):
+    assert check(run)["tdd"]["update_available"] is False

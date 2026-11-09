@@ -33,7 +33,11 @@ Each item records its source repo, path, ref, resolved commit and a digest of
 the fetched files in `profile.yaml`. Updates are explicit and never touch items
 without a source. When an item's files no longer match the digest, `update`
 asks before overwriting them (with `--json` it skips them unless `--yes`).
-A fetched skill whose symlinks point outside the repository is refused.
+Fetched skills may only contain symlinks that stay inside the skill's own
+folder; they are copied as plain files. A source `repo` must be `owner/repo`,
+`user@host:path` or an https, http, ssh or git URL; local paths and other git
+transports are refused. Items installed by `profile install` have no recorded
+digest, so their first `update` asks before overwriting.
 `profile install` copies a repository's `profile.yaml` and listed `skills/`
 once; the profile is then owned locally and its items keep their own sources.
 
