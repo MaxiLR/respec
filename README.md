@@ -14,6 +14,7 @@ respec disable my-skill [-p work] # stop linking it; files and metadata stay
 respec enable my-skill [-p work]
 respec remove my-skill [-p work]  # drop it from profile.yaml and delete its folder
 respec adopt [--add|--backup|--keep <entry>] [--all <choice>] [-p work]
+respec restore [<backup>] [--list] [--unknown add|backup|keep] [--overwrite]
 ```
 
 `add`, `remove`, `enable` and `disable` change the active profile unless `-p`
@@ -38,6 +39,20 @@ stop asking). A terminal asks per entry; other runs stop unless
 resolves unknown entries outside a switch (`--add` copies into the active
 profile unless `-p` names another). Nothing is removed before it is copied into
 a profile or a backup.
+
+`respec restore` undoes respec: it removes every item respec manages, puts each
+owned folder back to the backup taken when respec first took it over (a folder
+that did not exist then is removed again once empty), clears `state.json` and
+leaves no profile active. `respec restore <backup>` restores the target folders
+of that run instead; `--list` shows the runs. respec's own items in a backup are
+skipped and reported: symlinks into profiles, and copies that the run's
+`manifest.json` records as installed by respec when the backup was taken.
+Entries the backup would overwrite (unknown ones, edited copies, or kept entries
+whose content or permissions differ from the backup) stop the restore until
+they are resolved with `--unknown` or `respec adopt`, or until `--overwrite` (or
+a yes in a terminal) backs them up and replaces them. Kept and hidden entries
+the backup does not hold stay in place and are reported. A restore that fails
+part way can be run again to finish.
 
 ### TUI
 

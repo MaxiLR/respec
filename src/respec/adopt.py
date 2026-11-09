@@ -107,7 +107,7 @@ def resolve(
     entries: list[unknown.Unknown],
     decide: Decide,
     profile_name: str | None = None,
-    now: switch.Clock = switch._utc_now,
+    now: switch.Clock = switch.utc_now,
 ) -> list[Resolution]:
     """Ask ``decide`` about each entry and apply its choice at once.
 
@@ -130,7 +130,7 @@ def resolve(
             resolution.profile = _add(respec_home, entry, profile_name)
         elif choice == "backup":
             if run_dir is None:
-                run_dir = switch._new_backup_run(respec_home, now())
+                run_dir = switch.new_backup_run(respec_home, now())
             resolution.backup = _backup(respec_home, entry, run_dir)
         else:
             _settle(respec_home, entry, keep=True)
@@ -148,7 +148,7 @@ def adopt(
     user_home: Path,
     decide: Decide,
     profile_name: str | None = None,
-    now: switch.Clock = switch._utc_now,
+    now: switch.Clock = switch.utc_now,
 ) -> AdoptResult:
     """Resolve unknown entries outside a switch.
 
