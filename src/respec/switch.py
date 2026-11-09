@@ -62,13 +62,19 @@ def _new_backup_run(respec_home: Path, moment: datetime) -> Path:
         return candidate
 
 
+def _real(path: Path) -> Path:
+    """``path`` with its parent folders' symlinks resolved (not the entry itself)."""
+    return path.parent.resolve() / path.name
+
+
 def _preflight(
     profile: profiles.Profile, state: State, user_home: Path
 ) -> list[tuple[str, str, Path, Path]]:
     """Plan installs as (target, skill, source, destination); fail on conflicts."""
     registry = targets.registry()
-    recorded = {item.path for item in state.installed}
+    recorded = {_real(Path(item.path)) for item in state.installed}
     plan: list[tuple[str, str, Path, Path]] = []
+    seen_folders: set[Path] = set()
     problems: list[str] = []
     enabled = [name for name, entry in profile.skills.items() if entry.enabled]
     for skill in enabled:
@@ -77,9 +83,14 @@ def _preflight(
             problems.append(f"skill {skill!r} has no folder at {source}")
     for target in profile.targets:
         folder = registry[target].skills_dir(user_home)
+        # Targets whose folders resolve to one real directory (for example
+        # ~/.claude/skills linked to ~/.agents/skills) get each skill once.
+        if folder.resolve() in seen_folders:
+            continue
+        seen_folders.add(folder.resolve())
         for skill in enabled:
             destination = folder / skill
-            if os.path.lexists(destination) and str(destination) not in recorded:
+            if os.path.lexists(destination) and _real(destination) not in recorded:
                 problems.append(
                     f"{destination} already exists and is not managed by respec; "
                     "move it out of the way before switching"
@@ -109,6 +120,7 @@ def _take_over(
     moment = now()
     run_dir: Path | None = None
     backups: dict[str, str] = {}
+    owned: dict[str, Owned] = {}
     for target in new_targets:
         folder = registry[target].skills_dir(user_home)
         backup: str | None = None
@@ -116,14 +128,23 @@ def _take_over(
             if run_dir is None:
                 run_dir = _new_backup_run(respec_home, moment)
             destination = run_dir / target
-            shutil.copytree(folder, destination, symlinks=True)
+            try:
+                shutil.copytree(folder, destination, symlinks=True)
+            except (OSError, shutil.Error) as error:
+                # Nothing has changed yet: drop the partial backup run and stop.
+                shutil.rmtree(run_dir, ignore_errors=True)
+                raise RespecError(
+                    f"could not back up {folder} before taking it over; "
+                    f"nothing was changed: {error}"
+                ) from None
             backup = str(destination)
             backups[target] = backup
-        state.owned[target] = Owned(
+        owned[target] = Owned(
             skills_dir=str(folder),
             backup=backup,
             taken_over_at=moment.isoformat(),
         )
+    state.owned.update(owned)
     return backups
 
 
@@ -150,13 +171,25 @@ def _remove(respec_home: Path, item: Installed) -> bool:
 
 
 def _install(source: Path, destination: Path) -> str:
+    """Symlink ``source`` at ``destination``, copying when links are refused.
+
+    Raises ``OSError`` with nothing left at ``destination`` when neither works.
+    An existing destination is never overwritten or copied into.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.symlink(source, destination, target_is_directory=True)
         return "symlink"
+    except FileExistsError:
+        raise
     except OSError:
+        pass
+    try:
         shutil.copytree(source, destination, symlinks=True)
-        return "copy"
+    except (OSError, shutil.Error) as error:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise OSError(f"could not link or copy {source} to {destination}: {error}")
+    return "copy"
 
 
 def use(
@@ -174,18 +207,32 @@ def use(
     result.backups = _take_over(respec_home, user_home, profile, state, now)
     save_state(respec_home, state)
 
-    for item in state.installed:
-        if _remove(respec_home, item):
-            result.removed.append(item)
-    state.installed = []
+    # state.json is saved after every removal and every install, so it always
+    # lists each path respec has created and a later switch can remove it.
     state.active_profile = None
-    save_state(respec_home, state)
+    try:
+        for item in list(state.installed):
+            if _remove(respec_home, item):
+                result.removed.append(item)
+            state.installed.remove(item)
+            save_state(respec_home, state)
 
-    for target, skill, source, destination in plan:
-        mode = _install(source, destination)
-        record = Installed(target=target, name=skill, path=str(destination), mode=mode)
-        state.installed.append(record)
-        result.installed.append(record)
+        for target, skill, source, destination in plan:
+            mode = _install(source, destination)
+            record = Installed(
+                target=target, name=skill, path=str(destination), mode=mode
+            )
+            state.installed.append(record)
+            result.installed.append(record)
+            save_state(respec_home, state)
+    except OSError as error:
+        save_state(respec_home, state)
+        raise RespecError(
+            f"switch to profile {profile.name!r} did not complete: {error}\n"
+            "No profile is active. Items installed so far are recorded in "
+            "state.json and are removed by the next 'respec use'."
+        ) from None
+
     state.active_profile = profile.name
     save_state(respec_home, state)
     return result

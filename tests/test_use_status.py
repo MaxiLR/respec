@@ -342,3 +342,81 @@ def test_status_human_without_active_profile(run):
     assert result.exit_code == 0
     assert "No active profile" in result.stdout
     assert "respec use" in result.stdout
+
+
+def test_targets_sharing_one_real_folder_are_installed_once_and_tracked(
+    run, isolated_homes, dirs, state_file
+):
+    # A common setup: ~/.claude/skills is a symlink to ~/.agents/skills.
+    dirs["agents"].mkdir(parents=True)
+    dirs["claude-code"].parent.mkdir(parents=True)
+    dirs["claude-code"].symlink_to(dirs["agents"], target_is_directory=True)
+    make_profile(
+        isolated_homes.respec_home, "a", ["claude-code", "agents"], {"tdd": True}
+    )
+    make_profile(isolated_homes.respec_home, "b", ["oh-my-pi"], {"other": True})
+
+    result = run("use", "a")
+
+    assert result.exit_code == 0, result.output
+    assert sorted(p.name for p in dirs["agents"].iterdir()) == ["tdd"]
+    assert (dirs["agents"] / "tdd" / "SKILL.md").read_text() == "# tdd from a\n"
+    assert len(read_state(state_file)["installed"]) == 1
+
+    assert run("use", "b").exit_code == 0
+
+    assert list(dirs["agents"].iterdir()) == []
+    assert dirs["claude-code"].is_symlink()
+
+
+def test_failed_install_is_reported_and_earlier_installs_stay_tracked(
+    run, isolated_homes, dirs, state_file
+):
+    make_profile(
+        isolated_homes.respec_home, "a", ["claude-code", "agents"], {"tdd": True}
+    )
+    make_profile(isolated_homes.respec_home, "b", ["oh-my-pi"], {"other": True})
+    dirs["agents"].mkdir(parents=True)
+    dirs["agents"].chmod(0o555)  # neither a symlink nor a copy can be created
+    try:
+        result = run("use", "a")
+
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "error:" in result.output
+        assert recorded_paths(state_file) == [str(dirs["claude-code"] / "tdd")]
+        assert (dirs["claude-code"] / "tdd").is_symlink()
+    finally:
+        dirs["agents"].chmod(0o755)
+
+    assert run("use", "b").exit_code == 0
+
+    assert list(dirs["claude-code"].iterdir()) == []
+    assert list(dirs["agents"].iterdir()) == []
+
+
+def test_failed_backup_leaves_no_partial_backup_and_no_changes(
+    run, isolated_homes, dirs
+):
+    make_profile(
+        isolated_homes.respec_home, "a", ["claude-code", "agents"], {"tdd": True}
+    )
+    (dirs["claude-code"] / "mine").mkdir(parents=True)
+    (dirs["claude-code"] / "mine" / "SKILL.md").write_text("mine\n")
+    secret = dirs["agents"] / "secret.txt"
+    dirs["agents"].mkdir(parents=True)
+    secret.write_text("unreadable\n")
+    secret.chmod(0o000)
+    try:
+        result = run("use", "a")
+    finally:
+        secret.chmod(0o644)
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "back up" in result.output
+    backups = isolated_homes.respec_home / "backups"
+    assert not backups.exists() or list(backups.iterdir()) == []
+    assert not (isolated_homes.respec_home / "state.json").exists()
+    assert not (dirs["claude-code"] / "tdd").exists()
