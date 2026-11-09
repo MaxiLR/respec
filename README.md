@@ -2,6 +2,21 @@
 
 Switchable global profiles of agent skills across coding harnesses (Claude Code, oh-my-pi, .agents readers)
 
+## Usage
+
+```sh
+respec profile new work --target claude-code --target agents
+respec use work      # switch: remove the previous profile's items, link this one's
+respec status        # active profile, targets and managed items per folder
+```
+
+`respec use` links every enabled skill of the profile into each of its targets'
+folders (symlinks, or copies where symlinking fails) and records every created
+path in `~/.respec/state.json`. A switch removes only recorded paths, from every
+folder, then installs the new profile into its own targets. The first time
+respec takes over a target folder it copies the folder's full contents to
+`~/.respec/backups/<timestamp>/<target>/`. Installing respec changes nothing.
+
 ## Development
 
 ```sh
