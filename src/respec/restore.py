@@ -366,7 +366,7 @@ def _apply(
         again = f" {result.backup}" if result.backup else ""
         raise RespecError(
             f"restore did not complete: {error}\n"
-            "respec's items are removed and no profile is active; respec still "
+            "respec's skills are removed and no profile is active; respec still "
             f"owns its folders. Run 'respec restore{again}' again to finish."
         ) from None
     result.released = sorted(state.owned)

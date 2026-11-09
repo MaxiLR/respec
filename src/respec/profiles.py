@@ -55,7 +55,7 @@ BUILTIN_LAYER_KEYS = ("items", "active")
 OUTPUT_STYLE = "output-style"
 OUTPUT_STYLE_UNSUPPORTED = (
     "output styles are not supported yet; "
-    f"the {OUTPUT_STYLE!r} layer accepts no items until they are"
+    f"the {OUTPUT_STYLE!r} layer accepts no skills until they are"
 )
 BUILTIN_LAYERS: dict[str, str] = {
     "design-principles": (
@@ -63,7 +63,7 @@ BUILTIN_LAYERS: dict[str, str] = {
         "Never component libraries or project tokens."
     ),
     OUTPUT_STYLE: (
-        "How the agent writes its replies. Reserved: accepts no items until "
+        "How the agent writes its replies. Reserved: accepts no skills until "
         "output styles are supported."
     ),
 }
@@ -173,7 +173,7 @@ def exclusivity_problems(profile: Profile) -> list[str]:
         ]
         if len(enabled) > 1:
             problems.append(
-                f"layer {name!r} is exclusive but has {len(enabled)} enabled items "
+                f"layer {name!r} is exclusive but has {len(enabled)} enabled skills "
                 f"({', '.join(enabled)}); keep at most one enabled"
             )
     return problems

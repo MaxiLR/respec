@@ -100,7 +100,7 @@ def test_status_json_reports_foreign_entry_dropped_after_activation(
 
     folder = folder_report(status_json(run), "claude-code")
 
-    assert [item["name"] for item in folder["items"]] == ["tdd"]
+    assert [item["name"] for item in folder["skills"]] == ["tdd"]
     assert folder["unknown"] == [
         {
             "name": "foreign",
@@ -200,7 +200,7 @@ def test_switch_policy_add_copies_entry_into_new_profile_and_links_it(
     link = dirs["claude-code"] / "foreign"
     assert link.is_symlink() and link.resolve() == copied.resolve()
     report = folder_report(status_json(run), "claude-code")
-    assert sorted(i["name"] for i in report["items"]) == ["foreign", "lint"]
+    assert sorted(i["name"] for i in report["skills"]) == ["foreign", "lint"]
     assert report["unknown"] == []
 
 
@@ -261,7 +261,7 @@ def test_replaced_link_is_reported_as_unknown(run, activated, dirs):
 
     folder = folder_report(status_json(run), "claude-code")
 
-    assert folder["items"] == []
+    assert folder["skills"] == []
     assert [(u["name"], u["replaced"]) for u in folder["unknown"]] == [("tdd", True)]
 
 
@@ -329,7 +329,7 @@ def test_replaced_copy_is_reported_as_unknown_not_as_managed(
 
     folder = folder_report(status_json(run), "claude-code")
 
-    assert folder["items"] == []
+    assert folder["skills"] == []
     assert [(u["name"], u["replaced"]) for u in folder["unknown"]] == [("tdd", True)]
 
 
@@ -362,7 +362,7 @@ def test_unmodified_copy_stays_managed_and_is_replaced_on_switch(
     run, activated_as_copy, dirs
 ):
     folder = folder_report(status_json(run), "claude-code")
-    assert [(i["name"], i["mode"]) for i in folder["items"]] == [("tdd", "copy")]
+    assert [(i["name"], i["mode"]) for i in folder["skills"]] == [("tdd", "copy")]
     assert folder["unknown"] == []
 
     ok(run("use", "b"))
@@ -486,8 +486,10 @@ def test_status_lists_shared_items_once_whatever_the_profile_target_order(
 
     report = status_json(run)
 
-    assert [i["name"] for i in folder_report(report, "claude-code")["items"]] == ["tdd"]
-    assert folder_report(report, "agents")["items"] == []
+    assert [i["name"] for i in folder_report(report, "claude-code")["skills"]] == [
+        "tdd"
+    ]
+    assert folder_report(report, "agents")["skills"] == []
     assert folder_report(report, "agents")["same_as"] == "claude-code"
 
 
@@ -506,7 +508,7 @@ def test_layer_change_is_rolled_back_while_an_unknown_entry_waits(
 ):
     make_profile(respec_home, "a", ["claude-code"], ["tdd", "lint"])
     ok(run("use", "a"))
-    ok(run("layer", "add-item", "design-principles", "tdd"))
+    ok(run("layer", "add-skill", "design-principles", "tdd"))
     foreign = drop_skill(dirs["claude-code"], "foreign")
     before = (respec_home / "profiles" / "a" / "profile.yaml").read_text()
 

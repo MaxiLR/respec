@@ -156,7 +156,7 @@ def test_add_repo_with_several_skills_adds_each_with_its_own_path(
     result = ok(run("add", "acme/pack", "-p", "work", "--json"))
 
     data = json.loads(result.output)
-    assert sorted(data["items"]) == ["one", "two"]
+    assert sorted(data["skills"]) == ["one", "two"]
     skills = read_yaml(profiles_root, "work")["skills"]
     one = skills["one"]["source"]
     assert (one["repo"], one["path"], one["commit"]) == (
@@ -265,7 +265,7 @@ def sourced(run, upstream, tmp_path):
 
 def check(run, *extra):
     result = ok(run("update", "--check", "-p", "work", "--json", *extra))
-    return {row["item"]: row for row in json.loads(result.output)["items"]}
+    return {row["skill"]: row for row in json.loads(result.output)["skills"]}
 
 
 def test_check_reports_up_to_date_items(run, sourced):
@@ -436,7 +436,7 @@ def test_update_json_skips_locally_edited_items_without_yes(
 
     result = ok(run("update", "-p", "work", "--json"))
 
-    rows = {row["item"]: row for row in json.loads(result.output)["items"]}
+    rows = {row["skill"]: row for row in json.loads(result.output)["skills"]}
     assert rows["tdd"]["result"] == "skipped-local-edits"
     assert rows["lint"]["result"] == "updated"
     assert edited.read_text() == "# edited\n"
@@ -445,10 +445,10 @@ def test_update_json_skips_locally_edited_items_without_yes(
 def test_update_of_up_to_date_item_reports_nothing_to_do(run, sourced):
     result = ok(run("update", "tdd", "-p", "work", "--json"))
 
-    rows = json.loads(result.output)["items"]
+    rows = json.loads(result.output)["skills"]
     assert rows == [
         {
-            "item": "tdd",
+            "skill": "tdd",
             "result": "up-to-date",
             "current": sourced.first,
             "latest": sourced.first,
@@ -526,10 +526,10 @@ def test_profile_install_with_name_and_then_owned_locally(
     skills_repo.write("tdd/SKILL.md", "# tdd v2\n")
     skills_repo.commit()
     rows = {
-        row["item"]: row
+        row["skill"]: row
         for row in json.loads(
             ok(run("update", "--check", "-p", "mine", "--json")).output
-        )["items"]
+        )["skills"]
     }
     assert set(rows) == {"tdd"}
     assert rows["tdd"]["update_available"] is True

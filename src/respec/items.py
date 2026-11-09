@@ -27,7 +27,7 @@ SKILL_FILE = "SKILL.md"
 @dataclass
 class ItemChange:
     profile: str
-    item: str
+    skill: str
     action: str
     enabled: bool | None
     path: str
@@ -81,12 +81,12 @@ def add_local(
     item = name if name is not None else source.name
     if not profiles.NAME_PATTERN.match(item):
         raise RespecError(
-            f"skill folder name {item!r} is not a valid item name: "
+            f"skill folder name {item!r} is not a valid skill name: "
             f"{profiles.NAME_RULE}"
         )
     if item in profile.skills:
         raise RespecError(
-            f"profile {profile.name!r} already has an item {item!r}; "
+            f"profile {profile.name!r} already has a skill {item!r}; "
             f"remove it first with 'respec remove {item} -p {profile.name}'"
         )
     destination = _skill_folder(profile, item)
@@ -179,7 +179,7 @@ def add(
     item = next(skill for skill in profile.skills if skill not in before.skills)
     folder = _skill_folder(profile, item)
     change = ItemChange(
-        profile=name, item=item, action="add", enabled=True, path=str(folder)
+        profile=name, skill=item, action="add", enabled=True, path=str(folder)
     )
 
     def undo() -> None:
@@ -199,7 +199,7 @@ def _load_with_item(
     if item not in profile.skills:
         known = ", ".join(profile.skills) or "none"
         raise RespecError(
-            f"profile {profile.name!r} has no item {item!r} (items: {known})"
+            f"profile {profile.name!r} has no skill {item!r} (skills: {known})"
         )
     return profile
 
@@ -215,7 +215,7 @@ def set_enabled(
     profile = _load_with_item(respec_home, profile_name, item)
     change = ItemChange(
         profile=profile.name,
-        item=item,
+        skill=item,
         action="enable" if enabled else "disable",
         enabled=enabled,
         path=str(_skill_folder(profile, item)),
@@ -239,7 +239,11 @@ def remove(
     profile = _load_with_item(respec_home, profile_name, item)
     folder = _skill_folder(profile, item)
     change = ItemChange(
-        profile=profile.name, item=item, action="remove", enabled=None, path=str(folder)
+        profile=profile.name,
+        skill=item,
+        action="remove",
+        enabled=None,
+        path=str(folder),
     )
     skills = {name: entry for name, entry in profile.skills.items() if name != item}
     layers = {

@@ -181,12 +181,12 @@ def _folder_text(folder: dict[str, Any]) -> Text:
         text.append(f"same folder as {folder['same_as']}", style=SECONDARY)
         return text
     lines: list[Text] = []
-    for item in folder["items"]:
+    for skill in folder["skills"]:
         lines.append(
-            Text.assemble(("● ", SUCCESS), item["name"], (f"  {item['mode']}", MUTED))
+            Text.assemble(("● ", SUCCESS), skill["name"], (f"  {skill['mode']}", MUTED))
         )
     for entry in folder["unknown"]:
-        replaced = ", replaced a managed item" if entry["replaced"] else ""
+        replaced = ", replaced a managed skill" if entry["replaced"] else ""
         lines.append(
             Text.assemble(
                 ("▲ ", WARNING),
@@ -199,7 +199,7 @@ def _folder_text(folder: dict[str, Any]) -> Text:
             Text.assemble(("○ ", MUTED), entry["name"], ("  kept unmanaged", MUTED))
         )
     if not lines:
-        lines.append(Text("no managed items", style=MUTED))
+        lines.append(Text("no managed skills", style=MUTED))
     text.append(Text("\n").join(lines))
     return text
 
@@ -271,7 +271,7 @@ class AdoptDialog(ModalScreen[dict[str, str] | None]):
             with VerticalScroll(id="entries"):
                 for index, entry in enumerate(self.entries):
                     replaced = (
-                        ", replaced an item respec installed" if entry.replaced else ""
+                        ", replaced a skill respec installed" if entry.replaced else ""
                     )
                     with Vertical(id=f"unknown-{index}", classes="unknown"):
                         yield Static(entry.path, classes="unknown-path")

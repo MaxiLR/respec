@@ -28,7 +28,7 @@ class LayerChange:
     profile: str
     layer: str
     action: str
-    item: str | None = None
+    skill: str | None = None
     active: bool = False
     linked: list[str] = field(default_factory=list)
     unlinked: list[str] = field(default_factory=list)
@@ -84,7 +84,7 @@ def describe(layer_name: str, layer: profiles.Layer, profile: profiles.Profile):
         "description": layer.description,
         "builtin": layer.builtin,
         "active": layer.active,
-        "items": [
+        "skills": [
             {"name": item, "enabled": profile.skills[item].enabled}
             for item in layer.items
         ],
@@ -145,21 +145,21 @@ def _with_member(
     if item not in profile.skills:
         known = ", ".join(profile.skills) or "none"
         raise RespecError(
-            f"profile {profile.name!r} has no item {item!r} (items: {known})"
+            f"profile {profile.name!r} has no skill {item!r} (skills: {known})"
         )
     current = profile.layer_of(item)
     if current == name:
         return profile, layer
     if current is not None:
         raise RespecError(
-            f"{item!r} is already in layer {current!r}; an item belongs to at most "
-            f"one layer (remove it with 'respec layer remove-item {current} {item}')"
+            f"{item!r} is already in layer {current!r}; a skill belongs to at most "
+            f"one layer (remove it with 'respec layer remove-skill {current} {item}')"
         )
     layer = dataclasses.replace(layer, items=layer.items + (item,))
     return _with_layer(profile, name, layer), layer
 
 
-def add_item(
+def add_skill(
     respec_home: Path,
     user_home: Path,
     name: str,
@@ -181,11 +181,13 @@ def add_item(
         ]
         if others and after.skills[item].enabled:
             after = profiles.with_enabled(after, [item], False)
-    change = LayerChange(profile=before.name, layer=name, action="add-item", item=item)
+    change = LayerChange(
+        profile=before.name, layer=name, action="add-skill", skill=item
+    )
     return _apply(respec_home, user_home, before, after, change)
 
 
-def remove_item(
+def remove_skill(
     respec_home: Path,
     user_home: Path,
     name: str,
@@ -202,7 +204,7 @@ def remove_item(
     )
     after = _with_layer(before, name, layer)
     change = LayerChange(
-        profile=before.name, layer=name, action="remove-item", item=item
+        profile=before.name, layer=name, action="remove-skill", skill=item
     )
     return _apply(respec_home, user_home, before, after, change)
 
@@ -221,7 +223,7 @@ def use(
     before = _load(respec_home, profile_name)
     after, _ = _with_member(before, name, item)
     after = profiles.with_enabled(after, [item], True)
-    change = LayerChange(profile=before.name, layer=name, action="use", item=item)
+    change = LayerChange(profile=before.name, layer=name, action="use", skill=item)
     return _apply(respec_home, user_home, before, after, change)
 
 
@@ -237,8 +239,8 @@ def set_enabled(
     layer = _layer(before, name)
     if enabled and layer.exclusive and layer.active and len(layer.items) > 1:
         raise RespecError(
-            f"layer {name!r} is exclusive; choose one item with "
-            f"'respec layer use {name} <item>'"
+            f"layer {name!r} is exclusive; choose one skill with "
+            f"'respec layer use {name} <skill>'"
         )
     after = profiles.with_enabled(before, list(layer.items), enabled)
     action = "enable" if enabled else "disable"

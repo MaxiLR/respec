@@ -221,7 +221,7 @@ def _interactive() -> bool:
 
 def _prompt_choice(entry: unknown.Unknown, profile: str | None) -> str:
     """Ask what to do with one unknown entry."""
-    replaced = ", replaced an item respec installed" if entry.replaced else ""
+    replaced = ", replaced a skill respec installed" if entry.replaced else ""
     typer.echo(
         f"Unknown entry {entry.path} ({entry.kind} in "
         f"{', '.join(entry.targets)}{replaced})"
@@ -271,7 +271,7 @@ def use(
     ] = None,
     as_json: JsonOption = False,
 ) -> None:
-    """Activate a profile: remove the previous profile's items, install this one."""
+    """Activate a profile: remove the previous profile's skills, install this one."""
     homes = _homes(ctx)
     resolutions: list[adopt_entries.Resolution] = []
     decide: adopt_entries.Decide | None = None
@@ -316,16 +316,16 @@ def use(
         typer.echo(f"Backed up {target} folder to {backup}")
     if result.removed:
         previous = f" of profile {result.previous!r}" if result.previous else ""
-        typer.echo(f"Removed {len(result.removed)} items{previous}")
+        typer.echo(f"Removed {len(result.removed)} skills{previous}")
     typer.echo(
         f"Switched to profile {result.profile!r}: "
-        f"installed {len(result.installed)} items"
+        f"installed {len(result.installed)} skills"
     )
 
 
 @app.command("status")
 def status(ctx: typer.Context, as_json: JsonOption = False) -> None:
-    """Show the active profile, its targets and the items in each folder."""
+    """Show the active profile, its targets and the skills in each folder."""
     homes = _homes(ctx)
     try:
         report = switch.status(homes.respec_home)
@@ -345,13 +345,13 @@ def status(ctx: typer.Context, as_json: JsonOption = False) -> None:
         if folder["same_as"]:
             typer.echo(f"  (same folder as {folder['same_as']})")
             continue
-        if not folder["items"]:
-            typer.echo("  (no managed items)")
-        for item in folder["items"]:
-            typer.echo(f"  {item['name']}  {item['mode']}")
+        if not folder["skills"]:
+            typer.echo("  (no managed skills)")
+        for skill in folder["skills"]:
+            typer.echo(f"  {skill['name']}  {skill['mode']}")
         for entry in folder["unknown"]:
             any_unknown = True
-            replaced = ", replaced a managed item" if entry["replaced"] else ""
+            replaced = ", replaced a managed skill" if entry["replaced"] else ""
             typer.echo(f"  {entry['name']}  unknown {entry['kind']}{replaced}")
         for entry in folder["unmanaged"]:
             typer.echo(f"  {entry['name']}  unmanaged (kept)")
@@ -371,7 +371,7 @@ ProfileOption = Annotated[
         show_default=False,
     ),
 ]
-ItemArgument = Annotated[str, typer.Argument(help="Item (skill) name.")]
+SkillArgument = Annotated[str, typer.Argument(help="Skill name.")]
 
 
 def _report_change(change: items.ItemChange, as_json: bool) -> None:
@@ -379,10 +379,10 @@ def _report_change(change: items.ItemChange, as_json: bool) -> None:
         _print_json(change.to_dict())
         return
     messages = {
-        "add": f"Added {change.item!r} to profile {change.profile!r}",
-        "remove": f"Removed {change.item!r} from profile {change.profile!r}",
-        "enable": f"Enabled {change.item!r} in profile {change.profile!r}",
-        "disable": f"Disabled {change.item!r} in profile {change.profile!r}",
+        "add": f"Added {change.skill!r} to profile {change.profile!r}",
+        "remove": f"Removed {change.skill!r} from profile {change.profile!r}",
+        "enable": f"Enabled {change.skill!r} in profile {change.profile!r}",
+        "disable": f"Disabled {change.skill!r} in profile {change.profile!r}",
     }
     typer.echo(messages[change.action])
     for path in change.linked:
@@ -441,10 +441,10 @@ def _report_sourced(change: sources.SourceChange, as_json: bool) -> None:
     if as_json:
         _print_json(change.to_dict())
         return
-    for item in change.items:
-        origin = change.sources[item]
+    for skill in change.skills:
+        origin = change.sources[skill]
         typer.echo(
-            f"Added {item!r} to profile {change.profile!r} from "
+            f"Added {skill!r} to profile {change.profile!r} from "
             f"{_source_label(profiles.Source(**origin))} "
             f"at {origin['commit'][:12]}"
         )
@@ -455,26 +455,26 @@ def _report_sourced(change: sources.SourceChange, as_json: bool) -> None:
 @app.command("remove")
 def remove(
     ctx: typer.Context,
-    item: ItemArgument,
+    skill: SkillArgument,
     profile: ProfileOption = None,
     as_json: JsonOption = False,
 ) -> None:
-    """Remove an item from a profile and delete its files."""
+    """Remove a skill from a profile and delete its files."""
     homes = _homes(ctx)
     try:
-        change = items.remove(homes.respec_home, homes.user_home, item, profile)
+        change = items.remove(homes.respec_home, homes.user_home, skill, profile)
     except RespecError as error:
         _fail(error)
     _report_change(change, as_json)
 
 
 def _set_enabled(
-    ctx: typer.Context, item: str, enabled: bool, profile: str | None, as_json: bool
+    ctx: typer.Context, skill: str, enabled: bool, profile: str | None, as_json: bool
 ) -> None:
     homes = _homes(ctx)
     try:
         change = items.set_enabled(
-            homes.respec_home, homes.user_home, item, enabled, profile
+            homes.respec_home, homes.user_home, skill, enabled, profile
         )
     except RespecError as error:
         _fail(error)
@@ -484,27 +484,27 @@ def _set_enabled(
 @app.command("enable")
 def enable(
     ctx: typer.Context,
-    item: ItemArgument,
+    skill: SkillArgument,
     profile: ProfileOption = None,
     as_json: JsonOption = False,
 ) -> None:
-    """Enable an item; an active profile links it right away."""
-    _set_enabled(ctx, item, True, profile, as_json)
+    """Enable a skill; an active profile links it right away."""
+    _set_enabled(ctx, skill, True, profile, as_json)
 
 
 @app.command("disable")
 def disable(
     ctx: typer.Context,
-    item: ItemArgument,
+    skill: SkillArgument,
     profile: ProfileOption = None,
     as_json: JsonOption = False,
 ) -> None:
-    """Disable an item, keeping its files and metadata."""
-    _set_enabled(ctx, item, False, profile, as_json)
+    """Disable a skill, keeping its files and metadata."""
+    _set_enabled(ctx, skill, False, profile, as_json)
 
 
 layer_app = typer.Typer(
-    help="Group a profile's items into layers.", no_args_is_help=True
+    help="Group a profile's skills into layers.", no_args_is_help=True
 )
 app.add_typer(layer_app, name="layer")
 LayerArgument = Annotated[str, typer.Argument(help="Layer name.")]
@@ -517,12 +517,12 @@ def _report_layer_change(change: layers.LayerChange, as_json: bool) -> None:
     where = f"layer {change.layer!r} of profile {change.profile!r}"
     messages = {
         "add": f"Added {where}",
-        "rm": f"Removed {where}; its items stay in the profile",
-        "add-item": f"Added {change.item!r} to {where}",
-        "remove-item": f"Removed {change.item!r} from {where}",
-        "use": f"Using {change.item!r} in {where}",
-        "enable": f"Enabled the items of {where}",
-        "disable": f"Disabled the items of {where}",
+        "rm": f"Removed {where}; its skills stay in the profile",
+        "add-skill": f"Added {change.skill!r} to {where}",
+        "remove-skill": f"Removed {change.skill!r} from {where}",
+        "use": f"Using {change.skill!r} in {where}",
+        "enable": f"Enabled the skills of {where}",
+        "disable": f"Disabled the skills of {where}",
         "on": f"Turned on {where}",
         "off": f"Turned off {where}; its rules no longer apply",
     }
@@ -546,7 +546,7 @@ def _layer_kind(layer: dict[str, Any]) -> str:
 def layer_list(
     ctx: typer.Context, profile: ProfileOption = None, as_json: JsonOption = False
 ) -> None:
-    """List a profile's layers with their items."""
+    """List a profile's layers with their skills."""
     homes = _homes(ctx)
     try:
         rows = layers.list_layers(homes.respec_home, profile)
@@ -558,8 +558,8 @@ def layer_list(
     width = max(len(row["name"]) for row in rows)
     for row in rows:
         members = ", ".join(
-            item["name"] + ("" if item["enabled"] else " (disabled)")
-            for item in row["items"]
+            skill["name"] + ("" if skill["enabled"] else " (disabled)")
+            for skill in row["skills"]
         )
         typer.echo(
             f"{row['name']:<{width}}  [{_layer_kind(row)}]  {members or '(empty)'}"
@@ -573,7 +573,7 @@ def layer_show(
     profile: ProfileOption = None,
     as_json: JsonOption = False,
 ) -> None:
-    """Show a layer's rule, description and items."""
+    """Show a layer's rule, description and skills."""
     homes = _homes(ctx)
     try:
         row = layers.show(homes.respec_home, name, profile)
@@ -584,13 +584,13 @@ def layer_show(
         return
     typer.echo(f"Layer {row['name']}  [{_layer_kind(row)}]  profile {row['profile']}")
     typer.echo(f"  {row['description']}")
-    if not row["items"]:
-        typer.echo("Items: none")
+    if not row["skills"]:
+        typer.echo("Skills: none")
         return
-    typer.echo("Items:")
-    for item in row["items"]:
-        state = "enabled" if item["enabled"] else "disabled"
-        typer.echo(f"  {item['name']}  {state}")
+    typer.echo("Skills:")
+    for skill in row["skills"]:
+        state = "enabled" if skill["enabled"] else "disabled"
+        typer.echo(f"  {skill['name']}  {state}")
 
 
 @layer_app.command("add")
@@ -601,7 +601,7 @@ def layer_add(
         bool,
         typer.Option(
             "--exclusive/--additive",
-            help="Exclusive: at most one enabled item. Additive: any number.",
+            help="Exclusive: at most one enabled skill. Additive: any number.",
         ),
     ],
     description: Annotated[
@@ -629,7 +629,7 @@ def layer_rm(
     profile: ProfileOption = None,
     as_json: JsonOption = False,
 ) -> None:
-    """Remove a custom layer; its items stay in the profile."""
+    """Remove a custom layer; its skills stay in the profile."""
     homes = _homes(ctx)
     try:
         change = layers.remove(homes.respec_home, name, profile)
@@ -638,10 +638,10 @@ def layer_rm(
     _report_layer_change(change, as_json)
 
 
-def _layer_item_command(ctx, function, name, item, profile, as_json) -> None:
+def _layer_skill_command(ctx, function, name, skill, profile, as_json) -> None:
     homes = _homes(ctx)
     try:
-        change = function(homes.respec_home, homes.user_home, name, item, profile)
+        change = function(homes.respec_home, homes.user_home, name, skill, profile)
     except RespecError as error:
         _fail(error)
     _report_layer_change(change, as_json)
@@ -651,36 +651,36 @@ def _layer_item_command(ctx, function, name, item, profile, as_json) -> None:
 def layer_use(
     ctx: typer.Context,
     name: LayerArgument,
-    item: ItemArgument,
+    skill: SkillArgument,
     profile: ProfileOption = None,
     as_json: JsonOption = False,
 ) -> None:
-    """Enable an item in a layer (adding it); exclusive layers disable the rest."""
-    _layer_item_command(ctx, layers.use, name, item, profile, as_json)
+    """Enable a skill in a layer (adding it); exclusive layers disable the rest."""
+    _layer_skill_command(ctx, layers.use, name, skill, profile, as_json)
 
 
-@layer_app.command("add-item")
-def layer_add_item(
+@layer_app.command("add-skill")
+def layer_add_skill(
     ctx: typer.Context,
     name: LayerArgument,
-    item: ItemArgument,
+    skill: SkillArgument,
     profile: ProfileOption = None,
     as_json: JsonOption = False,
 ) -> None:
-    """Add an item to a layer, keeping an exclusive layer's current choice."""
-    _layer_item_command(ctx, layers.add_item, name, item, profile, as_json)
+    """Add a skill to a layer, keeping an exclusive layer's current choice."""
+    _layer_skill_command(ctx, layers.add_skill, name, skill, profile, as_json)
 
 
-@layer_app.command("remove-item")
-def layer_remove_item(
+@layer_app.command("remove-skill")
+def layer_remove_skill(
     ctx: typer.Context,
     name: LayerArgument,
-    item: ItemArgument,
+    skill: SkillArgument,
     profile: ProfileOption = None,
     as_json: JsonOption = False,
 ) -> None:
-    """Take an item out of a layer; it stays in the profile."""
-    _layer_item_command(ctx, layers.remove_item, name, item, profile, as_json)
+    """Take a skill out of a layer; it stays in the profile."""
+    _layer_skill_command(ctx, layers.remove_skill, name, skill, profile, as_json)
 
 
 def _layer_flag_command(ctx, function, name, value, profile, as_json) -> None:
@@ -699,7 +699,7 @@ def layer_enable(
     profile: ProfileOption = None,
     as_json: JsonOption = False,
 ) -> None:
-    """Enable every item of a layer."""
+    """Enable every skill of a layer."""
     _layer_flag_command(ctx, layers.set_enabled, name, True, profile, as_json)
 
 
@@ -710,7 +710,7 @@ def layer_disable(
     profile: ProfileOption = None,
     as_json: JsonOption = False,
 ) -> None:
-    """Disable every item of a layer, keeping their files."""
+    """Disable every skill of a layer, keeping their files."""
     _layer_flag_command(ctx, layers.set_enabled, name, False, profile, as_json)
 
 
@@ -732,7 +732,7 @@ def layer_off(
     profile: ProfileOption = None,
     as_json: JsonOption = False,
 ) -> None:
-    """Turn a layer off: its items become plain additive items."""
+    """Turn a layer off: its skills become plain additive skills."""
     _layer_flag_command(ctx, layers.set_active, name, False, profile, as_json)
 
 
@@ -959,12 +959,12 @@ def restore(
     for resolution in resolutions + result.set_aside:
         _report_resolution(resolution)
     if result.removed:
-        typer.echo(f"Removed {len(result.removed)} respec items")
+        typer.echo(f"Removed {len(result.removed)} respec skills")
     for target, source in result.restored.items():
         origin = source if source else "nothing (folder did not exist)"
         typer.echo(f"Restored {target} from {origin}")
     for path in result.skipped:
-        typer.echo(f"Skipped {path}: respec's own item, not restored")
+        typer.echo(f"Skipped {path}: respec's own skill, not restored")
     for path in result.left:
         typer.echo(f"Left {path} in place: kept or hidden, not in the backup")
     typer.echo("respec released its folders; no profile is active.")
@@ -973,14 +973,14 @@ def restore(
 @app.command("update")
 def update(
     ctx: typer.Context,
-    item: Annotated[
+    skill: Annotated[
         Optional[str],
-        typer.Argument(help="Item to update (default: every sourced item)."),
+        typer.Argument(help="Skill to update (default: every sourced skill)."),
     ] = None,
     profile: ProfileOption = None,
     check_only: Annotated[
         bool,
-        typer.Option("--check", help="Only report which items have newer commits."),
+        typer.Option("--check", help="Only report which skills have newer commits."),
     ] = False,
     yes: Annotated[
         bool,
@@ -988,10 +988,10 @@ def update(
     ] = False,
     as_json: JsonOption = False,
 ) -> None:
-    """Check for or apply newer upstream commits of sourced items."""
+    """Check for or apply newer upstream commits of sourced skills."""
     homes = _homes(ctx)
     if check_only:
-        _update_check(homes, profile, item, as_json)
+        _update_check(homes, profile, skill, as_json)
         return
 
     def confirm(name: str) -> bool:
@@ -1006,17 +1006,17 @@ def update(
 
     try:
         result = sources.update(
-            homes.respec_home, homes.user_home, profile, item, confirm
+            homes.respec_home, homes.user_home, profile, skill, confirm
         )
     except RespecError as error:
         _fail(error)
-    failed = any(row["result"] == "error" for row in result.items)
+    failed = any(row["result"] == "error" for row in result.skills)
     if as_json:
         _print_json(result.to_dict())
     else:
-        if not result.items:
-            typer.echo(f"Profile {result.profile!r} has no items with a source.")
-        for row in result.items:
+        if not result.skills:
+            typer.echo(f"Profile {result.profile!r} has no skills with a source.")
+        for row in result.skills:
             typer.echo(_update_line(row))
         for path in result.linked:
             typer.echo(f"  linked {path}")
@@ -1025,12 +1025,12 @@ def update(
 
 
 def _short(commit: str | None) -> str:
-    """A commit for messages; items installed without one show as unknown."""
+    """A commit for messages; skills installed without one show as unknown."""
     return commit[:12] if commit else "unknown"
 
 
 def _update_line(row: dict[str, Any]) -> str:
-    name = row["item"]
+    name = row["skill"]
     outcome = row["result"]
     if outcome == "updated":
         return f"{name}  updated {_short(row['current'])} -> {_short(row['latest'])}"
@@ -1042,17 +1042,17 @@ def _update_line(row: dict[str, Any]) -> str:
 
 
 def _update_check(
-    homes: Homes, profile: str | None, item: str | None, as_json: bool
+    homes: Homes, profile: str | None, skill: str | None, as_json: bool
 ) -> None:
     try:
-        name, rows = sources.check(homes.respec_home, profile, item)
+        name, rows = sources.check(homes.respec_home, profile, skill)
     except RespecError as error:
         _fail(error)
     if as_json:
-        _print_json({"profile": name, "items": [row.to_dict() for row in rows]})
+        _print_json({"profile": name, "skills": [row.to_dict() for row in rows]})
     else:
         if not rows:
-            typer.echo(f"Profile {name!r} has no items with a source.")
+            typer.echo(f"Profile {name!r} has no skills with a source.")
         for row in rows:
             edits = "  (local edits)" if row.modified else ""
             if row.error:
@@ -1063,7 +1063,7 @@ def _update_check(
                 )
             else:
                 state = "up to date"
-            typer.echo(f"{row.item}  {state}{edits}")
+            typer.echo(f"{row.skill}  {state}{edits}")
     if any(row.error for row in rows):
         raise typer.Exit(code=1)
 
@@ -1097,5 +1097,5 @@ def profile_install(
     else:
         typer.echo(
             f"Installed profile {installed.name!r} at {installed.path} "
-            f"({len(installed.skills)} items)"
+            f"({len(installed.skills)} skills)"
         )

@@ -393,10 +393,10 @@ def _find_skills(tree: Path, spec: Spec) -> list[tuple[str, str | None]]:
 
 @dataclass
 class SourceChange:
-    """Result of adding items from a repository."""
+    """Result of adding skills from a repository."""
 
     profile: str
-    items: list[str]
+    skills: list[str]
     sources: dict[str, dict[str, str]]
     action: str = "add"
     active: bool = False
@@ -450,7 +450,7 @@ def add(
             _forget(before, added)
             raise RespecError(f"could not add from {spec.repo}: {error}") from None
 
-    change = SourceChange(profile=name, items=added, sources=sources)
+    change = SourceChange(profile=name, skills=added, sources=sources)
     items.refresh_active(respec_home, user_home, change, lambda: _forget(before, added))
     return change
 
@@ -466,7 +466,7 @@ def _forget(before: profiles.Profile, added: list[str]) -> None:
 
 @dataclass
 class Row:
-    item: str
+    skill: str
     current: str | None
     latest: str | None = None
     update_available: bool | None = None
@@ -483,11 +483,11 @@ def _sourced(profile: profiles.Profile, item: str | None) -> list[str]:
     if item not in profile.skills:
         known = ", ".join(profile.skills) or "none"
         raise RespecError(
-            f"profile {profile.name!r} has no item {item!r} (items: {known})"
+            f"profile {profile.name!r} has no skill {item!r} (skills: {known})"
         )
     if profile.skills[item].source is None:
         raise RespecError(
-            f"item {item!r} has no source; items without a source never change"
+            f"skill {item!r} has no source; skills without a source never change"
         )
     return [item]
 
@@ -518,7 +518,7 @@ def check(
     for name in _sourced(profile, item):
         source = profile.skills[name].source
         assert source is not None
-        row = Row(item=name, current=source.commit, modified=_modified(profile, name))
+        row = Row(skill=name, current=source.commit, modified=_modified(profile, name))
         try:
             row.latest = _latest(source, cache)
             row.update_available = row.latest != source.commit
@@ -531,7 +531,7 @@ def check(
 @dataclass
 class UpdateResult:
     profile: str
-    items: list[dict[str, object]] = field(default_factory=list)
+    skills: list[dict[str, object]] = field(default_factory=list)
     active: bool = False
     linked: list[str] = field(default_factory=list)
     unlinked: list[str] = field(default_factory=list)
@@ -566,8 +566,8 @@ def update(
         for name in _sourced(profile, item):
             source = skills[name].source
             assert source is not None
-            row: dict[str, object] = {"item": name, "current": source.commit}
-            result.items.append(row)
+            row: dict[str, object] = {"skill": name, "current": source.commit}
+            result.skills.append(row)
             try:
                 latest = _latest(source, cache)
             except RespecError as error:
@@ -686,7 +686,7 @@ def install_profile(
         ]
         if missing:
             raise RespecError(
-                f"{where} lists items without a {profiles.SKILLS_DIR}/<item>/"
+                f"{where} lists skills without a {profiles.SKILLS_DIR}/<skill>/"
                 f"{items.SKILL_FILE}: {', '.join(missing)}"
             )
         try:

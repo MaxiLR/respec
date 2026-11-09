@@ -293,7 +293,7 @@ def test_commands_support_json(run, tmp_path, profiles_root, dirs):
     link = str(dirs["claude-code"] / "tdd")
     assert added == {
         "profile": "work",
-        "item": "tdd",
+        "skill": "tdd",
         "action": "add",
         "enabled": True,
         "path": str(profiles_root / "work" / "skills" / "tdd"),
