@@ -140,14 +140,19 @@ def test_show_json_includes_resolved_target_dirs_and_skills(
     }
 
 
-def test_home_option_relocates_target_dirs(run, sourced_profile, tmp_path):
-    other = tmp_path / "other-home"
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--home", "x", "profile", "show", "work"),
+        ("profile", "show", "work", "--home", "x"),
+        ("tui", "--home", "x"),
+    ],
+)
+def test_home_option_is_rejected(run, sourced_profile, args):
+    result = run(*args)
 
-    result = run("--home", str(other), "profile", "show", "work", "--json")
-
-    assert result.exit_code == 0, result.output
-    dirs = [t["skills_dir"] for t in json.loads(result.stdout)["targets"]]
-    assert dirs[0] == str(other / ".claude" / "skills")
+    assert result.exit_code == 2
+    assert "No such option: --home" in result.output
 
 
 def test_user_home_env_relocates_target_dirs(run, sourced_profile, tmp_path):
@@ -159,6 +164,7 @@ def test_user_home_env_relocates_target_dirs(run, sourced_profile, tmp_path):
 
     assert result.exit_code == 0, result.output
     dirs = [t["skills_dir"] for t in json.loads(result.stdout)["targets"]]
+    assert dirs[0] == str(other / ".claude" / "skills")
     assert dirs[2] == str(other / ".omp" / "agent" / "skills")
 
 

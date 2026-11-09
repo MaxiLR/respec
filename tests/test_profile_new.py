@@ -22,6 +22,26 @@ def test_new_without_respec_home_uses_dot_respec_in_home(run, isolated_homes):
     assert not (isolated_homes.respec_home / "profiles").exists()
 
 
+def test_new_without_respec_home_follows_relocated_user_home(
+    run, isolated_homes, tmp_path
+):
+    other = tmp_path / "other-home"
+
+    result = run(
+        "profile",
+        "new",
+        "solo",
+        "--target",
+        "agents",
+        env={"RESPEC_HOME": None, "RESPEC_USER_HOME": str(other)},
+    )
+
+    assert result.exit_code == 0, result.output
+    expected = other / ".respec" / "profiles" / "solo" / "profile.yaml"
+    assert expected.is_file()
+    assert not (isolated_homes.home / ".respec").exists()
+
+
 def test_new_rejects_unknown_target(run, isolated_homes):
     result = run("profile", "new", "work", "--target", "cursor")
 

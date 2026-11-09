@@ -75,8 +75,9 @@ uv run pytest
 uv run black --check .
 ```
 
-`RESPEC_HOME` relocates respec's data folder (default `~/.respec`).
-`RESPEC_USER_HOME` or `respec --home <dir>` relocates the home that target
-folders such as `~/.claude/skills` resolve against. The test suite points
+Two environment variables are advanced/testing overrides, not everyday options:
+`RESPEC_USER_HOME` relocates the home that target folders such as
+`~/.claude/skills` resolve against, and `RESPEC_HOME` relocates respec's data
+folder (default `.respec` inside that home). The test suite points
 `HOME`, `RESPEC_HOME` and `RESPEC_USER_HOME` at temporary folders for every test
 and fails any test that resolves a respec path under the real home.
