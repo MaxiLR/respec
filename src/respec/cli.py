@@ -12,7 +12,7 @@ from typing import Annotated, Any, NoReturn, Optional
 import typer
 
 from respec import adopt as adopt_entries
-from respec import items, layers, paths, profiles, switch, targets, unknown
+from respec import items, layers, paths, profiles, sources, switch, targets, unknown
 from respec import restore as restore_backups
 from respec.errors import RespecError
 from respec.state import load_state
@@ -391,22 +391,65 @@ def _report_change(change: items.ItemChange, as_json: bool) -> None:
         typer.echo(f"  unlinked {path}")
 
 
+RefOption = Annotated[
+    Optional[str],
+    typer.Option(
+        "--ref",
+        help="Branch, tag or commit to fetch (default: the remote's default branch).",
+        show_default=False,
+    ),
+]
+
+
 @app.command("add")
 def add(
     ctx: typer.Context,
-    path: Annotated[
-        Path, typer.Argument(help="Local skill folder (must contain SKILL.md).")
+    source: Annotated[
+        str,
+        typer.Argument(
+            help="Local skill folder (with SKILL.md), 'owner/repo[#path]' "
+            "or a git URL[#path]. An existing local folder wins.",
+            metavar="SOURCE",
+        ),
     ],
     profile: ProfileOption = None,
+    ref: RefOption = None,
     as_json: JsonOption = False,
 ) -> None:
-    """Copy a local skill folder into a profile and enable it."""
+    """Add a skill from a local folder or a git repository and enable it."""
     homes = _homes(ctx)
+    local = Path(source).expanduser()
+    from_git = not local.exists() and sources.is_git_spec(source)
     try:
-        change = items.add(homes.respec_home, homes.user_home, path, profile)
+        if from_git:
+            sourced = sources.add(
+                homes.respec_home, homes.user_home, source, profile, ref
+            )
+        elif ref is not None:
+            raise RespecError("--ref only applies to git sources")
+        else:
+            change = items.add(homes.respec_home, homes.user_home, local, profile)
     except RespecError as error:
         _fail(error)
-    _report_change(change, as_json)
+    if from_git:
+        _report_sourced(sourced, as_json)
+    else:
+        _report_change(change, as_json)
+
+
+def _report_sourced(change: sources.SourceChange, as_json: bool) -> None:
+    if as_json:
+        _print_json(change.to_dict())
+        return
+    for item in change.items:
+        origin = change.sources[item]
+        typer.echo(
+            f"Added {item!r} to profile {change.profile!r} from "
+            f"{_source_label(profiles.Source(**origin))} "
+            f"at {origin['commit'][:12]}"
+        )
+    for path in change.linked:
+        typer.echo(f"  linked {path}")
 
 
 @app.command("remove")
@@ -925,3 +968,127 @@ def restore(
     for path in result.left:
         typer.echo(f"Left {path} in place: kept or hidden, not in the backup")
     typer.echo("respec released its folders; no profile is active.")
+
+
+@app.command("update")
+def update(
+    ctx: typer.Context,
+    item: Annotated[
+        Optional[str],
+        typer.Argument(help="Item to update (default: every sourced item)."),
+    ] = None,
+    profile: ProfileOption = None,
+    check_only: Annotated[
+        bool,
+        typer.Option("--check", help="Only report which items have newer commits."),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Overwrite local edits without asking."),
+    ] = False,
+    as_json: JsonOption = False,
+) -> None:
+    """Check for or apply newer upstream commits of sourced items."""
+    homes = _homes(ctx)
+    if check_only:
+        _update_check(homes, profile, item, as_json)
+        return
+
+    def confirm(name: str) -> bool:
+        if yes:
+            return True
+        if as_json:
+            return False
+        return typer.confirm(
+            f"{name!r} has local edits that the update would overwrite. Overwrite?",
+            default=False,
+        )
+
+    try:
+        result = sources.update(
+            homes.respec_home, homes.user_home, profile, item, confirm
+        )
+    except RespecError as error:
+        _fail(error)
+    failed = any(row["result"] == "error" for row in result.items)
+    if as_json:
+        _print_json(result.to_dict())
+    else:
+        if not result.items:
+            typer.echo(f"Profile {result.profile!r} has no items with a source.")
+        for row in result.items:
+            typer.echo(_update_line(row))
+        for path in result.linked:
+            typer.echo(f"  linked {path}")
+    if failed:
+        raise typer.Exit(code=1)
+
+
+def _update_line(row: dict[str, Any]) -> str:
+    name = row["item"]
+    outcome = row["result"]
+    if outcome == "updated":
+        return f"{name}  updated {row['current'][:12]} -> {row['latest'][:12]}"
+    if outcome == "up-to-date":
+        return f"{name}  up to date"
+    if outcome == "skipped-local-edits":
+        return f"{name}  skipped: local edits kept (use --yes to overwrite)"
+    return f"{name}  error: {row['error']}"
+
+
+def _update_check(
+    homes: Homes, profile: str | None, item: str | None, as_json: bool
+) -> None:
+    try:
+        name, rows = sources.check(homes.respec_home, profile, item)
+    except RespecError as error:
+        _fail(error)
+    if as_json:
+        _print_json({"profile": name, "items": [row.to_dict() for row in rows]})
+    else:
+        if not rows:
+            typer.echo(f"Profile {name!r} has no items with a source.")
+        for row in rows:
+            edits = "  (local edits)" if row.modified else ""
+            if row.error:
+                state = f"error: {row.error}"
+            elif row.update_available:
+                state = f"update available {row.current[:12]} -> {row.latest[:12]}"
+            else:
+                state = "up to date"
+            typer.echo(f"{row.item}  {state}{edits}")
+    if any(row.error for row in rows):
+        raise typer.Exit(code=1)
+
+
+@profile_app.command("install")
+def profile_install(
+    ctx: typer.Context,
+    source: Annotated[
+        str,
+        typer.Argument(
+            help="'owner/repo[#path]' or a git URL[#path] of a profile folder "
+            "(with profile.yaml).",
+            metavar="REPO",
+        ),
+    ],
+    name: Annotated[
+        Optional[str],
+        typer.Option("--name", help="Profile name (default: the repo or folder name)."),
+    ] = None,
+    ref: RefOption = None,
+    as_json: JsonOption = False,
+) -> None:
+    """Copy a whole profile from a repository once; it is then owned locally."""
+    homes = _homes(ctx)
+    try:
+        installed = sources.install_profile(homes.respec_home, source, name, ref)
+    except RespecError as error:
+        _fail(error)
+    if as_json:
+        _print_json({"name": installed.name, "path": str(installed.path)})
+    else:
+        typer.echo(
+            f"Installed profile {installed.name!r} at {installed.path} "
+            f"({len(installed.skills)} items)"
+        )

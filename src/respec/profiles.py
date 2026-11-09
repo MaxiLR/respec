@@ -12,6 +12,7 @@ schema of ``profile.yaml``::
           path: skills/my-skill      # optional
           ref: main                  # optional
           commit: 0123abcd           # optional resolved commit
+          digest: sha256:...         # optional hash of the files as fetched
     layers:                          # optional; named groups of skills
       design-principles:             # built-in: only items and active allowed
         items: [my-skill]
@@ -46,7 +47,7 @@ NAME_RULE = "use letters, digits, '.', '_' or '-', starting with a letter or dig
 
 TOP_LEVEL_KEYS = ("targets", "skills", "layers")
 SKILL_KEYS = ("enabled", "source")
-SOURCE_KEYS = ("repo", "path", "ref", "commit")
+SOURCE_KEYS = ("repo", "path", "ref", "commit", "digest")
 LAYER_KEYS = ("exclusive", "description", "items", "active")
 BUILTIN_LAYER_KEYS = ("items", "active")
 
@@ -83,6 +84,7 @@ class Source:
     path: str | None = None
     ref: str | None = None
     commit: str | None = None
+    digest: str | None = None
 
     def to_dict(self) -> dict[str, str]:
         return {key: value for key, value in vars(self).items() if value is not None}
@@ -232,6 +234,67 @@ def _unknown_keys(where: str, data: dict[Any, Any], allowed: tuple[str, ...]):
     ]
 
 
+GIT_BASE_URL_ENV = "RESPEC_GIT_BASE_URL"
+DEFAULT_GIT_BASE_URL = "https://github.com"
+REPO_SHORTHAND = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+REPO_SCP_LIKE = re.compile(r"^[\w.-]+@[\w.-]+:")
+REPO_URL = re.compile(r"^(https?|ssh|git|file)://\S+$")
+
+
+def git_base_url() -> str:
+    """Base URL for ``owner/repo``; read at call time so tests can inject it."""
+    return os.environ.get(GIT_BASE_URL_ENV) or DEFAULT_GIT_BASE_URL
+
+
+def _repo_problem(repo: str) -> str | None:
+    """Only remote repositories: 'owner/repo', ``user@host:path`` or a URL.
+
+    ``file://`` is accepted only below a ``file://`` base URL (the injectable
+    test seam), so a profile cannot point respec at local repositories.
+    """
+    if REPO_SHORTHAND.match(repo) or REPO_SCP_LIKE.match(repo):
+        return None
+    match = REPO_URL.match(repo)
+    if match and match.group(1) != "file":
+        return None
+    base = git_base_url().rstrip("/")
+    if (
+        match
+        and base.startswith("file://")
+        and repo.startswith(base + "/")
+        and "%" not in repo
+        and not any(part in (".", "..") for part in repo.split("/"))
+    ):
+        return None
+    return (
+        f"source repo {repo!r} must be 'owner/repo', 'user@host:path' or an "
+        "https, http, ssh or git URL (local paths, file URLs and other "
+        "transports are refused)"
+    )
+
+
+def source_value_problem(key: str, value: str) -> str | None:
+    """Why a source ``repo``, ``ref`` or ``path`` value is unsafe, or None.
+
+    Values starting with '-' could be read by git as options, and a ``path``
+    must stay inside the repository it names.
+    """
+    if value.startswith("-"):
+        return f"source {key} {value!r} must not start with '-'"
+    if key == "repo":
+        return _repo_problem(value)
+    if key == "path" and (
+        value.startswith("/")
+        or "\\" in value
+        or any(part in ("", ".", "..") for part in value.split("/"))
+    ):
+        return (
+            f"source path {value!r} must be a relative path inside the repository "
+            "(no leading '/', no '.' or '..' parts)"
+        )
+    return None
+
+
 def _parse_source(where: str, raw: Any, problems: list[str]) -> Source | None:
     if not isinstance(raw, dict):
         problems.append(f"{where} must be a mapping with keys {', '.join(SOURCE_KEYS)}")
@@ -243,6 +306,10 @@ def _parse_source(where: str, raw: Any, problems: list[str]) -> Source | None:
             continue
         if not isinstance(raw[key], str) or not raw[key]:
             problems.append(f"{where}.{key} must be a non-empty string")
+            continue
+        problem = source_value_problem(key, raw[key])
+        if problem:
+            problems.append(f"{where}.{key}: {problem}")
         else:
             values[key] = raw[key]
     if "repo" not in raw:

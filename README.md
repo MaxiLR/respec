@@ -15,11 +15,31 @@ respec enable my-skill [-p work]
 respec remove my-skill [-p work]  # drop it from profile.yaml and delete its folder
 respec adopt [--add|--backup|--keep <entry>] [--all <choice>] [-p work]
 respec restore [<backup>] [--list] [--unknown add|backup|keep] [--overwrite]
+respec add owner/repo[#path] [--ref main] [-p work]  # fetch skill(s) from git
+respec update --check [-p work]   # which sourced items have newer commits
+respec update [my-skill] [-p work] [--yes]  # apply; --yes overwrites local edits
+respec profile install owner/repo[#path] [--name mine]  # copy a whole profile once
 ```
 
 `add`, `remove`, `enable` and `disable` change the active profile unless `-p`
 names another. When the changed profile is active, its target folders are
 refreshed right away. Every command accepts `--json`.
+
+`add` also takes `owner/repo[#path]` (resolved against `RESPEC_GIT_BASE_URL`,
+default `https://github.com`) or a git URL with an optional `#path`; an
+existing local folder of the same name wins. A path holding `SKILL.md` adds that
+skill; otherwise every subfolder (or `skills/` subfolder) holding one is added.
+Each item records its source repo, path, ref, resolved commit and a digest of
+the fetched files in `profile.yaml`. Updates are explicit and never touch items
+without a source. When an item's files no longer match the digest, `update`
+asks before overwriting them (with `--json` it skips them unless `--yes`).
+Fetched skills may only contain symlinks that stay inside the skill's own
+folder; they are copied as plain files. A source `repo` must be `owner/repo`,
+`user@host:path` or an https, http, ssh or git URL; local paths and other git
+transports are refused. Items installed by `profile install` have no recorded
+digest, so their first `update` asks before overwriting.
+`profile install` copies a repository's `profile.yaml` and listed `skills/`
+once; the profile is then owned locally and its items keep their own sources.
 
 `respec use` links every enabled skill of the profile into each of its targets'
 folders (symlinks, or copies where symlinking fails) and records every created
