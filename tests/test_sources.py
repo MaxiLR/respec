@@ -1067,3 +1067,29 @@ def test_profile_repo_naming_a_local_path_is_rejected(
 
 def test_file_url_under_the_configured_base_url_is_allowed(run, sourced):
     assert check(run)["tdd"]["update_available"] is False
+
+
+def test_update_in_copy_mode_refreshes_copies_and_records_their_digest(
+    run, sourced, claude_dir, isolated_homes, monkeypatch
+):
+    from respec import unknown
+
+    def refuse(*args, **kwargs):
+        raise OSError("symlinks not permitted")
+
+    monkeypatch.setattr(os, "symlink", refuse)
+    ok(run("use", "work"))
+    sourced.write("tdd/SKILL.md", "# tdd v2\n")
+    sourced.commit()
+
+    ok(run("update", "tdd", "--yes"))
+
+    copy = claude_dir / "tdd"
+    assert not copy.is_symlink()
+    assert (copy / "SKILL.md").read_text() == "# tdd v2\n"
+    state = json.loads((isolated_homes.respec_home / "state.json").read_text())
+    recorded = {Path(item["path"]).name: item for item in state["installed"]}
+    assert recorded["tdd"]["mode"] == "copy"
+    assert recorded["tdd"]["digest"] == unknown.digest(copy)
+    # The refreshed copy counts as managed: a later switch is not blocked.
+    ok(run("use", "work"))
