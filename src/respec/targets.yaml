@@ -1,0 +1,17 @@
+# Target registry: global skill folders respec can manage.
+#
+# Shaped after the skills.sh agent registry (vercel-labs/skills, src/agents.ts,
+# MIT): each entry has a name, a display name and its global skills directory.
+# Directories starting with "~/" resolve against the user home, which tests and
+# experiments can relocate with RESPEC_USER_HOME or `respec --home`.
+# Add more targets by pull request.
+targets:
+  - name: claude-code
+    display_name: Claude Code
+    global_skills_dir: ~/.claude/skills
+  - name: agents
+    display_name: Agents (Codex, Pi and other .agents readers)
+    global_skills_dir: ~/.agents/skills
+  - name: oh-my-pi
+    display_name: oh-my-pi
+    global_skills_dir: ~/.omp/agent/skills
