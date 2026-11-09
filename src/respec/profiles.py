@@ -234,6 +234,26 @@ def _unknown_keys(where: str, data: dict[Any, Any], allowed: tuple[str, ...]):
     ]
 
 
+def source_value_problem(key: str, value: str) -> str | None:
+    """Why a source ``repo``, ``ref`` or ``path`` value is unsafe, or None.
+
+    Values starting with '-' could be read by git as options, and a ``path``
+    must stay inside the repository it names.
+    """
+    if value.startswith("-"):
+        return f"source {key} {value!r} must not start with '-'"
+    if key == "path" and (
+        value.startswith("/")
+        or "\\" in value
+        or any(part in ("", ".", "..") for part in value.split("/"))
+    ):
+        return (
+            f"source path {value!r} must be a relative path inside the repository "
+            "(no leading '/', no '.' or '..' parts)"
+        )
+    return None
+
+
 def _parse_source(where: str, raw: Any, problems: list[str]) -> Source | None:
     if not isinstance(raw, dict):
         problems.append(f"{where} must be a mapping with keys {', '.join(SOURCE_KEYS)}")
@@ -245,6 +265,10 @@ def _parse_source(where: str, raw: Any, problems: list[str]) -> Source | None:
             continue
         if not isinstance(raw[key], str) or not raw[key]:
             problems.append(f"{where}.{key} must be a non-empty string")
+            continue
+        problem = source_value_problem(key, raw[key])
+        if problem:
+            problems.append(f"{where}.{key}: {problem}")
         else:
             values[key] = raw[key]
     if "repo" not in raw:

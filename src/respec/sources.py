@@ -63,15 +63,24 @@ def repo_url(repo: str) -> str:
     return repo
 
 
-def parse_spec(text: str) -> Spec:
+def check_value(key: str, value: str | None) -> None:
+    """Refuse a repo, ref or path that git could read as an option or escape."""
+    if value is not None:
+        problem = profiles.source_value_problem(key, value)
+        if problem:
+            raise RespecError(problem)
+
+
+def parse_spec(text: str, ref: str | None = None) -> Spec:
     repo, _, path = text.partition("#")
+    check_value("repo", repo)
+    check_value("ref", ref)
     if not is_git_spec(repo):
         raise RespecError(
             f"{text!r} is neither 'owner/repo[#path]' nor a git URL nor a local folder"
         )
-    path = path.strip("/") or None
-    if path is not None and any(part in ("", ".", "..") for part in path.split("/")):
-        raise RespecError(f"invalid path {path!r} in {text!r}")
+    path = path.rstrip("/") or None
+    check_value("path", path)
     return Spec(repo=repo, url=repo_url(repo), path=path)
 
 
@@ -83,8 +92,40 @@ def repo_name(repo: str) -> str:
 # --- git ---------------------------------------------------------------------
 
 
+# Repository-local variables (``git rev-parse --local-env-vars``): inherited from
+# a caller such as a git hook, they would point git at the caller's repository.
+LOCAL_GIT_ENV = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+)
+
+
 def _git(*args: str, cwd: Path | None = None) -> str:
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    """Run git with prompts off and without the caller's repository variables.
+
+    Callers pass ``--end-of-options`` before any user-controlled value.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in LOCAL_GIT_ENV
+        and not key.startswith("GIT_CONFIG_KEY_")
+        and not key.startswith("GIT_CONFIG_VALUE_")
+    }
+    env["GIT_TERMINAL_PROMPT"] = "0"
     try:
         done = subprocess.run(
             ["git", *args],
@@ -107,7 +148,7 @@ def remote_commit(url: str, ref: str | None, label: str) -> str:
         return ref
     wanted = ref or "HEAD"
     try:
-        output = _git("ls-remote", url, wanted)
+        output = _git("ls-remote", "--end-of-options", url, wanted)
     except RespecError as error:
         raise RespecError(f"cannot read {label}: {error}") from None
     found = dict(
@@ -132,10 +173,19 @@ def checkout(url: str, ref: str | None, label: str) -> Iterator[tuple[Path, str]
         try:
             _git("init", "-q", str(tree))
             if ref is not None and FULL_SHA.match(ref):
-                _git("fetch", "-q", url, cwd=tree)
-                _git("checkout", "-q", ref, cwd=tree)
+                _git("fetch", "-q", "--end-of-options", url, cwd=tree)
+                _git("checkout", "-q", "--detach", ref, cwd=tree)
             else:
-                _git("fetch", "-q", "--depth", "1", url, ref or "HEAD", cwd=tree)
+                _git(
+                    "fetch",
+                    "-q",
+                    "--depth",
+                    "1",
+                    "--end-of-options",
+                    url,
+                    ref or "HEAD",
+                    cwd=tree,
+                )
                 _git("checkout", "-q", "FETCH_HEAD", cwd=tree)
             commit = _git("rev-parse", "HEAD", cwd=tree).strip()
         except RespecError as error:
@@ -144,23 +194,45 @@ def checkout(url: str, ref: str | None, label: str) -> Iterator[tuple[Path, str]
         yield tree, commit
 
 
+def inside(tree: Path, path: str | None) -> Path:
+    """``tree / path``, refusing anything that resolves outside ``tree``."""
+    if path is None:
+        return tree
+    check_value("path", path)
+    root = tree.resolve()
+    target = (tree / path).resolve()
+    if target != root and root not in target.parents:
+        raise RespecError(f"source path {path!r} must stay inside the repository")
+    return target
+
+
 # --- content -----------------------------------------------------------------
 
 
 def digest(folder: Path) -> str:
-    """A hash of every file's relative path, executable bit and content."""
+    """A hash of the folder's tree: every entry's relative path and kind, file
+    contents and executable bits, and symlink targets (symlinks are not
+    followed), so added empty folders and symlinks count as edits too."""
     hasher = hashlib.sha256()
-    for file in sorted(p for p in folder.rglob("*") if p.is_file()):
-        relative = file.relative_to(folder).as_posix()
-        executable = "x" if os.access(file, os.X_OK) else "-"
-        hasher.update(f"{relative}\0{executable}\0".encode())
-        hasher.update(hashlib.sha256(file.read_bytes()).digest())
+    entries: list[Path] = []
+    for root, dirs, files in os.walk(folder):
+        entries.extend(Path(root) / name for name in dirs + files)
+    for entry in sorted(entries):
+        relative = entry.relative_to(folder).as_posix()
+        if entry.is_symlink():
+            hasher.update(f"l\0{relative}\0{os.readlink(entry)}\0".encode())
+        elif entry.is_dir():
+            hasher.update(f"d\0{relative}\0".encode())
+        else:
+            executable = "x" if os.access(entry, os.X_OK) else "-"
+            hasher.update(f"f\0{relative}\0{executable}\0".encode())
+            hasher.update(hashlib.sha256(entry.read_bytes()).digest())
     return f"sha256:{hasher.hexdigest()}"
 
 
 def _find_skills(tree: Path, spec: Spec) -> list[tuple[str, str | None]]:
     """Skills under the spec's path as (item name, path in the repository)."""
-    base = tree / spec.path if spec.path else tree
+    base = inside(tree, spec.path)
     where = f"{spec.repo}#{spec.path}" if spec.path else spec.repo
     if not base.is_dir():
         raise RespecError(f"{where}: no such folder in the repository")
@@ -208,7 +280,7 @@ def add(
     ref: str | None = None,
 ) -> SourceChange:
     """Fetch the skill(s) named by ``text`` into a profile and record sources."""
-    spec = parse_spec(text)
+    spec = parse_spec(text, ref)
     name = items.resolve_profile_name(respec_home, profile_name)
     before = profiles.load_profile(respec_home, name)
     with checkout(spec.url, ref, spec.repo) as (tree, commit):
@@ -225,7 +297,7 @@ def add(
             with tempfile.TemporaryDirectory(prefix="respec-stage-") as staging:
                 for item, path in found:
                     staged = Path(staging) / item
-                    shutil.copytree(tree / path if path else tree, staged)
+                    shutil.copytree(inside(tree, path), staged)
                     source = profiles.Source(
                         repo=spec.repo,
                         path=path,
@@ -372,7 +444,7 @@ def update(
                 continue
             try:
                 new_source = _replace(profile, name, source, replaced)
-            except RespecError as error:
+            except (RespecError, OSError, shutil.Error) as error:
                 row.update({"result": "error", "error": str(error)})
                 continue
             row.update({"result": "updated", "latest": new_source.commit})
@@ -384,11 +456,15 @@ def update(
         _restore(profile, replaced)
         raise
 
-    items.refresh_active(
-        respec_home, user_home, result, lambda: _restore(profile, replaced)
-    )
-    for _, old in replaced:
-        shutil.rmtree(old, ignore_errors=True)
+    try:
+        items.refresh_active(
+            respec_home, user_home, result, lambda: _restore(profile, replaced)
+        )
+    finally:
+        # A refused refresh has moved the old folders back already; after any
+        # other failure the new files and profile.yaml agree, so drop the rest.
+        for _, old in replaced:
+            shutil.rmtree(old, ignore_errors=True)
     return result
 
 
@@ -406,7 +482,7 @@ def _replace(
     for leftover in (incoming, old):
         shutil.rmtree(leftover, ignore_errors=True)
     with checkout(repo_url(source.repo), source.ref, source.repo) as (tree, commit):
-        upstream = tree / source.path if source.path else tree
+        upstream = inside(tree, source.path)
         if not (upstream / items.SKILL_FILE).is_file():
             raise RespecError(
                 f"{source.repo} at {commit[:12]} has no {items.SKILL_FILE} "
@@ -414,7 +490,12 @@ def _replace(
             )
         shutil.copytree(upstream, incoming)
     os.replace(live, old)
-    os.replace(incoming, live)
+    try:
+        os.replace(incoming, live)
+    except OSError as error:
+        os.replace(old, live)
+        shutil.rmtree(incoming, ignore_errors=True)
+        raise RespecError(f"could not replace {live}: {error}") from None
     replaced.append((live, old))
     return dataclasses.replace(source, commit=commit, digest=digest(live))
 
@@ -436,7 +517,7 @@ def install_profile(
     ref: str | None = None,
 ) -> profiles.Profile:
     """Copy a whole profile from a repository once; it is then owned locally."""
-    spec = parse_spec(text)
+    spec = parse_spec(text, ref)
     name = name or (spec.path.rsplit("/", 1)[-1] if spec.path else repo_name(spec.repo))
     profiles.validate_name(name)
     destination = profiles.profiles_dir(respec_home) / name
@@ -447,7 +528,7 @@ def install_profile(
         )
     where = f"{spec.repo}#{spec.path}" if spec.path else spec.repo
     with checkout(spec.url, ref, spec.repo) as (tree, _commit):
-        folder = tree / spec.path if spec.path else tree
+        folder = inside(tree, spec.path)
         file = folder / profiles.PROFILE_FILE
         if not file.is_file():
             raise RespecError(f"{where} has no {profiles.PROFILE_FILE}")
@@ -455,7 +536,10 @@ def install_profile(
             data = yaml.safe_load(file.read_text("utf-8"))
         except yaml.YAMLError as error:
             raise profiles.ProfileError(file, [f"not valid YAML: {error}"]) from None
-        profile = profiles.parse_profile(name, destination, data)
+        # Validate against the fetched file so errors name it, then relocate.
+        profile = dataclasses.replace(
+            profiles.parse_profile(name, folder, data), path=destination
+        )
         missing = [
             item
             for item in profile.skills

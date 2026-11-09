@@ -576,3 +576,188 @@ def test_profile_install_rejects_listed_item_without_folder(
 
     assert "gone" in result.output
     assert not (profiles_root / "holes").exists()
+
+
+# --- review round 1: safety -------------------------------------------------
+
+
+def write_profile_yaml(profiles_root, profile, data):
+    (profiles_root / profile / "profile.yaml").write_text(yaml.safe_dump(data))
+
+
+def test_option_like_repo_in_profile_is_rejected_and_runs_nothing(
+    run, sourced, profiles_root, tmp_path
+):
+    marker = tmp_path / "PWNED"
+    data = read_yaml(profiles_root, "work")
+    data["skills"]["tdd"]["source"]["repo"] = f"--upload-pack=touch {marker};false"
+    write_profile_yaml(profiles_root, "work", data)
+
+    result = fails(run("update", "--check", "-p", "work"))
+
+    assert not marker.exists()
+    assert "must not start with '-'" in result.output
+
+
+def test_option_like_ref_on_add_is_rejected_and_runs_nothing(
+    run, upstream, profiles_root, tmp_path
+):
+    marker = tmp_path / "PWNED"
+    repo = upstream("acme/tdd")
+    repo.write("SKILL.md", "# tdd\n")
+    repo.commit()
+    new_profile(run)
+
+    result = fails(
+        run(
+            "add", "acme/tdd", f"--ref=--upload-pack=touch {marker};false", "-p", "work"
+        )
+    )
+
+    assert not marker.exists()
+    assert "must not start with '-'" in result.output
+    assert read_yaml(profiles_root, "work")["skills"] == {}
+
+
+def test_option_like_ref_on_profile_install_is_rejected_and_runs_nothing(
+    run, upstream, skills_repo, profiles_root, tmp_path
+):
+    marker = tmp_path / "PWNED"
+    make_modpack(upstream, skills_repo)
+
+    fails(
+        run("profile", "install", "acme/modpack", f"--ref=--upload-pack=touch {marker}")
+    )
+
+    assert not marker.exists()
+    assert not (profiles_root / "modpack").exists()
+
+
+def test_option_like_path_in_spec_is_rejected(run, upstream, profiles_root):
+    repo = upstream("acme/tdd")
+    repo.write("SKILL.md", "# tdd\n")
+    repo.commit()
+    new_profile(run)
+
+    result = fails(run("add", "acme/tdd#-x", "-p", "work"))
+
+    assert "must not start with '-'" in result.output
+
+
+def test_git_treats_option_like_url_as_a_repository_not_an_option(tmp_path):
+    """Defense in depth: even unvalidated values never reach git as options."""
+    from respec import sources
+    from respec.errors import RespecError
+
+    marker = tmp_path / "PWNED"
+    evil = f"--upload-pack=touch {marker};false"
+    with pytest.raises(RespecError):
+        sources.remote_commit(evil, None, "evil")
+    with pytest.raises(RespecError):
+        with sources.checkout(evil, None, "evil"):
+            pass
+    with pytest.raises(RespecError):
+        with sources.checkout((tmp_path / "none").as_uri(), evil, "evil"):
+            pass
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("path", ["../../outside", "ABSOLUTE", "tdd/../.."])
+def test_source_path_escaping_the_repository_is_rejected(
+    run, sourced, profiles_root, tmp_path, path
+):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "SKILL.md").write_text("# outside\n")
+    data = read_yaml(profiles_root, "work")
+    data["skills"]["tdd"]["source"]["path"] = (
+        str(outside) if path == "ABSOLUTE" else path
+    )
+    write_profile_yaml(profiles_root, "work", data)
+    sourced.write("tdd/SKILL.md", "# tdd v2\n")
+    sourced.commit()
+
+    result = fails(run("update", "tdd", "-p", "work", "--yes"))
+
+    assert "inside the repository" in result.output
+    tdd = profiles_root / "work" / "skills" / "tdd" / "SKILL.md"
+    assert tdd.read_text() == "# tdd v1\n"
+
+
+def test_failed_swap_restores_the_item_folder(run, sourced, profiles_root, monkeypatch):
+    from respec import sources
+
+    real_replace = sources.os.replace
+
+    def failing_replace(src, dst):
+        if str(src).endswith(".incoming"):
+            raise OSError("disk full")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(sources.os, "replace", failing_replace)
+    sourced.write("tdd/SKILL.md", "# tdd v2\n")
+    sourced.commit()
+
+    run("update", "tdd", "-p", "work", "--yes")
+
+    skills = profiles_root / "work" / "skills"
+    assert (skills / "tdd" / "SKILL.md").read_text() == "# tdd v1\n"
+    assert sorted(p.name for p in skills.iterdir()) == ["lint", "mine", "tdd"]
+    source = read_yaml(profiles_root, "work")["skills"]["tdd"]["source"]
+    assert source["commit"] == sourced.first
+
+
+def test_refresh_error_leaves_no_old_folders(run, sourced, profiles_root, monkeypatch):
+    from respec import switch
+    from respec.errors import RespecError
+
+    ok(run("use", "work"))
+    sourced.write("tdd/SKILL.md", "# tdd v2\n")
+    sourced.commit()
+
+    def broken_use(*args, **kwargs):
+        raise RespecError("target folder vanished")
+
+    monkeypatch.setattr(switch, "use", broken_use)
+
+    fails(run("update", "tdd", "--yes"))
+
+    skills = profiles_root / "work" / "skills"
+    assert sorted(p.name for p in skills.iterdir()) == ["lint", "mine", "tdd"]
+    # Files and profile.yaml agree: the new content and the new commit.
+    assert (skills / "tdd" / "SKILL.md").read_text() == "# tdd v2\n"
+    source = read_yaml(profiles_root, "work")["skills"]["tdd"]["source"]
+    assert source["commit"] != sourced.first
+
+
+def test_inherited_git_dir_is_ignored(
+    run, upstream, profiles_root, tmp_path, monkeypatch
+):
+    other = tmp_path / "other.git"
+    git(tmp_path, "init", "-q", "--bare", str(other))
+    repo = upstream("acme/tdd")
+    repo.write("SKILL.md", "# tdd\n")
+    repo.commit()
+    new_profile(run)
+    monkeypatch.setenv("GIT_DIR", str(other))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "elsewhere"))
+
+    ok(run("add", "acme/tdd", "-p", "work"))
+
+    assert not (other / "FETCH_HEAD").exists()
+    assert not (tmp_path / "elsewhere").exists()
+    assert (profiles_root / "work" / "skills" / "tdd" / "SKILL.md").exists()
+
+
+@pytest.mark.parametrize("kind", ["empty-dir", "dir-symlink"])
+def test_check_sees_added_folders_and_symlinks_as_local_edits(
+    run, sourced, profiles_root, tmp_path, kind
+):
+    folder = profiles_root / "work" / "skills" / "tdd"
+    if kind == "empty-dir":
+        (folder / "notes").mkdir()
+    else:
+        (tmp_path / "target").mkdir()
+        (folder / "link").symlink_to(tmp_path / "target")
+
+    assert check(run)["tdd"]["modified"] is True
