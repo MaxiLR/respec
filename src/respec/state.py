@@ -14,7 +14,10 @@ Schema (version 1)::
       },
       "installed": [                       # every path respec created
         {"target": "claude-code", "name": "tdd",
-         "path": "/home/me/.claude/skills/tdd", "mode": "symlink"}
+         "path": "/home/me/.claude/skills/tdd", "mode": "symlink"},
+        {"target": "agents", "name": "lint",
+         "path": "/home/me/.agents/skills/lint", "mode": "copy",
+         "digest": "sha256:..."}         # content fingerprint, copies only
       ],
       "unmanaged": [                       # foreign entries the user chose to keep
         "/home/me/.claude/skills/their-skill"
@@ -22,7 +25,9 @@ Schema (version 1)::
     }
 
 ``backup`` is null when the folder did not exist at takeover. ``mode`` is
-``symlink`` or ``copy``. Removal only ever touches paths listed in
+``symlink`` or ``copy``. ``digest`` fingerprints a copy's content as installed,
+so a copy that was later edited or replaced is not mistaken for respec's own; a
+copy recorded without one is never treated as respec's. Removal only ever touches paths listed in
 ``installed``. ``unmanaged`` may be absent in files written before it existed.
 """
 
@@ -54,6 +59,18 @@ class Installed:
     name: str
     path: str
     mode: str
+    digest: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data = {
+            "target": self.target,
+            "name": self.name,
+            "path": self.path,
+            "mode": self.mode,
+        }
+        if self.digest is not None:
+            data["digest"] = self.digest
+        return data
 
 
 @dataclass
@@ -68,7 +85,7 @@ class State:
             "version": VERSION,
             "active_profile": self.active_profile,
             "owned": {name: vars(entry) for name, entry in self.owned.items()},
-            "installed": [vars(item) for item in self.installed],
+            "installed": [item.to_dict() for item in self.installed],
             "unmanaged": list(self.unmanaged),
         }
 

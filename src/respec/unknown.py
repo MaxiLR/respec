@@ -3,7 +3,8 @@
 An entry is *managed* when ``state.json`` records it and it is still what respec
 created: a recorded symlink must still be a symlink into the profiles folder,
 a recorded copy must still exist. A recorded path that now holds something
-else (for example a link replaced by a hand-made folder) is unknown again and
+else (for example a link replaced by a hand-made folder, or a
+copy another tool replaced or someone edited) is unknown again and
 flagged ``replaced``. Entries the user chose to keep unmanaged are listed in
 ``state.unmanaged`` and are not unknown. Hidden entries (``.DS_Store`` and the
 like) are never reported.
@@ -14,6 +15,7 @@ first of them in registry order; the others are its aliases.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +48,31 @@ def real(path: Path | str) -> Path:
     return path.parent.resolve() / path.name
 
 
+def digest(path: Path | str) -> str:
+    """Fingerprint of an entry's content: names, file bytes and link targets.
+
+    Symlinks are recorded by target and never followed.
+    """
+    root = Path(path)
+    hasher = hashlib.sha256()
+
+    def add(relative: str, entry: Path) -> None:
+        if entry.is_symlink():
+            hasher.update(b"L\0" + relative.encode() + b"\0")
+            hasher.update(os.readlink(entry).encode() + b"\0")
+        elif entry.is_dir():
+            hasher.update(b"D\0" + relative.encode() + b"\0")
+            for child in sorted(entry.iterdir(), key=lambda c: c.name):
+                add(f"{relative}/{child.name}", child)
+        else:
+            content = entry.read_bytes()
+            hasher.update(b"F\0" + relative.encode() + b"\0")
+            hasher.update(str(len(content)).encode() + b"\0" + content)
+
+    add(".", root)
+    return "sha256:" + hasher.hexdigest()
+
+
 def is_managed(respec_home: Path, item: Installed) -> bool:
     """Whether the recorded path still holds what respec created there."""
     path = Path(item.path)
@@ -55,7 +82,12 @@ def is_managed(respec_home: Path, item: Installed) -> bool:
         root = profiles.profiles_dir(respec_home).resolve()
         linked = path.resolve()
         return linked == root or root in linked.parents
-    return os.path.lexists(path)
+    if item.digest is None or not os.path.lexists(path):
+        return False
+    try:
+        return digest(path) == item.digest
+    except OSError:
+        return False
 
 
 def folder_groups(state: State) -> list[tuple[Path, list[str]]]:

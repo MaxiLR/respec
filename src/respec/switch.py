@@ -176,16 +176,18 @@ def _take_over(
 
 
 def _remove(respec_home: Path, item: Installed) -> bool:
-    """Remove one recorded path; never follow links into profile folders."""
+    """Remove one recorded path that still holds what respec created there.
+
+    Never follows links into profile folders. A path that was replaced or
+    edited is left alone; :func:`use` resolves it as unknown before removal.
+    """
     path = Path(item.path)
+    if not unknown.is_managed(respec_home, item):
+        # The recorded path no longer holds what respec created; leave it alone.
+        return False
     if path.is_symlink():
         path.unlink()
         return True
-    if not path.exists():
-        return False
-    if item.mode != "copy":
-        # A recorded symlink was replaced by something else; leave it alone.
-        return False
     profiles_root = profiles.profiles_dir(respec_home).resolve()
     resolved = path.resolve()
     if resolved == profiles_root or profiles_root in resolved.parents:
@@ -275,7 +277,11 @@ def use(
         for target, skill, source, destination in plan:
             mode = _install(source, destination)
             record = Installed(
-                target=target, name=skill, path=str(destination), mode=mode
+                target=target,
+                name=skill,
+                path=str(destination),
+                mode=mode,
+                digest=unknown.digest(destination) if mode == "copy" else None,
             )
             state.installed.append(record)
             result.installed.append(record)
