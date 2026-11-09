@@ -9,7 +9,7 @@ from typing import Annotated, Any, NoReturn, Optional
 
 import typer
 
-from respec import paths, profiles, switch, targets
+from respec import items, paths, profiles, switch, targets
 from respec.errors import RespecError
 
 app = typer.Typer(
@@ -253,3 +253,101 @@ def status(ctx: typer.Context, as_json: JsonOption = False) -> None:
             typer.echo("  (no managed items)")
         for item in folder["items"]:
             typer.echo(f"  {item['name']}  {item['mode']}")
+
+
+ProfileOption = Annotated[
+    Optional[str],
+    typer.Option(
+        "--profile",
+        "-p",
+        help="Profile to change (default: the active profile).",
+        show_default=False,
+    ),
+]
+ItemArgument = Annotated[str, typer.Argument(help="Item (skill) name.")]
+
+
+def _report_change(change: items.ItemChange, as_json: bool) -> None:
+    if as_json:
+        _print_json(change.to_dict())
+        return
+    messages = {
+        "add": f"Added {change.item!r} to profile {change.profile!r}",
+        "remove": f"Removed {change.item!r} from profile {change.profile!r}",
+        "enable": f"Enabled {change.item!r} in profile {change.profile!r}",
+        "disable": f"Disabled {change.item!r} in profile {change.profile!r}",
+    }
+    typer.echo(messages[change.action])
+    for path in change.linked:
+        typer.echo(f"  linked {path}")
+    for path in change.unlinked:
+        typer.echo(f"  unlinked {path}")
+
+
+@app.command("add")
+def add(
+    ctx: typer.Context,
+    path: Annotated[
+        Path, typer.Argument(help="Local skill folder (must contain SKILL.md).")
+    ],
+    profile: ProfileOption = None,
+    as_json: JsonOption = False,
+) -> None:
+    """Copy a local skill folder into a profile and enable it."""
+    homes = _homes(ctx)
+    try:
+        change = items.add(homes.respec_home, homes.user_home, path, profile)
+    except RespecError as error:
+        _fail(error)
+    _report_change(change, as_json)
+
+
+@app.command("remove")
+def remove(
+    ctx: typer.Context,
+    item: ItemArgument,
+    profile: ProfileOption = None,
+    as_json: JsonOption = False,
+) -> None:
+    """Remove an item from a profile and delete its files."""
+    homes = _homes(ctx)
+    try:
+        change = items.remove(homes.respec_home, homes.user_home, item, profile)
+    except RespecError as error:
+        _fail(error)
+    _report_change(change, as_json)
+
+
+def _set_enabled(
+    ctx: typer.Context, item: str, enabled: bool, profile: str | None, as_json: bool
+) -> None:
+    homes = _homes(ctx)
+    try:
+        change = items.set_enabled(
+            homes.respec_home, homes.user_home, item, enabled, profile
+        )
+    except RespecError as error:
+        _fail(error)
+    _report_change(change, as_json)
+
+
+@app.command("enable")
+def enable(
+    ctx: typer.Context,
+    item: ItemArgument,
+    profile: ProfileOption = None,
+    as_json: JsonOption = False,
+) -> None:
+    """Enable an item; an active profile links it right away."""
+    _set_enabled(ctx, item, True, profile, as_json)
+
+
+@app.command("disable")
+def disable(
+    ctx: typer.Context,
+    item: ItemArgument,
+    profile: ProfileOption = None,
+    as_json: JsonOption = False,
+) -> None:
+    """Disable an item, keeping its files and metadata."""
+    _set_enabled(ctx, item, False, profile, as_json)

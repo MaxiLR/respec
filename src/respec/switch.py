@@ -42,6 +42,10 @@ class SwitchResult:
     installed: list[Installed] = field(default_factory=list)
 
 
+class SwitchBlocked(RespecError):
+    """The preflight refused the switch; nothing on disk was changed."""
+
+
 def backups_dir(respec_home: Path) -> Path:
     return respec_home / "backups"
 
@@ -98,7 +102,7 @@ def _preflight(
             source = profile.path / profiles.SKILLS_DIR / skill
             plan.append((target, skill, source, destination))
     if problems:
-        raise RespecError(
+        raise SwitchBlocked(
             f"cannot switch to profile {profile.name!r}:\n"
             + "\n".join(f"  - {problem}" for problem in problems)
         )

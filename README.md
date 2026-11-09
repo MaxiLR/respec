@@ -8,7 +8,15 @@ Switchable global profiles of agent skills across coding harnesses (Claude Code,
 respec profile new work --target claude-code --target agents
 respec use work      # switch: remove the previous profile's items, link this one's
 respec status        # active profile, targets and managed items per folder
+respec add ./my-skill [-p work]   # copy a skill folder (with SKILL.md) into a profile
+respec disable my-skill [-p work] # stop linking it; files and metadata stay
+respec enable my-skill [-p work]
+respec remove my-skill [-p work]  # drop it from profile.yaml and delete its folder
 ```
+
+`add`, `remove`, `enable` and `disable` change the active profile unless `-p`
+names another. When the changed profile is active, its target folders are
+refreshed right away. Every command accepts `--json`.
 
 `respec use` links every enabled skill of the profile into each of its targets'
 folders (symlinks, or copies where symlinking fails) and records every created

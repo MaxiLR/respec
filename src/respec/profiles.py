@@ -16,6 +16,7 @@ schema of ``profile.yaml``::
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -237,6 +238,14 @@ def create_profile(respec_home: Path, name: str, targets: list[str]) -> Profile:
         )
     profile = Profile(name=name, path=folder, targets=list(targets))
     (folder / SKILLS_DIR).mkdir(parents=True)
-    text = yaml.safe_dump(profile.to_yaml_data(), sort_keys=False)
-    (folder / PROFILE_FILE).write_text(text, "utf-8")
+    save_profile(profile)
     return profile
+
+
+def save_profile(profile: Profile) -> None:
+    """Write ``profile.yaml``; the only writer, atomic so a crash never truncates."""
+    file = profile.path / PROFILE_FILE
+    temporary = file.with_name(f".{PROFILE_FILE}.tmp")
+    text = yaml.safe_dump(profile.to_yaml_data(), sort_keys=False)
+    temporary.write_text(text, "utf-8")
+    os.replace(temporary, file)

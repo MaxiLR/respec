@@ -1,0 +1,219 @@
+"""Items of a profile: add a local skill folder, remove, enable and disable.
+
+Every change writes ``profile.yaml`` through :func:`respec.profiles.save_profile`.
+When the changed profile is the active one, its targets are refreshed at once by
+re-running the switching engine (:func:`respec.switch.use`) for that profile, so
+links are added or removed and ``state.json`` stays truthful. When that switch is
+refused by its preflight (nothing on disk changed), the profile change is undone
+so the profile and its target folders never disagree.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import os
+import shutil
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from respec import profiles, switch
+from respec.errors import RespecError
+from respec.state import load_state
+
+SKILL_FILE = "SKILL.md"
+
+
+@dataclass
+class ItemChange:
+    profile: str
+    item: str
+    action: str
+    enabled: bool | None
+    path: str
+    active: bool = False
+    linked: list[str] = field(default_factory=list)
+    unlinked: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+
+def resolve_profile_name(respec_home: Path, name: str | None) -> str:
+    """``name``, or the active profile when ``name`` is not given."""
+    if name is not None:
+        return name
+    active = load_state(respec_home).active_profile
+    if active is None:
+        raise RespecError(
+            "no active profile; name the profile with '-p <profile>' "
+            "or activate one with 'respec use <profile>'"
+        )
+    return active
+
+
+def _skill_folder(profile: profiles.Profile, item: str) -> Path:
+    return profile.path / profiles.SKILLS_DIR / item
+
+
+def add_local(
+    respec_home: Path, profile_name: str, source: Path, enabled: bool = True
+) -> profiles.Profile:
+    """Copy the skill folder ``source`` into a profile and record it.
+
+    Target folders are not touched. Returns the updated profile. On failure
+    nothing is left behind in the profile.
+    """
+    profile = profiles.load_profile(respec_home, profile_name)
+    source = Path(source).expanduser().resolve()
+    if not source.is_dir():
+        raise RespecError(f"{source} is not a folder; give the path of a skill folder")
+    if not (source / SKILL_FILE).is_file():
+        raise RespecError(f"{source} has no {SKILL_FILE}; a skill folder needs one")
+    item = source.name
+    if not profiles.NAME_PATTERN.match(item):
+        raise RespecError(
+            f"skill folder name {item!r} is not a valid item name: "
+            f"{profiles.NAME_RULE}"
+        )
+    if item in profile.skills:
+        raise RespecError(
+            f"profile {profile.name!r} already has an item {item!r}; "
+            f"remove it first with 'respec remove {item} -p {profile.name}'"
+        )
+    destination = _skill_folder(profile, item)
+    if os.path.lexists(destination):
+        raise RespecError(
+            f"{destination} already exists but is not listed in "
+            f"{profiles.PROFILE_FILE}; move it out of the way first"
+        )
+    if source == destination.resolve() or source in destination.resolve().parents:
+        raise RespecError(f"cannot add {source}: it contains profile {profile.name!r}")
+
+    try:
+        shutil.copytree(source, destination)
+        skills = dict(profile.skills)
+        skills[item] = profiles.SkillEntry(enabled=enabled)
+        updated = dataclasses.replace(profile, skills=skills)
+        profiles.save_profile(updated)
+    except (OSError, shutil.Error) as error:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise RespecError(
+            f"could not add {source} to profile {profile.name!r}: {error}"
+        ) from None
+    return updated
+
+
+def _refresh(
+    respec_home: Path,
+    user_home: Path,
+    change: ItemChange,
+    undo: Callable[[], None],
+) -> None:
+    """Re-apply the profile when it is active; fill in the link changes."""
+    if load_state(respec_home).active_profile != change.profile:
+        return
+    change.active = True
+    try:
+        result = switch.use(respec_home, user_home, change.profile)
+    except switch.SwitchBlocked as error:
+        undo()
+        raise switch.SwitchBlocked(
+            f"{error}\nProfile {change.profile!r} was left unchanged."
+        ) from None
+    removed = {item.path for item in result.removed}
+    installed = {item.path for item in result.installed}
+    change.linked = sorted(installed - removed)
+    change.unlinked = sorted(removed - installed)
+
+
+def add(
+    respec_home: Path,
+    user_home: Path,
+    source: Path,
+    profile_name: str | None = None,
+) -> ItemChange:
+    """Add a local skill folder to a profile (default: the active one)."""
+    name = resolve_profile_name(respec_home, profile_name)
+    before = profiles.load_profile(respec_home, name)
+    profile = add_local(respec_home, name, source)
+    item = next(skill for skill in profile.skills if skill not in before.skills)
+    folder = _skill_folder(profile, item)
+    change = ItemChange(
+        profile=name, item=item, action="add", enabled=True, path=str(folder)
+    )
+
+    def undo() -> None:
+        profiles.save_profile(before)
+        shutil.rmtree(folder, ignore_errors=True)
+
+    _refresh(respec_home, user_home, change, undo)
+    return change
+
+
+def _load_with_item(
+    respec_home: Path, profile_name: str | None, item: str
+) -> profiles.Profile:
+    profile = profiles.load_profile(
+        respec_home, resolve_profile_name(respec_home, profile_name)
+    )
+    if item not in profile.skills:
+        known = ", ".join(profile.skills) or "none"
+        raise RespecError(
+            f"profile {profile.name!r} has no item {item!r} (items: {known})"
+        )
+    return profile
+
+
+def set_enabled(
+    respec_home: Path,
+    user_home: Path,
+    item: str,
+    enabled: bool,
+    profile_name: str | None = None,
+) -> ItemChange:
+    """Enable or disable an item; its files and source record are kept."""
+    profile = _load_with_item(respec_home, profile_name, item)
+    change = ItemChange(
+        profile=profile.name,
+        item=item,
+        action="enable" if enabled else "disable",
+        enabled=enabled,
+        path=str(_skill_folder(profile, item)),
+        active=load_state(respec_home).active_profile == profile.name,
+    )
+    entry = profile.skills[item]
+    if entry.enabled == enabled:
+        return change
+    skills = dict(profile.skills)
+    skills[item] = dataclasses.replace(entry, enabled=enabled)
+    profiles.save_profile(dataclasses.replace(profile, skills=skills))
+    _refresh(respec_home, user_home, change, lambda: profiles.save_profile(profile))
+    return change
+
+
+def remove(
+    respec_home: Path,
+    user_home: Path,
+    item: str,
+    profile_name: str | None = None,
+) -> ItemChange:
+    """Remove an item: drop it from ``profile.yaml`` and delete its folder."""
+    profile = _load_with_item(respec_home, profile_name, item)
+    folder = _skill_folder(profile, item)
+    change = ItemChange(
+        profile=profile.name, item=item, action="remove", enabled=None, path=str(folder)
+    )
+    skills = {name: entry for name, entry in profile.skills.items() if name != item}
+    profiles.save_profile(dataclasses.replace(profile, skills=skills))
+    try:
+        _refresh(respec_home, user_home, change, lambda: profiles.save_profile(profile))
+    except switch.SwitchBlocked:
+        raise
+    except RespecError:
+        # The item is gone from profile.yaml; any links still recorded in
+        # state.json are removed by the next switch, so delete the folder too.
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+    shutil.rmtree(folder, ignore_errors=True)
+    return change
