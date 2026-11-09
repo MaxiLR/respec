@@ -62,7 +62,9 @@ def run():
 
     runner = CliRunner()
 
-    def invoke(*args: str, env: dict[str, str | None] | None = None):
-        return runner.invoke(app, list(args), env=env)
+    def invoke(
+        *args: str, env: dict[str, str | None] | None = None, input: str | None = None
+    ):
+        return runner.invoke(app, list(args), env=env, input=input)
 
     return invoke

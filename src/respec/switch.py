@@ -3,6 +3,9 @@ installs the new profile's enabled skills into its targets.
 
 Order of a switch:
 
+0. Unknown entries in owned folders (see :mod:`respec.unknown`): refuse with
+   :class:`UnknownEntries` unless the caller passes ``on_unknown`` to resolve
+   them (add to the profile, back up and remove, or keep unmanaged).
 1. Preflight (nothing changes): load the profile, check every enabled skill has
    a folder, and refuse when an install path is occupied by an entry respec did
    not create.
@@ -22,11 +25,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from respec import profiles, targets
+from respec import profiles, targets, unknown
 from respec.errors import RespecError
 from respec.state import Installed, Owned, State, load_state, save_state
 
 Clock = Callable[[], datetime]
+UnknownHandler = Callable[[list[unknown.Unknown]], None]
 
 
 def _utc_now() -> datetime:
@@ -44,6 +48,25 @@ class SwitchResult:
 
 class SwitchBlocked(RespecError):
     """The preflight refused the switch; nothing on disk was changed."""
+
+
+class UnknownEntries(SwitchBlocked):
+    """Owned folders hold entries respec did not create; the user must choose."""
+
+    def __init__(self, profile: str, entries: list[unknown.Unknown]) -> None:
+        self.entries = entries
+        lines = "\n".join(
+            f"  - {entry.path} ({entry.kind}"
+            + (", replaced an item respec installed)" if entry.replaced else ")")
+            for entry in entries
+        )
+        super().__init__(
+            f"cannot switch to profile {profile!r}: folders respec owns hold "
+            f"entries not managed by respec:\n{lines}\n"
+            "Choose for each: add to profile, back up and remove, or keep "
+            "unmanaged. Run 'respec adopt', or pass '--unknown add|backup|keep' "
+            "to 'respec use'."
+        )
 
 
 def backups_dir(respec_home: Path) -> Path:
@@ -196,14 +219,42 @@ def _install(source: Path, destination: Path) -> str:
     return "copy"
 
 
+def _forget_replaced(respec_home: Path) -> None:
+    """Drop records of paths that now hold a foreign entry; it is not respec's."""
+    state = load_state(respec_home)
+    replaced = {
+        unknown.real(entry.path)
+        for entry in unknown.find_unknown(respec_home, state)
+        if entry.replaced
+    }
+    if not replaced:
+        return
+    state.installed = [
+        item for item in state.installed if unknown.real(item.path) not in replaced
+    ]
+    save_state(respec_home, state)
+
+
 def use(
     respec_home: Path,
     user_home: Path,
     name: str,
     now: Clock = _utc_now,
+    on_unknown: UnknownHandler | None = None,
 ) -> SwitchResult:
-    """Activate profile ``name``; see the module docstring for the order."""
+    """Activate profile ``name``; see the module docstring for the order.
+
+    ``on_unknown`` receives the unknown entries of owned folders before
+    anything else happens; entries it leaves in place stay untouched.
+    """
     profile = profiles.load_profile(respec_home, name)
+    entries = unknown.find_unknown(respec_home, load_state(respec_home))
+    if entries:
+        if on_unknown is None:
+            raise UnknownEntries(profile.name, entries)
+        on_unknown(entries)
+        _forget_replaced(respec_home)
+        profile = profiles.load_profile(respec_home, name)
     state = load_state(respec_home)
     plan = _preflight(profile, state, user_home)
     result = SwitchResult(profile=profile.name, previous=state.active_profile)
@@ -257,6 +308,9 @@ def status(respec_home: Path) -> dict[str, object]:
         state.owned.items(),
         key=lambda pair: (order.index(pair[0]) if pair[0] in order else len(order)),
     )
+    extra = unknown.folder_report(respec_home, state)
+    # Targets sharing one real folder list its items once, under the first.
+    sharing = {group[0]: group for _, group in unknown.folder_groups(state)}
     folders = [
         {
             "target": target,
@@ -264,8 +318,10 @@ def status(respec_home: Path) -> dict[str, object]:
             "items": [
                 {"name": item.name, "path": item.path, "mode": item.mode}
                 for item in sorted(state.installed, key=lambda i: i.name)
-                if item.target == target
+                if item.target in sharing.get(target, ())
+                and unknown.is_managed(respec_home, item)
             ],
+            **extra[target],
         }
         for target, entry in owned
     ]

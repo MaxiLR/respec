@@ -57,12 +57,17 @@ def _skill_folder(profile: profiles.Profile, item: str) -> Path:
 
 
 def add_local(
-    respec_home: Path, profile_name: str, source: Path, enabled: bool = True
+    respec_home: Path,
+    profile_name: str,
+    source: Path,
+    enabled: bool = True,
+    name: str | None = None,
 ) -> profiles.Profile:
     """Copy the skill folder ``source`` into a profile and record it.
 
-    Target folders are not touched. Returns the updated profile. On failure
-    nothing is left behind in the profile.
+    The item is called ``name``, or after the source folder (after resolving
+    symlinks) when no name is given. Target folders are not touched. Returns
+    the updated profile. On failure nothing is left behind in the profile.
     """
     profile = profiles.load_profile(respec_home, profile_name)
     source = Path(source).expanduser().resolve()
@@ -70,7 +75,7 @@ def add_local(
         raise RespecError(f"{source} is not a folder; give the path of a skill folder")
     if not (source / SKILL_FILE).is_file():
         raise RespecError(f"{source} has no {SKILL_FILE}; a skill folder needs one")
-    item = source.name
+    item = name if name is not None else source.name
     if not profiles.NAME_PATTERN.match(item):
         raise RespecError(
             f"skill folder name {item!r} is not a valid item name: "

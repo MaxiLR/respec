@@ -12,6 +12,7 @@ respec add ./my-skill [-p work]   # copy a skill folder (with SKILL.md) into a p
 respec disable my-skill [-p work] # stop linking it; files and metadata stay
 respec enable my-skill [-p work]
 respec remove my-skill [-p work]  # drop it from profile.yaml and delete its folder
+respec adopt [--add|--backup|--keep <entry>] [--all <choice>] [-p work]
 ```
 
 `add`, `remove`, `enable` and `disable` change the active profile unless `-p`
@@ -24,6 +25,16 @@ path in `~/.respec/state.json`. A switch removes only recorded paths, from every
 folder, then installs the new profile into its own targets. The first time
 respec takes over a target folder it copies the folder's full contents to
 `~/.respec/backups/<timestamp>/<target>/`. Installing respec changes nothing.
+
+Entries in an owned folder that respec did not create are _unknown_: `status`
+lists them, and before a switch each one needs a choice: `add` (copy it into
+the profile being activated, then manage it), `backup` (move it to
+`~/.respec/backups/<timestamp>/<target>/`) or `keep` (leave it, unmanaged, and
+stop asking). A terminal asks per entry; other runs stop unless
+`respec use <profile> --unknown add|backup|keep` gives the choice. `respec adopt`
+resolves unknown entries outside a switch (`--add` copies into the active
+profile unless `-p` names another). Nothing is removed before it is copied into
+a profile or a backup.
 
 ### Layers
 

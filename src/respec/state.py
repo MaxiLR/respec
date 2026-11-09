@@ -15,12 +15,15 @@ Schema (version 1)::
       "installed": [                       # every path respec created
         {"target": "claude-code", "name": "tdd",
          "path": "/home/me/.claude/skills/tdd", "mode": "symlink"}
+      ],
+      "unmanaged": [                       # foreign entries the user chose to keep
+        "/home/me/.claude/skills/their-skill"
       ]
     }
 
 ``backup`` is null when the folder did not exist at takeover. ``mode`` is
 ``symlink`` or ``copy``. Removal only ever touches paths listed in
-``installed``.
+``installed``. ``unmanaged`` may be absent in files written before it existed.
 """
 
 from __future__ import annotations
@@ -58,6 +61,7 @@ class State:
     active_profile: str | None = None
     owned: dict[str, Owned] = field(default_factory=dict)
     installed: list[Installed] = field(default_factory=list)
+    unmanaged: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -65,6 +69,7 @@ class State:
             "active_profile": self.active_profile,
             "owned": {name: vars(entry) for name, entry in self.owned.items()},
             "installed": [vars(item) for item in self.installed],
+            "unmanaged": list(self.unmanaged),
         }
 
 
@@ -94,10 +99,17 @@ def load_state(respec_home: Path) -> State:
     for item in installed:
         if item.mode not in MODES:
             raise _invalid(path, f"unknown install mode {item.mode!r}")
+    unmanaged = data.get("unmanaged", [])
+    if not isinstance(unmanaged, list) or not all(
+        isinstance(path, str) for path in unmanaged
+    ):
+        raise _invalid(path, "unmanaged must be a list of paths")
     active = data.get("active_profile")
     if active is not None and not isinstance(active, str):
         raise _invalid(path, "active_profile must be a string or null")
-    return State(active_profile=active, owned=owned, installed=installed)
+    return State(
+        active_profile=active, owned=owned, installed=installed, unmanaged=unmanaged
+    )
 
 
 def save_state(respec_home: Path, state: State) -> None:
