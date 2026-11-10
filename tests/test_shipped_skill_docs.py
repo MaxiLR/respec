@@ -122,3 +122,20 @@ def test_every_command_but_the_tui_takes_json(run):
 def test_a_misspelled_command_is_caught():
     with pytest.raises(AssertionError):
         resolve("respec layer fix design-principles")
+
+
+WARNING_TYPES = (
+    "layer-conflict",
+    "unreadable-manifest",
+    "unreadable-takeover-log",
+    "interrupted-operation",
+)
+OUTCOMES = ("finished", "rolled-back", "pending", "rebuilt")
+
+
+def test_respec_skill_names_every_warning_type_and_outcome():
+    text = " ".join(skill_text("respec").split())
+
+    missing = [w for w in WARNING_TYPES + OUTCOMES if f"`{w}`" not in text]
+
+    assert missing == []

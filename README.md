@@ -166,8 +166,12 @@ install`. If respec is killed or crashes part way, the journal stays behind:
   undoes the change instead where that is still possible (a switch activates
   the previous profile again; a restore that already removed skills, and the
   choices adopt completed, cannot be undone).
-- While a restore waits, `respec restore` finishes that same restore and
-  refuses another backup.
+- While a restore waits, `respec restore` finishes that same restore (and
+  `respec restore --release-only` an interrupted release) and reports what
+  this run removed, restored and released; another backup is refused.
+- While a change waits, `respec status` names the entry its step in flight was
+  changing (for example a link a switch had just made) as part of that change,
+  under the warning's `in_flight`, rather than as an unknown entry.
 - In the TUI, Sync shows the interrupted change with Finish and Roll back;
   until it is resolved, Sync offers nothing else and the TUI refuses every
   change to skill folders.
@@ -216,11 +220,15 @@ After a power loss:
   runs), or run `respec restore --release-only`, which lets go of every folder
   without putting anything back: it removes only the records it can verify as
   respec's (a link into its folders, or a copy with the recorded digest),
-  lists the rest under `kept`, removes only folders respec recorded creating,
+  lists the rest under `kept` (a record whose path is gone is only dropped),
+  removes only folders respec recorded creating,
   and keeps every backup run. It reports this as an `interrupted-operation`
   warning with `operation` `state` and `outcome` `rebuilt`.
-- A `state.json` written by a newer respec is never rebuilt: every command
-  says so and changes nothing.
+- A `state.json` or `takeovers.json` written by a newer respec is never
+  rebuilt or rewritten: every command that needs it says so and changes
+  nothing. A `takeovers.json` that cannot be read is reported
+  (`unreadable-takeover-log`) and moved to a new backup run before respec
+  writes a new log.
 
 ### TUI
 
@@ -314,6 +322,9 @@ Every `--json` output that is an object uses one vocabulary:
   - `unreadable-manifest`: a backup run's `manifest.json` could not be read
     during a restore, so every entry of that run was put back as the user's;
     gives its `path`.
+  - `unreadable-takeover-log`: `takeovers.json` could not be read, so the
+    takeovers it recorded are unknown; gives its `path`, which is in a backup
+    run once respec wrote a new log (it never overwrites the damaged one).
   - `interrupted-operation`: a change that was cut short (see
     [Interrupted changes](#interrupted-changes)); also gives `operation`
     (`use`, `restore`, `adopt`, `links`, `update`, `add`, `install`, or `state`
@@ -321,13 +332,17 @@ Every `--json` output that is an object uses one vocabulary:
     `outcome` (`finished` or `rolled-back` when this command recovered it,
     `rebuilt` when `respec recover` rebuilt an unreadable `state.json`,
     `pending` when it still waits), `set_aside` (paths moved to a backup
-    run) and `profile` when it concerns one. `respec recover --json` gives
+    run), `profile` when it concerns one and, while it is `pending`,
+    `in_flight`: the entry its step in flight was changing (part of that
+    change, so not listed under `unresolved`). `respec recover --json` gives
     `active_profile`, `recovered` (whether there was anything to recover)
     and this warning.
-- `error`: present only when the command failed. `use`, `adopt` and
-  `restore` then print every other key of their success output too, filled
-  with what was done before the failure. Other commands print their error on
-  stderr only.
+- `error`: present only when the command failed. `use`, `adopt`, `restore`
+  (also `--release-only`, which adds `kept`) and `recover` then print every
+  other key of their success output too, filled with what was done before the
+  failure (`recover` gives `active_profile` and `recovered: false`). Other
+  commands, and a refused combination of options (such as `restore --list
+--release-only`), print their error on stderr only.
 
 A field that does not apply is left out rather than given as `null`: for
 example a resolved entry has `profile` only when it was added and `backup`

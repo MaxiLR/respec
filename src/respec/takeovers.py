@@ -9,6 +9,11 @@ folder's takeover again, also when the folder did not exist and no backup run
 was made. A restore marks the records of the folders it releases as
 ``released``, so a later rebuild never reuses a takeover that was undone.
 
+A log written by a newer respec (a higher ``version``) is never read or
+rewritten: every command that needs it refuses (:class:`TakeoversNewer`). A
+log that cannot be read is reported (:func:`take_problems`) and, before
+respec writes a new one, moved to a fresh backup run, never overwritten.
+
 Schema::
 
     {"version": 1,
@@ -21,28 +26,126 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from respec.errors import RespecError
 from respec.state import Owned, sync_folder, write_durably
 
 LOG_FILE = "takeovers.json"
 VERSION = 1
+WARNING = "unreadable-takeover-log"
+
+
+class TakeoversNewer(RespecError):
+    """``takeovers.json`` comes from a newer respec; it is never rewritten."""
+
+
+@dataclass(frozen=True)
+class Problem:
+    """A takeover log that could not be read; ``path`` is where it is now
+    (moved to a backup run before a new log was written, or left in place)."""
+
+    path: str
+    message: str
+
+    def to_warning(self) -> dict[str, Any]:
+        return {"type": WARNING, "path": self.path, "message": self.message}
+
+
+# Unreadable logs found by this process, reported as warnings by the CLI.
+_problems: list[Problem] = []
+
+
+def peek_problems() -> list[Problem]:
+    return list(_problems)
+
+
+def take_problems() -> list[Problem]:
+    found = list(_problems)
+    _problems.clear()
+    return found
+
+
+def _report(problem: Problem) -> None:
+    if problem not in _problems:
+        _problems.append(problem)
 
 
 def log_path(respec_home: Path) -> Path:
     return respec_home / LOG_FILE
 
 
-def _load(respec_home: Path) -> list[dict[str, Any]]:
-    """The records; none when the log is missing or cannot be read."""
+def check(respec_home: Path) -> None:
+    """Refuse (:class:`TakeoversNewer`) when a newer respec wrote the log."""
+    _read(respec_home)
+
+
+def _read(respec_home: Path) -> tuple[list[dict[str, Any]], str | None]:
+    """(the records, why the log cannot be read or None). No log: no records."""
+    path = log_path(respec_home)
     try:
-        data = json.loads(log_path(respec_home).read_text("utf-8"))
-        records = data["records"]
-    except (OSError, ValueError, KeyError, TypeError):
-        return []
-    return [r for r in records if isinstance(r, dict) and "target" in r]
+        text = path.read_text("utf-8")
+    except FileNotFoundError:
+        return [], None
+    except OSError as error:
+        return [], str(error)
+    try:
+        data = json.loads(text)
+    except ValueError as error:
+        return [], str(error)
+    version = data.get("version") if isinstance(data, dict) else None
+    if isinstance(version, int) and version > VERSION:
+        raise TakeoversNewer(
+            f"{path} was written by a newer respec (takeover log version "
+            f"{version}; this respec reads version {VERSION}). Use that newer "
+            "respec; nothing was changed."
+        )
+    if version != VERSION or not isinstance(data.get("records"), list):
+        return [], f"expected a mapping with version {VERSION} and its records"
+    records = data["records"]
+    return [r for r in records if isinstance(r, dict) and "target" in r], None
+
+
+def _load(respec_home: Path) -> list[dict[str, Any]]:
+    """The records to read; a log that cannot be read is reported and left as
+    it is (it holds none that respec can use)."""
+    records, problem = _read(respec_home)
+    if problem is not None:
+        path = log_path(respec_home)
+        _report(
+            Problem(
+                str(path),
+                f"{path} could not be read ({problem}), so the takeovers it "
+                "recorded are unknown; it is left as it is, and moved to a "
+                "backup run before respec writes a new one.",
+            )
+        )
+    return records
+
+
+def _load_for_rewrite(respec_home: Path) -> list[dict[str, Any]]:
+    """The records to rewrite; a log that cannot be read is first moved to a
+    fresh backup run (never overwritten) and reported."""
+    records, problem = _read(respec_home)
+    if problem is None:
+        return records
+    from respec import switch
+
+    path = log_path(respec_home)
+    kept = switch.new_backup_run(respec_home, switch.utc_now()) / LOG_FILE
+    os.replace(path, kept)
+    _report(
+        Problem(
+            str(kept),
+            f"{path} could not be read ({problem}), so the takeovers it "
+            f"recorded are unknown. It is kept at {kept}, and a new log was "
+            "started.",
+        )
+    )
+    return []
 
 
 def _save(respec_home: Path, records: list[dict[str, Any]]) -> None:
@@ -60,7 +163,7 @@ def record(respec_home: Path, owned: dict[str, Owned]) -> None:
     """Append the takeover of each target in ``owned``."""
     if not owned:
         return
-    records = _load(respec_home)
+    records = _load_for_rewrite(respec_home)
     for target, entry in owned.items():
         records.append({"target": target, **entry.to_dict(), "released": False})
     _save(respec_home, records)
@@ -69,10 +172,22 @@ def record(respec_home: Path, owned: dict[str, Owned]) -> None:
 def release(respec_home: Path, targets: Iterable[str]) -> None:
     """Mark the current takeovers of ``targets`` as undone."""
     wanted = set(targets)
-    records = _load(respec_home)
+    _release(respec_home, lambda target: target in wanted)
+
+
+def release_unowned(respec_home: Path, owned: Iterable[str]) -> None:
+    """Mark as undone the takeovers of targets not in ``owned`` (those of an
+    interrupted switch that was rolled back before ``state.json`` recorded
+    them)."""
+    keep = set(owned)
+    _release(respec_home, lambda target: target not in keep)
+
+
+def _release(respec_home: Path, chosen: Callable[[str], bool]) -> None:
+    records = _load_for_rewrite(respec_home)
     changed = False
     for entry in records:
-        if entry["target"] in wanted and not entry.get("released"):
+        if chosen(entry["target"]) and not entry.get("released"):
             entry["released"] = True
             changed = True
     if changed:
