@@ -44,6 +44,7 @@ from respec import (
     lock,
     messages,
     profiles,
+    provenance,
     removal,
     sources,
     switch,
@@ -268,12 +269,12 @@ def _one_line(error: Exception) -> str:
 
 
 def _skill_text(
-    name: str, entry: profiles.SkillEntry, update: sources.Row | None
+    profile: profiles.Profile, name: str, update: sources.Row | None
 ) -> Text:
     """A skill's name, where it came from and, once checked, its update state."""
     text = Text(name, style="bold")
-    if entry.source is not None:
-        text.append(f"  from {messages.source_label(entry.source)}", style=MUTED)
+    origin = provenance.fields(profile, name)
+    text.append(f"  {provenance.label(origin)}", style=MUTED)
     if update is None:
         return text
     if update.error:
@@ -291,7 +292,7 @@ def _skill_text(
         )
     else:
         text.append("  ✓ up to date", style=SUCCESS)
-    if update.modified:
+    if update.modified and not origin.get("edited"):
         text.append("  local edits", style=MUTED)
     return text
 
@@ -829,7 +830,7 @@ class ProfileScreen(Screen[None]):
         row.compose_add_child(SkillSwitch(skill, entry.enabled))
         row.compose_add_child(
             Static(
-                _skill_text(skill, entry, self.updates.get(skill)),
+                _skill_text(profile, skill, self.updates.get(skill)),
                 id=_dom_id("skill", skill),
                 classes="skill-meta",
             )
@@ -871,7 +872,7 @@ class ProfileScreen(Screen[None]):
             )
         buttons = [
             SkillChoice(
-                _skill_text(skill, profile.skills[skill], self.updates.get(skill)),
+                _skill_text(profile, skill, self.updates.get(skill)),
                 name,
                 skill,
                 value=on == [skill],

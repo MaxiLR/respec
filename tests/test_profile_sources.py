@@ -121,7 +121,11 @@ def test_install_from_a_folder_copies_the_profile_and_records_its_source(
     assert (folder / "skills" / "tdd" / "SKILL.md").read_text() == "# tdd v1\n"
     assert (folder / "skills" / "tdd" / "refs" / "note.txt").read_text() == "note\n"
     assert (folder / "skills" / "house" / "SKILL.md").read_text() == "# house v1\n"
-    assert sorted(p.name for p in folder.iterdir()) == ["profile.yaml", "skills"]
+    assert sorted(p.name for p in folder.iterdir()) == [
+        "SOURCE.md",
+        "profile.yaml",
+        "skills",
+    ]
     assert pack.untouched()
 
 

@@ -413,7 +413,9 @@ def test_a_skill_without_a_source_still_never_changes(run, work, profiles_root):
 
     assert refused.exit_code == 1 and "has no source" in refused.output
     assert "has no skills with a source" in everything.output
-    assert shown["skills"] == [{"name": "tdd", "enabled": True}]
+    assert shown["skills"] == [
+        {"name": "tdd", "enabled": True, "provenance": "original"}
+    ]
 
 
 @pytest.mark.parametrize(

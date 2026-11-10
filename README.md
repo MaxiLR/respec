@@ -124,6 +124,7 @@ export RESPEC_USER_HOME="$(mktemp -d)"
 | **Layer**         | A named group of skills inside a profile. An exclusive layer keeps at most one enabled.                                                          |
 | **Shipped skill** | `respec` and `profile-maker`, installed into every target whenever a profile is active so any agent can manage profiles.                         |
 | **Global skill**  | A skill of yours listed in `~/.respec/config.yaml`; it survives every switch.                                                                    |
+| **Source**        | Where a profile or a skill was copied from: a folder or a git repository. respec reads it and never writes to it.                                |
 
 Skills are installed as symlinks into the profile, or as copies where
 symlinking fails. respec records every path it creates and never removes
@@ -179,6 +180,16 @@ target:
   skills when you ask.
 - `profile-maker`: a guided interview that builds a profile.
 
+respec keeps its own copy of every skill and never writes to a skill's source.
+An agent asked to edit a global skill first looks up where it came from:
+`respec profile show <name> --json` (and `respec status --json`) give each
+skill's `provenance` and `source`. A skill with a source is edited there and
+brought in with `respec update <skill>`; only a skill that is original to the
+copy is edited under `~/.respec/profiles/`. The shipped `respec` skill states
+this rule, and a generated `SOURCE.md` in each profile's folder repeats it per
+skill. See
+[Finding a skill's true source](docs/reference.md#finding-a-skills-true-source).
+
 Every command's `--json` output uses one vocabulary (`resolved`, `unresolved`,
 `backups`, `warnings`, `error`), described in the
 [reference](docs/reference.md#json-output).
@@ -188,6 +199,7 @@ Every command's `--json` output uses one vocabulary (`resolved`, `unresolved`,
 The [reference](docs/reference.md) covers every command in detail:
 
 - [Skills from git](docs/reference.md#skills-from-git)
+- [Finding a skill's true source](docs/reference.md#finding-a-skills-true-source)
 - [Shipped and global skills](docs/reference.md#shipped-and-global-skills)
 - [Unknown entries](docs/reference.md#unknown-entries)
 - [Undo](docs/reference.md#undo)

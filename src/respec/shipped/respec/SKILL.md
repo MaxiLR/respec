@@ -15,6 +15,24 @@ every path it creates, and hand edits make its record disagree with disk.
 
 ## Ground rules for agents
 
+- **Before editing any global skill, look up where it came from.** The files
+  under `~/.respec/profiles/` are respec's copy, not the source. Run
+  `respec profile show <profile> --json` (or `respec status --json` for the
+  active profile) and read the skill's `provenance` and `source`:
+  - `profile-source` or `own-source`: the skill has a `source`. Edit it
+    there (the `folder`, or a checkout of the `repo` at its `path`), then run
+    `respec update <skill>` to bring the change into the copy. An edit made
+    in the copy never reaches the source, and `edited: true` marks a copy
+    that already differs from what was copied.
+  - `original`: the skill has no `source`; the copy is the only one. Edit it
+    under `~/.respec/profiles/<profile>/skills/<skill>/`.
+
+  Never write to a source on respec's behalf. The one exception is when the
+  user asks you to save a profile to its source: then follow
+  [Saving a profile to its source](#saving-a-profile-to-its-source).
+  `SOURCE.md` in each profile's folder repeats this per skill; respec
+  generates it, so never edit it.
+
 - Pass `--json` to read results. Every command except `tui` accepts it. JSON
   objects carry a `warnings` list; each warning has a `type`
   (`layer-conflict`, `unreadable-manifest`, `unreadable-takeover-log`,
@@ -64,7 +82,13 @@ Every enabled skill of a profile goes to all of that profile's targets.
 - `respec profile new <name> -t <target> [-t <target>...]`: create an empty
   profile.
 - `respec profile list`: profiles with their targets and skill counts.
-- `respec profile show <name>`: targets (with folders) and skills.
+- `respec profile show <name>`: targets (with folders), the profile's
+  `source` when it has one, and the skills. Each skill has `name`, `enabled`
+  and `provenance`: `profile-source` (it came from the profile's source),
+  `own-source` (added locally with a source of its own, git or a folder) or
+  `original` (added locally, no source). A skill with a source also has
+  `source` and, when its record has a digest, `edited`: whether the copy no
+  longer matches what was copied.
 - `respec profile install <source> [--name <name>] [--ref <ref>]`: copy a
   whole profile folder (with `profile.yaml` and `skills/`). `<source>` is a
   local folder (an existing local folder wins), `owner/repo[#path]` or a git
@@ -97,7 +121,9 @@ Every enabled skill of a profile goes to all of that profile's targets.
 - `respec use <profile> [--unknown add|remove]`: activate a profile.
 - `respec status`: active profile, its targets, and the managed skills in
   each folder respec owns (each marked by `origin`: `profile`, `shipped` or
-  `global`), plus the unknown entries (`unresolved`).
+  `global`), plus the unknown entries (`unresolved`). A skill with `origin`
+  `profile` also has `provenance`, `source` and `edited`, as in
+  `respec profile show`.
 - `respec tui` (or `respec` alone on a terminal): the terminal UI.
 
 ### Skills
@@ -131,7 +157,8 @@ Every enabled skill of a profile goes to all of that profile's targets.
   folder is copied again). A skill with local edits is only overwritten after
   confirmation or with `--yes`; with `--json` it is skipped. Each row's
   `result` is `updated`, `up-to-date`, `skipped-local-edits`, `source-missing`
-  or `error`. Skills without a source never change.
+  or `error`. `update` never changes the files of a skill without a source;
+  it only gives such a skill a source when it adopts it (`adopted`, below).
 - `respec update` with no skill named also follows the profile's own source:
   it adds the skills that are new there (`result` `added`, with `enabled`:
   the state the source's `profile.yaml` gives, as a starting state only) and
@@ -288,7 +315,9 @@ disable it (`respec disable <skill>`) or remove it in the source.
 
 Each profile is a folder `~/.respec/profiles/<name>/` with `profile.yaml` and
 `skills/<skill>/SKILL.md...`. The commands above write it; this schema is for
-reading.
+reading. Beside it respec keeps a generated `SOURCE.md` (the profile's source
+and each skill's provenance and source), written again on every save. It is
+not a skill and is never installed into a target.
 
 ```yaml
 targets: [claude-code, agents] # at least one known target

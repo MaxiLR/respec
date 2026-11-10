@@ -1,7 +1,8 @@
 """Profiles: self-contained folders under ``<respec home>/profiles/<name>/``.
 
-Each profile folder holds ``profile.yaml`` and a ``skills/`` directory. The
-schema of ``profile.yaml``::
+Each profile folder holds ``profile.yaml`` and a ``skills/`` directory, plus a
+generated ``SOURCE.md`` (see :mod:`respec.provenance`). The schema of
+``profile.yaml``::
 
     targets: [claude-code, agents]   # at least one known target, no repeats
     source:                          # optional; where 'profile install' got
@@ -55,6 +56,8 @@ from respec.state import sync_folder, write_durably
 from respec.targets import known_names, registry
 
 PROFILE_FILE = "profile.yaml"
+# Generated beside profile.yaml on every save; see :mod:`respec.provenance`.
+SOURCE_FILE = "SOURCE.md"
 SKILLS_DIR = "skills"
 # ``\Z``, not ``$``: ``$`` also matches before a trailing newline.
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -682,6 +685,26 @@ def _write(profile: Profile, text: str) -> None:
     os.replace(temporary, file)
     sync_folder(file.parent)
     _touched[(profile.path, profile.name)] = None
+    _write_source_file(profile)
+
+
+def _write_source_file(profile: Profile) -> None:
+    """Write the generated ``SOURCE.md`` that tells agents where each skill
+    came from, as atomically as ``profile.yaml``. It is only a note: when it
+    cannot be written the profile change stands and the next save tries again.
+    """
+    from respec import provenance  # imports this module
+
+    file = profile.path / SOURCE_FILE
+    temporary = file.with_name(f".{SOURCE_FILE}.tmp")
+    try:
+        write_durably(temporary, provenance.source_file(profile))
+        os.replace(temporary, file)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def save_profile(profile: Profile) -> None:

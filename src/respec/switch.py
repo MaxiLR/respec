@@ -816,12 +816,16 @@ def _kept(
 
 def status(respec_home: Path) -> dict[str, object]:
     """Active profile, its targets, the skills respec placed in each folder
-    (each with its ``origin``: ``profile``, ``shipped`` or ``global``) and the
+    (each with its ``origin``: ``profile``, ``shipped`` or ``global``; a
+    profile's skill also with :func:`respec.provenance.fields`) and the
     unknown entries still waiting for a decision (``unresolved``). A
     takeover log that cannot be read is reported (:func:`takeovers.inspect`)."""
+    from respec import provenance  # imports this module
+
     state = load_state(respec_home)
     takeovers.inspect(respec_home)
     active_targets: list[str] = []
+    profile = None
     if state.active_profile is not None:
         try:
             profile = profiles.load_profile(respec_home, state.active_profile)
@@ -837,6 +841,15 @@ def status(respec_home: Path) -> dict[str, object]:
     # The entry a cut-short step was changing belongs to that change.
     changing = {trees.real(path) for path in journal.in_flight(state.journal)}
     order = list(targets.registry())
+
+    def described(item: Installed) -> dict[str, object]:
+        origin = global_skills.origin(respec_home, Path(item.path), item.name)
+        row = {"name": item.name, "path": item.path, "mode": item.mode}
+        row["origin"] = origin
+        if origin == "profile" and profile and item.name in profile.skills:
+            row.update(provenance.fields(profile, item.name))
+        return row
+
     folders = []
     for target in sorted(
         state.owned, key=lambda t: order.index(t) if t in order else len(order)
@@ -848,14 +861,7 @@ def status(respec_home: Path) -> dict[str, object]:
                 "skills_dir": state.owned[target].skills_dir,
                 "same_as": None if target == first else first,
                 "skills": [
-                    {
-                        "name": item.name,
-                        "path": item.path,
-                        "mode": item.mode,
-                        "origin": global_skills.origin(
-                            respec_home, Path(item.path), item.name
-                        ),
-                    }
+                    described(item)
                     for item in sorted(state.installed, key=lambda i: i.name)
                     if target == first
                     and first_of.get(item.target) == first

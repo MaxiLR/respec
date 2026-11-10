@@ -9,6 +9,7 @@ respec               # open the TUI (also: respec tui)
 respec profile new work --target claude-code --target agents
 respec use work      # switch: remove the previous profile's skills, link this one's
 respec status        # active profile, targets and managed skills per folder
+respec profile show work          # targets, the profile's source and where each skill came from
 respec add ./my-skill [-p work]   # copy a skill folder (with SKILL.md) into a profile; the folder is its source
 respec disable my-skill [-p work] # stop linking it; files and metadata stay
 respec enable my-skill [-p work]
@@ -234,6 +235,62 @@ source is still only overwritten after confirmation or with `--yes`, and a
 skill that did not come from the source is left alone. The change is
 journaled with the rest of the update. `profile diff` then no longer lists
 the skill.
+
+## Finding a skill's true source
+
+The files under `~/.respec/profiles/` are respec's own copy. A skill that has
+a source must be edited there, not in the copy: respec never writes to a
+source, so an edit made in the copy never reaches it. After editing the
+source, `respec update <skill>` brings the change into the copy.
+
+Each skill of a profile has a provenance, derived from the sources
+`profile.yaml` records (nothing more is stored):
+
+| `provenance`     | In text                     | Meaning                                                        | Where to edit                         |
+| ---------------- | --------------------------- | -------------------------------------------------------------- | ------------------------------------- |
+| `profile-source` | `from the profile's source` | Its source points into the profile's source.                   | At its `source`, then `update`.       |
+| `own-source`     | `added locally`             | Added here with a source of its own (git, or another folder).  | At its `source`, then `update`.       |
+| `original`       | `added locally, original`   | Added or made here without a source; the copy is the only one. | In the copy, under `skills/<skill>/`. |
+
+A skill with a source is also flagged `edited` when its files no longer match
+the digest of what was copied. A source record without a digest cannot be
+judged, so the flag is then left out.
+
+`profile show <name>` prints the profile's source (`Source: ...`) and, per
+skill, the label, `, edited` when flagged, and the source:
+
+```text
+Profile pack  (/Users/me/.respec/profiles/pack)
+Source: /Users/me/dev-setup/pack
+Targets:
+  claude-code  /Users/me/.claude/skills
+Skills:
+  tdd    enabled   from the profile's source, edited: /Users/me/dev-setup/pack/skills/tdd
+  extra  enabled   added locally: owner/repo#skills/extra@main
+  notes  disabled  added locally, original
+```
+
+`status` prints the same label after each skill of the active profile. With
+`--json`, `profile show` gives the profile's `source` (left out when it has
+none) and each skill's `provenance`, `source` (left out for `original`) and
+`edited` (left out when it cannot be judged); `status` gives the same three
+fields on every skill whose `origin` is `profile`. `origin` keeps its meaning
+(`profile`, `shipped` or `global`: who placed the skill); `provenance` says
+where a profile's skill came from.
+
+respec also keeps a generated `SOURCE.md` in the profile's folder, beside
+`profile.yaml`, as a backstop for an agent that opens the folder directly. It
+names the profile's source, lists each skill with its label and where to edit
+it, and gives the rule above. respec writes it again every time it saves
+`profile.yaml` (through a temporary file and a rename), from `profile.yaml`
+alone: it does not carry the `edited` flag, which `profile show`, `status` and
+`profile diff` compute when asked. Commands that only read (`profile show`,
+`status`, `profile diff`, `update --check`) never write it, so a profile made
+before this file existed gets one at its next change. It is not a skill: it is
+never installed into a target, is not part of any skill's digest, and a
+`SOURCE.md` inside a profile's source is neither copied nor read. Do not edit
+it. If it cannot be written, the profile change still stands and the next save
+writes it again.
 
 ## Removing a profile
 
@@ -490,7 +547,9 @@ until its first or last entry, where the next press moves on.
 
 **Edit** (`e`) opens the selected profile: its skills grouped by layer, with a
 toggle per skill and, in an active exclusive layer, a choice of one skill (or
-none). **Add folder** (`a`) and **Add from git** (`g`) add skills, and
+none). Each skill shows where it came from (`from the profile's source`,
+`added locally` or `added locally, original`, with `, edited` when the copy
+no longer matches what was copied) and its source, as `profile show` does. **Add folder** (`a`) and **Add from git** (`g`) add skills, and
 **Check updates** (`u`) marks sourced skills that have a newer commit or a
 changed source folder, or that are gone from the profile's source. Git runs
 in the background with a **Cancel** button (or `Esc`). Every
@@ -621,7 +680,11 @@ fields can be `null`, each meaning "none": `active_profile` and
 another target) and a value under `restored` (that folder did not exist at
 takeover). In `status`, each skill of a folder gives its `origin`: `profile`,
 `shipped` (respec's own skills) or `global` (from `config.yaml`); a link is
-judged by the folder it points into.
+judged by the folder it points into. A skill of a profile (in `profile show`,
+and in `status` when its `origin` is `profile`) also gives its `provenance`
+(`profile-source`, `own-source` or `original`), its `source` when it has one
+and `edited` when that can be judged; see
+[Finding a skill's true source](#finding-a-skills-true-source).
 
 The same warnings are printed on stderr. `respec restore --list --json` prints a
 bare list of backups instead: it reads no profile, so it has nothing to warn

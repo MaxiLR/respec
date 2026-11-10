@@ -14,7 +14,7 @@ import typer
 
 from respec import adopt as adopt_entries
 from respec import global_skills, items, journal, layers, lock, messages, paths
-from respec import profiles, removal
+from respec import profiles, provenance, removal
 from respec import sources
 from respec import switch, takeovers, targets, trees, unknown
 from respec import restore as restore_backups
@@ -322,7 +322,7 @@ def profile_show(
         {
             "name": skill,
             "enabled": entry.enabled,
-            "source": entry.source.to_dict() if entry.source else None,
+            **provenance.fields(profile, skill),
         }
         for skill, entry in profile.skills.items()
     ]
@@ -331,6 +331,7 @@ def profile_show(
             {
                 "name": profile.name,
                 "path": str(profile.path),
+                "source": profile.source.to_dict() if profile.source else None,
                 "targets": target_rows,
                 "skills": skill_rows,
             }
@@ -338,6 +339,8 @@ def profile_show(
         return
 
     typer.echo(f"Profile {profile.name}  ({profile.path})")
+    if profile.source is not None:
+        typer.echo(f"Source: {messages.source_label(profile.source)}")
     typer.echo("Targets:")
     width = max(len(row["name"]) for row in target_rows)
     for row in target_rows:
@@ -349,8 +352,8 @@ def profile_show(
     width = max(len(row["name"]) for row in skill_rows)
     for skill, entry in profile.skills.items():
         state = "enabled " if entry.enabled else "disabled"
-        origin = f"  {messages.source_label(entry.source)}" if entry.source else ""
-        typer.echo(f"  {skill:<{width}}  {state}{origin}".rstrip())
+        label = provenance.label(provenance.fields(profile, skill))
+        typer.echo(f"  {skill:<{width}}  {state}  {label}")
 
 
 def _interactive() -> bool:
@@ -690,7 +693,10 @@ def status(ctx: typer.Context, as_json: JsonOption = False) -> None:
         if not folder["skills"]:
             typer.echo("  (no managed skills)")
         for skill in folder["skills"]:
-            origin = "" if skill["origin"] == "profile" else f"  {skill['origin']}"
+            if "provenance" in skill:
+                origin = f"  {provenance.label(skill)}"
+            else:
+                origin = "" if skill["origin"] == "profile" else f"  {skill['origin']}"
             typer.echo(f"  {skill['name']}  {skill['mode']}{origin}")
         for entry in report["unresolved"]:
             if entry["targets"][0] != folder["target"]:
