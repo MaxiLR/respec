@@ -1,5 +1,6 @@
-"""Git sources: add skills from a repository, check and apply updates, and
-install a whole profile from a repository once (modpack-style).
+"""Sources: add skills from a repository or a folder, check and apply updates,
+and install a whole profile from a repository or a folder, which the profile
+then remembers as its own source (see :func:`reference`).
 
 A source is written as ``owner/repo`` (resolved against ``RESPEC_GIT_BASE_URL``,
 default ``https://github.com``) or as a git URL, optionally followed by
@@ -8,15 +9,19 @@ default ``https://github.com``) or as a git URL, optionally followed by
 (none means the remote's default branch), the resolved commit and a digest of
 the files as fetched, so later local edits can be detected.
 
-Updates are explicit: :func:`check` only reads the remote; :func:`update`
-replaces an item's folder with the newer upstream files. Items without a
-source never change. Git runs as a subprocess with prompts disabled, a time
+A skill added from a local folder records that folder instead (``folder``,
+its absolute path, and the digest of the copy). respec only ever reads it.
+
+Updates are explicit: :func:`check` only reads the remote or the folder;
+:func:`update` replaces an item's folder with the newer upstream files. Items
+without a source never change. Git runs as a subprocess with prompts disabled, a time
 limit (``RESPEC_GIT_TIMEOUT`` seconds per git command, default 120) and, for
 the TUI, a way to be cancelled (:func:`cancel_on`).
 """
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import os
@@ -35,7 +40,7 @@ from pathlib import Path
 
 import yaml
 
-from respec import global_skills, items, journal, profiles, trees
+from respec import global_skills, items, journal, paths, profiles, trees
 from respec.errors import RespecError
 from respec.state import load_state
 
@@ -44,6 +49,12 @@ SCP_LIKE = profiles.REPO_SCP_LIKE
 # Transports git may use: no remote helpers such as ``fd::`` or ``ext::``.
 ALLOWED_PROTOCOLS = "file:git:http:https:ssh"
 FULL_SHA = re.compile(r"^[0-9a-f]{40}\Z")
+# Never content of a skill, wherever they are in it: git's own data (a
+# checkout given as a source) and the macOS Finder's ``.DS_Store``. They are
+# not copied from a source and do not count in a digest or in ``profile diff``.
+# A ``.git`` in respec's copy of a skill is another matter: see
+# :func:`local_git`.
+NOT_CONTENT = trees.IGNORED_FILES | {".git"}
 
 
 @dataclass(frozen=True)
@@ -328,11 +339,11 @@ def _label(root: Path, entry: Path) -> str:
         return entry.name
 
 
-def _within(root: Path, entry: Path) -> None:
+def _within(root: Path, entry: Path, where: str = "the repository") -> None:
     target = entry.resolve()
     if target != root and root not in target.parents:
         raise RespecError(
-            f"symlink {_label(root, entry)!r} points outside the repository; "
+            f"symlink {_label(root, entry)!r} points outside {where}; "
             "refusing to copy it"
         )
 
@@ -353,16 +364,28 @@ def copy_fetched(tree: Path, source: Path, destination: Path) -> None:
     write gigabytes) and sibling folder links can form copy loops. Each file
     link adds at most one copy of one file, which a repository could also
     get from duplicate files at the same fetch cost.
+    ``.git`` and ``.DS_Store`` entries are never copied (:data:`NOT_CONTENT`).
     Every failure is a :class:`RespecError` and leaves no ``destination``.
     """
     root = tree.resolve()
     _within(root, source)
+    _copy_checked(source, destination, f"{_label(root, source)!r} from the repository")
+
+
+def _copy_checked(source: Path, destination: Path, what: str) -> None:
+    """Copy ``source`` to ``destination`` by the link rules of
+    :func:`copy_fetched`; ``what`` names the source in a failure."""
     if os.path.lexists(destination):
         raise RespecError(f"{destination} already exists")
     with tempfile.TemporaryDirectory(prefix="respec-check-") as scratch:
         checked = Path(scratch) / "item"
         try:
-            shutil.copytree(source, checked, symlinks=True)
+            shutil.copytree(
+                source,
+                checked,
+                symlinks=True,
+                ignore=shutil.ignore_patterns(*NOT_CONTENT),
+            )
             _check_links(checked)
             shutil.copytree(checked, destination)
         except RespecError:
@@ -370,10 +393,36 @@ def copy_fetched(tree: Path, source: Path, destination: Path) -> None:
             raise
         except (OSError, shutil.Error) as error:
             shutil.rmtree(destination, ignore_errors=True)
-            raise RespecError(
-                f"could not copy {_label(root, source)!r} from the repository: "
-                f"{_reason(error)}"
-            ) from None
+            raise RespecError(f"could not copy {what}: {_reason(error)}") from None
+
+
+class SourceMissing(RespecError):
+    """A source folder is gone or no longer holds ``SKILL.md``."""
+
+
+def copy_folder(folder: Path, destination: Path, root: Path | None = None) -> None:
+    """Copy the local source ``folder`` to ``destination`` by the rules for
+    fetched content (:func:`copy_fetched`). The folder is only read. With
+    ``root`` (the folder of a profile's source that ``folder`` is an entry
+    of), a ``folder`` that resolves outside it is refused, as an entry of a
+    repository is."""
+    if not folder.is_dir():
+        raise SourceMissing(f"source folder {folder} no longer exists")
+    if not (folder / items.SKILL_FILE).is_file():
+        raise SourceMissing(
+            f"source folder {folder} no longer holds {items.SKILL_FILE}"
+        )
+    if root is not None:
+        _within(root.resolve(), folder, f"the source folder {root}")
+    _copy_checked(folder, destination, f"source folder {folder}")
+
+
+def folder_digest(folder: str) -> str:
+    """The digest a copy of the source ``folder`` made now would record."""
+    with tempfile.TemporaryDirectory(prefix="respec-folder-") as scratch:
+        copy = Path(scratch) / "skill"
+        copy_folder(Path(folder), copy)
+        return fetched_digest(copy)
 
 
 def _reason(error: OSError | shutil.Error) -> str:
@@ -424,10 +473,13 @@ def _check_links(folder: Path) -> None:
 # --- content -----------------------------------------------------------------
 
 
-def fetched_digest(folder: Path) -> str:
+def fetched_digest(folder: Path, everything: bool = False) -> str:
     """A hash of the folder's tree: every entry's relative path and kind, file
     contents and executable bits, and symlink targets (symlinks are not
     followed), so added empty folders and symlinks count as edits too.
+    ``.git`` and ``.DS_Store`` entries (:data:`NOT_CONTENT`) are left out,
+    unless ``everything`` is asked for: the digest as it was recorded before
+    they were (see :func:`copied_digest`).
 
     This is ``source.digest`` in ``profile.yaml``: the profile's copy as
     fetched. It is not :func:`respec.unknown.digest`, which fingerprints
@@ -436,6 +488,9 @@ def fetched_digest(folder: Path) -> str:
     hasher = hashlib.sha256()
     entries: list[Path] = []
     for root, dirs, files in os.walk(folder):
+        if not everything:
+            dirs[:] = [name for name in dirs if name not in NOT_CONTENT]
+            files = [name for name in files if name not in NOT_CONTENT]
         entries.extend(Path(root) / name for name in dirs + files)
     for entry in sorted(entries):
         relative = entry.relative_to(folder).as_posix()
@@ -448,6 +503,38 @@ def fetched_digest(folder: Path) -> str:
             hasher.update(f"f\0{relative}\0{executable}\0".encode())
             hasher.update(hashlib.sha256(entry.read_bytes()).digest())
     return f"sha256:{hasher.hexdigest()}"
+
+
+def copied_digest(profile: profiles.Profile, item: str) -> str | None:
+    """The digest recorded for the skill's copy, as :func:`fetched_digest`
+    gives it today; None without one. A digest recorded when ``.DS_Store``
+    and ``.git`` entries still counted stays valid: while the copy still
+    matches it, it stands for the copy's digest of today."""
+    source = profile.skills[item].source
+    if source is None or source.digest is None:
+        return None
+    folder = profile.path / profiles.SKILLS_DIR / item
+    now = fetched_digest(folder)
+    if source.digest != now and source.digest == fetched_digest(folder, True):
+        return now
+    return source.digest
+
+
+def local_git(folder: Path) -> list[str]:
+    """The ``.git`` entries in ``folder``, respec's copy of a skill, at any
+    depth: their relative paths, a folder with a trailing ``/``. None is ever
+    copied from a source, so each was made in the copy (``git init`` there,
+    say) and counts as a local edit: an update asks before it deletes one."""
+    found: list[str] = []
+    for root, dirs, files in os.walk(folder):
+        for name in dirs + files:
+            if name == ".git":
+                entry = Path(root) / name
+                relative = entry.relative_to(folder).as_posix()
+                is_folder = entry.is_dir() and not entry.is_symlink()
+                found.append(f"{relative}/" if is_folder else relative)
+        dirs[:] = [name for name in dirs if name != ".git"]
+    return sorted(found)
 
 
 def _find_skills(tree: Path, spec: Spec) -> list[tuple[str, str | None]]:
@@ -520,6 +607,15 @@ def _add(
     with checkout(spec.url, ref, spec.repo) as (tree, commit):
         found = _find_skills(tree, spec)
         global_skills.refuse_reserved(respec_home, [item for item, _ in found], name)
+        inside_source = [
+            item
+            for item, path in found
+            if before.source is not None
+            and profiles.Source(repo=spec.repo, path=path, ref=ref)
+            == _skill_source(before.source, item)
+        ]
+        if inside_source:
+            raise RespecError(own_source_refusal(name, inside_source))
         clashes = [item for item, _ in found if item in before.skills]
         if clashes:
             raise RespecError(
@@ -563,6 +659,20 @@ def _add(
     return change
 
 
+def own_source_refusal(profile: str, skills: list[str]) -> str:
+    """Why ``add`` refuses skills taken from inside the source of the profile
+    they would go to: recorded with a source there, the next update would
+    take them for skills gone from it and remove them."""
+    names = ", ".join(map(repr, skills))
+    return (
+        f"{names} {'is' if len(skills) == 1 else 'are'} inside the source of "
+        f"profile {profile!r}; a skill of that source is added by 'respec "
+        "update', not by 'respec add'. Nothing was added. List the skill in "
+        f"the source's {profiles.PROFILE_FILE} (if it is not listed yet) and "
+        f"run 'respec update -p {profile}', which adds it."
+    )
+
+
 def _forget(before: profiles.Profile, added: list[str]) -> None:
     profiles.restore_profile(before)
     for item in added:
@@ -574,12 +684,24 @@ def _forget(before: profiles.Profile, added: list[str]) -> None:
 
 @dataclass
 class Row:
+    """One sourced skill of a check. A git source gives ``current`` and
+    ``latest`` (commits); a folder source gives ``folder``, and
+    ``source_missing`` (with ``message``) when that folder is gone. A skill
+    the profile's source no longer lists is ``gone``; one it lists that the
+    profile does not have is ``new`` (with ``enabled``, its starting state)."""
+
     skill: str
-    current: str | None
+    current: str | None = None
     latest: str | None = None
+    folder: str | None = None
     update_available: bool | None = None
     modified: bool | None = None
+    source_missing: bool | None = None
+    message: str | None = None
     error: str | None = None
+    gone: bool | None = None
+    new: bool | None = None
+    enabled: bool | None = None
 
     def to_dict(self) -> dict[str, object]:
         return dataclasses.asdict(self)
@@ -601,41 +723,134 @@ def _sourced(profile: profiles.Profile, item: str | None) -> list[str]:
 
 
 def _modified(profile: profiles.Profile, item: str) -> bool:
-    """Whether the item's files differ from what was fetched (unknown: True)."""
-    source = profile.skills[item].source
+    """Whether the item's files differ from what was fetched (unknown: True),
+    or its folder holds a ``.git`` entry (:func:`local_git`)."""
     folder = profile.path / profiles.SKILLS_DIR / item
-    return source is None or source.digest != fetched_digest(folder)
+    return copied_digest(profile, item) != fetched_digest(folder) or bool(
+        local_git(folder)
+    )
 
 
 def _latest(source: profiles.Source, cache: dict[tuple[str, str | None], str]) -> str:
+    """What the source holds now: the upstream commit, or for a folder source
+    the digest of its files, to compare with :func:`_recorded`."""
+    if source.folder is not None:
+        return folder_digest(source.folder)
+    assert source.repo is not None
     key = (repo_url(source.repo), source.ref)
     if key not in cache:
         cache[key] = remote_commit(key[0], source.ref, source.repo)
     return cache[key]
 
 
+def _recorded(profile: profiles.Profile, item: str) -> str | None:
+    """What ``profile.yaml`` says the copy was made from (see :func:`_latest`)."""
+    source = profile.skills[item].source
+    assert source is not None
+    if source.folder is not None:
+        return copied_digest(profile, item)
+    return source.commit
+
+
+def _open_source(
+    stack: contextlib.ExitStack, profile: profiles.Profile, item: str | None
+) -> tuple[Reference | None, RespecError | None]:
+    """The profile's source, opened (until ``stack`` closes) to compare its
+    skills with the profile's, or the reason it cannot be read. Neither when
+    the profile has no source, or one skill is named that did not come from
+    it."""
+    if profile.source is None or not (
+        item is None or (item in profile.skills and from_profile_source(profile, item))
+    ):
+        return None, None
+    try:
+        return stack.enter_context(reference(profile.source, profile.name)), None
+    except GitCancelled:
+        raise
+    except RespecError as error:
+        return None, error
+
+
+def _gone(profile: profiles.Profile, found: Reference | None, item: str) -> bool:
+    """Whether skill ``item`` came from the profile's source, which no longer
+    lists it. Skills from anywhere else are never gone."""
+    return (
+        found is not None
+        and item not in found.profile.skills
+        and from_profile_source(profile, item)
+    )
+
+
 def check(
     respec_home: Path, profile_name: str | None = None, item: str | None = None
-) -> tuple[str, list[Row]]:
-    """Report, per sourced item, whether a newer upstream commit exists."""
+) -> tuple[str, list[Row], dict[str, object] | None]:
+    """Report, per sourced item, whether a newer upstream commit exists, and
+    (when no item is named) the skills that are new in the profile's source.
+    A skill that came from the profile's source and is no longer listed
+    there is ``gone``, named or not; otherwise it has an update when its
+    files there differ from what was copied, whatever the source's commit,
+    as ``profile diff`` reports it. Returns the profile's
+    name, the rows and the state of the profile's source (None when it has
+    none or an item is named): its
+    record, ``latest`` for git, and ``source_missing`` with ``message`` or
+    ``error`` when it could not be read."""
     profile = profiles.load_profile(
         respec_home, items.resolve_profile_name(respec_home, profile_name)
     )
     cache: dict[tuple[str, str | None], str] = {}
     rows: list[Row] = []
-    for name in _sourced(profile, item):
-        source = profile.skills[name].source
-        assert source is not None
-        row = Row(skill=name, current=source.commit, modified=_modified(profile, name))
-        try:
-            row.latest = _latest(source, cache)
-            row.update_available = row.latest != source.commit
-        except GitCancelled:
-            raise
-        except RespecError as error:
-            row.error = str(error)
-        rows.append(row)
-    return profile.name, rows
+    with contextlib.ExitStack() as stack:
+        opened, failure = _open_source(stack, profile, item)
+        found = opened if item is None else None
+        for name in _sourced(profile, item):
+            source = profile.skills[name].source
+            assert source is not None
+            row = Row(
+                skill=name,
+                current=source.commit,
+                folder=source.folder,
+                modified=_modified(profile, name),
+            )
+            rows.append(row)
+            if _gone(profile, opened, name):
+                row.gone = True
+                continue
+            try:
+                if from_profile_source(profile, name):
+                    if failure is not None:
+                        raise failure  # an unreadable source changes nothing
+                    assert opened is not None
+                    row.update_available = opened.digest(name) != copied_digest(
+                        profile, name
+                    )
+                    row.latest = opened.source.commit
+                    continue
+                latest = _latest(source, cache)
+                row.update_available = latest != _recorded(profile, name)
+                if source.folder is None:
+                    row.latest = latest
+            except GitCancelled:
+                raise
+            except SourceMissing as error:
+                row.source_missing, row.message = True, str(error)
+            except RespecError as error:
+                row.error = str(error)
+        state: dict[str, object] | None = None
+        if item is None and profile.source is not None:
+            state = dict(profile.source.to_dict())
+        if found is not None and state is not None:
+            if found.source.commit is not None:
+                state["latest"] = found.source.commit
+            rows += [
+                Row(skill=name, new=True, enabled=entry.enabled)
+                for name, entry in found.profile.skills.items()
+                if name not in profile.skills
+            ]
+        elif isinstance(failure, SourceMissing) and state is not None:
+            state.update(source_missing=True, message=str(failure))
+        elif failure is not None and state is not None:
+            state["error"] = str(failure)
+    return profile.name, rows, state
 
 
 @dataclass
@@ -645,6 +860,9 @@ class UpdateResult:
     active: bool = False
     linked: list[str] = field(default_factory=list)
     unlinked: list[str] = field(default_factory=list)
+    # The profile's source as recorded after the run, or with the ``result``
+    # of a failed read; None when it has none or one skill was named.
+    source: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return dataclasses.asdict(self)
@@ -659,11 +877,25 @@ def update(
     profile_name: str | None = None,
     item: str | None = None,
     overwrite_edits: Confirm = lambda item: False,
+    remove_edits: Confirm | None = None,
 ) -> UpdateResult:
-    """Apply newer upstream commits to sourced items.
+    """Apply newer upstream commits, or a source folder's newer files, to
+    sourced items. A skill that came from the profile's source is compared
+    by its files there and copied from the source as opened once: when they
+    are the ones that were copied it is up to date (only its recorded commit
+    follows), whatever was edited in the copy.
+
+    With no item named, the profile is also put in line with the skills of
+    its own source: new ones are added, in the state the source
+    gives them, the ones that came from it and are gone are removed (a
+    named one that is gone is only reported, as ``source-missing``), and a
+    skill whose copy holds exactly the files the source now holds for it is
+    adopted: only its source is recorded, pointing into the profile's source.
 
     An item whose files were edited locally is replaced only when
-    ``overwrite_edits(item)`` returns true; otherwise it is skipped.
+    ``overwrite_edits(item)`` returns true, and removed only when
+    ``remove_edits(item)`` does (default: the same answer); otherwise it is
+    skipped.
     """
     journal.ready(respec_home, user_home)
     profile = profiles.load_profile(
@@ -677,7 +909,14 @@ def update(
         profile_digest=journal.file_digest(profile.path / profiles.PROFILE_FILE),
         phase="copy",
     ):
-        return _update(respec_home, user_home, profile, item, overwrite_edits)
+        return _update(
+            respec_home,
+            user_home,
+            profile,
+            item,
+            overwrite_edits,
+            remove_edits or overwrite_edits,
+        )
 
 
 def _update(
@@ -686,6 +925,7 @@ def _update(
     profile: profiles.Profile,
     item: str | None,
     overwrite_edits: Confirm,
+    remove_edits: Confirm,
 ) -> UpdateResult:
     """The changing part of :func:`update`, inside its journal."""
     # Whether the profile is the active one, also when nothing is swapped
@@ -694,56 +934,232 @@ def _update(
     result = UpdateResult(profile=profile.name, active=active)
     skills = dict(profile.skills)
     replaced: list[tuple[Path, Path]] = []  # (live folder, kept old folder)
+    removing: list[str] = []  # gone from the profile's source
+    added: list[str] = []  # new in the profile's source
     cache: dict[tuple[str, str | None], str] = {}
     try:
-        for name in _sourced(profile, item):
-            source = skills[name].source
-            assert source is not None
-            _put_back_old(profile, name)
-            row: dict[str, object] = {"skill": name, "current": source.commit}
-            result.skills.append(row)
-            try:
-                latest = _latest(source, cache)
-            except GitCancelled:
-                raise
-            except RespecError as error:
-                row.update({"result": "error", "error": str(error)})
-                continue
-            row["latest"] = latest
-            if latest == source.commit:
-                row["result"] = "up-to-date"
-                continue
-            if _modified(profile, name) and not overwrite_edits(name):
-                row["result"] = "skipped-local-edits"
-                continue
-            try:
-                new_source = _replace(respec_home, profile, name, source, replaced)
-            except GitCancelled:
-                raise
-            except (RespecError, OSError, shutil.Error) as error:
-                row.update({"result": "error", "error": str(error)})
-                continue
-            row.update({"result": "updated", "latest": new_source.commit})
-            skills[name] = dataclasses.replace(skills[name], source=new_source)
-        if not replaced:
+        with contextlib.ExitStack() as stack:
+            opened, failure = _open_source(stack, profile, item)
+            found = opened if item is None else None
+            # Skills someone carried into the profile's source: the copy
+            # already holds the same files, so only their source is recorded.
+            recorded: list[str] = []  # skills from it: only the record changes
+            adopted = {  # skills that did not come from it
+                name: carried
+                for name in (found.profile.skills if found is not None else ())
+                if name in profile.skills
+                and not from_profile_source(profile, name)
+                and (carried := _carried(profile, found, name)) is not None
+            }
+            for name in _sourced(profile, item):
+                if name in adopted:
+                    continue  # it follows the profile's source from now on
+                source = skills[name].source
+                assert source is not None
+                _put_back_old(profile, name)
+                row = _row(name, source)
+                result.skills.append(row)
+                if _gone(profile, opened, name):
+                    row["gone"] = True
+                    if item is not None:  # naming a skill never removes it
+                        row.update(_failure(_kept_gone(profile)))
+                        continue
+                    if _modified(profile, name) and not remove_edits(name):
+                        row["result"] = "skipped-local-edits"
+                        continue
+                    # Journaled before profile.yaml is saved without it:
+                    # recovery deletes the folder once it is not listed.
+                    journal.note(respec_home, "removing", name)
+                    removing.append(name)
+                    del skills[name]
+                    row["result"] = "removed"
+                    continue
+                mine = opened if from_profile_source(profile, name) else None
+                try:
+                    if mine is None and from_profile_source(profile, name):
+                        assert failure is not None
+                        raise failure  # an unreadable source changes nothing
+                    if mine is not None:
+                        # By its files in the source, not the source's commit.
+                        latest = mine.source.commit or ""
+                        same = mine.digest(name) == copied_digest(profile, name)
+                    else:
+                        latest = _latest(source, cache)
+                        same = latest == _recorded(profile, name)
+                except GitCancelled:
+                    raise
+                except RespecError as error:
+                    row.update(_failure(error))
+                    continue
+                if source.folder is None:
+                    row["latest"] = latest
+                if same:
+                    row["result"] = "up-to-date"
+                    if mine is not None and source.commit != mine.source.commit:
+                        # The files it has are the ones of that commit too.
+                        recorded.append(name)
+                        skills[name] = dataclasses.replace(
+                            skills[name],
+                            source=dataclasses.replace(
+                                source, commit=mine.source.commit
+                            ),
+                        )
+                    continue
+                if _modified(profile, name):
+                    carried = (
+                        _carried(profile, found, name)
+                        if found is not None and from_profile_source(profile, name)
+                        else None
+                    )
+                    if carried is not None:
+                        # The edits are in the source now: nothing to overwrite.
+                        recorded.append(name)
+                        skills[name] = dataclasses.replace(skills[name], source=carried)
+                        row["result"] = "adopted"
+                        continue
+                    if not overwrite_edits(name):
+                        row["result"] = "skipped-local-edits"
+                        continue
+                try:
+                    new_source = _replace(
+                        respec_home, profile, name, source, replaced, mine
+                    )
+                except GitCancelled:
+                    raise
+                except (RespecError, OSError, shutil.Error) as error:
+                    row.update(_failure(error))
+                    continue
+                row["result"] = "updated"
+                if source.folder is None:
+                    row["latest"] = new_source.commit
+                skills[name] = dataclasses.replace(skills[name], source=new_source)
+            for name in found.profile.skills if found is not None else ():
+                if name in profile.skills:
+                    if name in adopted:
+                        skills[name] = dataclasses.replace(
+                            skills[name], source=adopted[name]
+                        )
+                        row = _row(name, adopted[name])
+                        row["result"] = "adopted"
+                        result.skills.append(row)
+                    continue
+                try:
+                    entry = _add_new(respec_home, profile, found, name, added)
+                except (RespecError, OSError, shutil.Error) as error:
+                    result.skills.append({"skill": name, **_failure(error)})
+                    continue
+                assert entry.source is not None
+                row = _row(name, entry.source)
+                row.update(result="added", enabled=entry.enabled)
+                result.skills.append(row)
+                skills[name] = entry
+        after = dataclasses.replace(
+            profile,
+            skills=skills,
+            source=found.source if found is not None else profile.source,
+            layers={
+                name: dataclasses.replace(
+                    layer,
+                    items=tuple(m for m in layer.items if m not in removing),
+                )
+                for name, layer in profile.layers.items()
+            },
+        )
+        if item is None and after.source is not None:
+            result.source = {
+                **after.source.to_dict(),
+                **(_failure(failure) if failure is not None else {}),
+            }
+        if not (
+            replaced
+            or removing
+            or added
+            or adopted
+            or recorded
+            or after.source != profile.source
+        ):
             return result
-        profiles.save_profile(dataclasses.replace(profile, skills=skills))
+        profiles.save_profile(after)
         journal.checkpoint("profile-saved")
         journal.set_phase(respec_home, "refresh")
     except BaseException:
-        _restore(profile, replaced)
+        _restore(profile, replaced, added)
         raise
 
+    undone: list[bool] = []
+
+    def undo() -> None:
+        undone.append(True)
+        _restore(profile, replaced, added)
+
     try:
-        items.refresh_active(
-            respec_home, user_home, result, lambda: _restore(profile, replaced)
-        )
+        items.refresh_active(respec_home, user_home, result, undo)
     finally:
         # A refused refresh has moved the old folders back already; after any
         # other failure the new files and profile.yaml agree, so drop the rest.
         for _, old in replaced:
             shutil.rmtree(old, ignore_errors=True)
+        if not undone:
+            # profile.yaml no longer lists them and their links are gone.
+            for name in removing:
+                shutil.rmtree(
+                    profile.path / profiles.SKILLS_DIR / name, ignore_errors=True
+                )
     return result
+
+
+def _row(name: str, source: profiles.Source) -> dict[str, object]:
+    """How an update row names a skill and where it comes from."""
+    if source.folder is None:
+        return {"skill": name, "current": source.commit}
+    return {"skill": name, "folder": source.folder}
+
+
+def _kept_gone(profile: profiles.Profile) -> SourceMissing:
+    """What a named update says of a skill that is gone from the profile's
+    source: only an update of the whole profile removes it."""
+    from respec.messages import source_label
+
+    assert profile.source is not None
+    return SourceMissing(
+        f"gone from the source of profile {profile.name!r} "
+        f"({source_label(profile.source)}) and left as it is: an update of "
+        f"one skill removes nothing; 'respec update -p {profile.name}' "
+        "(no skill named) removes it"
+    )
+
+
+def _add_new(
+    respec_home: Path,
+    profile: profiles.Profile,
+    found: Reference,
+    item: str,
+    added: list[str],
+) -> profiles.SkillEntry:
+    """Copy a skill that is new in the profile's source into the profile.
+    A name a shipped or global skill has is refused, as ``add`` does."""
+    global_skills.refuse_reserved(respec_home, [item], profile.name)
+    folder = profile.path / profiles.SKILLS_DIR / item
+    if os.path.lexists(folder):
+        raise RespecError(
+            f"{folder} already exists but is not listed in "
+            f"{profiles.PROFILE_FILE}; move it out of the way first"
+        )
+    # Journaled before it is made: only folders this run makes are removed
+    # when it is rolled back.
+    journal.note(respec_home, "created", item)
+    entry = found.take(item, folder)
+    added.append(item)
+    journal.checkpoint("added")
+    return entry
+
+
+def _failure(error: Exception) -> dict[str, object]:
+    """How an update row reports ``error``: a source folder that is gone is
+    ``source-missing`` (reported, not a failure), anything else an error."""
+    if isinstance(error, SourceMissing):
+        return {"result": "source-missing", "message": str(error)}
+    return {"result": "error", "error": str(error)}
 
 
 def _replace(
@@ -752,8 +1168,11 @@ def _replace(
     item: str,
     source: profiles.Source,
     replaced: list[tuple[Path, Path]],
+    opened: Reference | None = None,
 ) -> profiles.Source:
-    """Swap the item's folder for the upstream files; keep the old folder."""
+    """Swap the item's folder for the upstream files; keep the old folder.
+    With ``opened`` (the profile's source, for a skill that came from it)
+    the files are copied from it instead of being fetched again."""
     skills_dir = profile.path / profiles.SKILLS_DIR
     live = skills_dir / item
     incoming = skills_dir / f".{item}.incoming"
@@ -780,14 +1199,25 @@ def _replace(
     # so recovery puts back only what this run moved (see respec.journal).
     swap = {"skill": item, "live": trees.digest(live), "old": str(old)}
     journal.note(respec_home, "swaps", swap)
-    with checkout(repo_url(source.repo), source.ref, source.repo) as (tree, commit):
-        upstream = inside(tree, source.path)
-        if not (upstream / items.SKILL_FILE).is_file():
-            raise RespecError(
-                f"{source.repo} at {commit[:12]} has no {items.SKILL_FILE} "
-                f"in {source.path or 'its root'}"
-            )
-        copy_fetched(tree, upstream, incoming)
+    commit = source.commit
+    if opened is not None:
+        opened.copy(item, incoming)
+        commit = opened.source.commit
+    elif source.folder is not None:
+        copy_folder(Path(source.folder), incoming)
+    else:
+        assert source.repo is not None
+        with checkout(repo_url(source.repo), source.ref, source.repo) as (
+            tree,
+            commit,
+        ):
+            upstream = inside(tree, source.path)
+            if not (upstream / items.SKILL_FILE).is_file():
+                raise RespecError(
+                    f"{source.repo} at {commit[:12]} has no {items.SKILL_FILE} "
+                    f"in {source.path or 'its root'}"
+                )
+            copy_fetched(tree, upstream, incoming)
     journal.note(
         respec_home, "fetched", {"skill": item, "digest": trees.digest(incoming)}
     )
@@ -853,11 +1283,386 @@ def _settle_foreign_old(
     )
 
 
-def _restore(profile: profiles.Profile, replaced: list[tuple[Path, Path]]) -> None:
+def _restore(
+    profile: profiles.Profile,
+    replaced: list[tuple[Path, Path]],
+    added: list[str],
+) -> None:
     profiles.restore_profile(profile)
     for live, old in reversed(replaced):
         shutil.rmtree(live, ignore_errors=True)
         os.replace(old, live)
+    for item in added:  # copies of the profile's source, made by this run
+        shutil.rmtree(profile.path / profiles.SKILLS_DIR / item, ignore_errors=True)
+
+
+# --- a profile's source -----------------------------------------------------------
+
+
+def _skill_source(source: profiles.Source, item: str) -> profiles.Source:
+    """Where skill ``item`` is inside the profile source ``source``."""
+    if source.folder is not None:
+        return profiles.Source(
+            folder=str(Path(source.folder) / profiles.SKILLS_DIR / item)
+        )
+    path = f"{profiles.SKILLS_DIR}/{item}"
+    return profiles.Source(
+        repo=source.repo,
+        path=f"{source.path}/{path}" if source.path else path,
+        ref=source.ref,
+    )
+
+
+def _place(source: profiles.Source) -> profiles.Source:
+    """Where ``source`` is, without the state that was copied from it."""
+    return dataclasses.replace(source, commit=None, digest=None)
+
+
+def from_profile_source(profile: profiles.Profile, item: str) -> bool:
+    """Whether the skill's recorded source points into the profile's source."""
+    source = profile.skills[item].source
+    if profile.source is None or source is None:
+        return False
+    return _place(source) == _skill_source(profile.source, item)
+
+
+def _carried(
+    profile: profiles.Profile, found: Reference, item: str
+) -> profiles.Source | None:
+    """The source to record for skill ``item`` when the profile's copy holds
+    exactly the files the profile's source holds for it now (someone carried
+    the copy into the source). None when the files differ, when the copy
+    holds a ``.git`` entry (:func:`local_git`), or when the source gives the
+    skill a git source of its own."""
+    with tempfile.TemporaryDirectory(prefix="respec-compare-") as scratch:
+        try:
+            source = found.take(item, Path(scratch) / item).source
+        except (RespecError, OSError, shutil.Error):
+            return None
+    if source is None or _place(source) != _skill_source(found.source, item):
+        return None
+    copy = profile.path / profiles.SKILLS_DIR / item
+    if local_git(copy):
+        return None
+    return source if source.digest == fetched_digest(copy) else None
+
+
+@dataclass(frozen=True)
+class Reference:
+    """A profile's source, opened for reading: the folder that holds its
+    ``profile.yaml`` and ``skills/``, and the profile that file describes."""
+
+    source: profiles.Source  # with the commit that was fetched, for git
+    tree: Path | None  # the fetched repository; None for a local folder
+    folder: Path
+    profile: profiles.Profile
+
+    def copy(self, item: str, destination: Path) -> None:
+        """Copy the files this source holds for skill ``item`` to
+        ``destination``. A skill folder that is a symlink out of the source
+        is refused, for a folder as for a repository."""
+        skill = self.folder / profiles.SKILLS_DIR / item
+        if self.tree is None:
+            copy_folder(skill, destination, self.folder)
+            return
+        _within(self.tree.resolve(), skill)
+        if not (skill / items.SKILL_FILE).is_file():
+            raise RespecError(
+                f"{self.source.repo} at {(self.source.commit or '')[:12]} has no "
+                f"{items.SKILL_FILE} in {skill.relative_to(self.tree).as_posix()}"
+            )
+        copy_fetched(self.tree, skill, destination)
+
+    def digest(self, item: str) -> str:
+        """The digest a copy of skill ``item`` made from this source now
+        would record."""
+        with tempfile.TemporaryDirectory(prefix="respec-compare-") as scratch:
+            copy = Path(scratch) / "skill"
+            self.copy(item, copy)
+            return fetched_digest(copy)
+
+    def take(self, item: str, destination: Path) -> profiles.SkillEntry:
+        """Copy skill ``item`` to ``destination`` and return its entry for the
+        copy's ``profile.yaml``: enabled as the source says, with its own git
+        source when it has one, otherwise a source pointing into this one. A
+        folder named by the source's own ``profile.yaml`` is never trusted: a
+        later update would copy from whatever local path it names."""
+        self.copy(item, destination)
+        entry = self.profile.skills[item]
+        if entry.source is not None and entry.source.folder is None:
+            return entry
+        source = dataclasses.replace(
+            _skill_source(self.source, item),
+            commit=self.source.commit,
+            digest=fetched_digest(destination),
+        )
+        return dataclasses.replace(entry, source=source)
+
+
+@contextmanager
+def reference(source: profiles.Source, name: str) -> Iterator[Reference]:
+    """Open the profile source ``source`` (of profile ``name``) for reading.
+
+    A folder that is gone or no longer holds ``profile.yaml`` is
+    :class:`SourceMissing`; a repository that cannot be fetched, a
+    ``profile.yaml`` that is not valid or one that lists a skill without its
+    folder is a :class:`RespecError`, which names a repository's
+    ``profile.yaml`` by the source, never by the temporary checkout. Nothing
+    is ever written to the source.
+    """
+    if source.folder is not None:
+        folder = Path(source.folder)
+        if not folder.is_dir():
+            raise SourceMissing(f"source folder {folder} no longer exists")
+        if not (folder / profiles.PROFILE_FILE).is_file():
+            raise SourceMissing(
+                f"source folder {folder} no longer holds {profiles.PROFILE_FILE}"
+            )
+        yield _read_reference(source, None, folder, source.folder, name)
+        return
+    assert source.repo is not None
+    where = f"{source.repo}#{source.path}" if source.path else source.repo
+    with checkout(repo_url(source.repo), source.ref, source.repo) as (tree, commit):
+        fetched = dataclasses.replace(source, commit=commit)
+        yield _read_reference(fetched, tree, inside(tree, source.path), where, name)
+
+
+def _read_reference(
+    source: profiles.Source, tree: Path | None, folder: Path, where: str, name: str
+) -> Reference:
+    from respec.messages import source_label
+
+    file = folder / profiles.PROFILE_FILE
+    if not file.is_file():
+        raise RespecError(f"{where} has no {profiles.PROFILE_FILE}")
+    # How messages name the file: a fetched one is in a temporary checkout.
+    shown: Path | str = file
+    if tree is not None:
+        _within(tree.resolve(), file)
+        shown = f"{profiles.PROFILE_FILE} in {source_label(source)}"
+    try:
+        data = yaml.safe_load(file.read_text("utf-8"))
+    except yaml.YAMLError as error:
+        raise profiles.ProfileError(shown, [f"not valid YAML: {error}"]) from None
+    except (OSError, UnicodeDecodeError) as error:
+        raise RespecError(f"cannot read {shown}: {error}") from None
+    try:
+        profile = profiles.parse_profile(name, folder, data)
+    except profiles.ProfileError as error:
+        raise profiles.ProfileError(shown, error.problems) from None
+    missing = [
+        item
+        for item in profile.skills
+        if not (folder / profiles.SKILLS_DIR / item / items.SKILL_FILE).is_file()
+    ]
+    if missing:
+        raise RespecError(
+            f"{where} lists skills without a {profiles.SKILLS_DIR}/<skill>/"
+            f"{items.SKILL_FILE}: {', '.join(missing)}"
+        )
+    return Reference(source=source, tree=tree, folder=folder, profile=profile)
+
+
+# --- profile diff ----------------------------------------------------------------
+
+
+def diff(respec_home: Path, name: str) -> dict[str, object]:
+    """How respec's copy of profile ``name`` differs from its source, for
+    whoever carries the differences into the source. Reads only.
+
+    Gives ``profile`` and ``path`` (the copy); with a source, ``source`` as
+    :func:`check` gives it; and when the source could be read, ``matches``
+    and the differences (see :func:`_differences`)."""
+    profile = profiles.load_profile(respec_home, name)
+    report: dict[str, object] = {"profile": profile.name, "path": str(profile.path)}
+    if profile.source is None:
+        return report
+    state: dict[str, object] = dict(profile.source.to_dict())
+    report["source"] = state
+    try:
+        with contextlib.ExitStack() as stack:
+            found = stack.enter_context(reference(profile.source, profile.name))
+            scratch = stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="respec-compare-")
+            )
+            differences = _differences(profile, found, Path(scratch))
+    except GitCancelled:
+        raise
+    except SourceMissing as error:
+        state.update(source_missing=True, message=str(error))
+        return report
+    except (RespecError, OSError, shutil.Error) as error:
+        state["error"] = str(error)
+        return report
+    if found.source.commit is not None:
+        state["latest"] = found.source.commit
+    report["matches"] = not any(
+        rows for key, rows in differences.items() if key != "local_state"
+    )
+    report.update(differences)
+    return report
+
+
+def _differences(
+    profile: profiles.Profile, found: Reference, scratch: Path
+) -> dict[str, object]:
+    """The skills of ``profile`` against the ones of its source ``found``:
+
+    - ``only_in_copy``: not in the source (``path``, and its own ``source``);
+    - ``edited``: the copy's files differ from the source's, or the copy
+      holds a ``.git`` entry (``path`` and ``files``: added, changed and
+      removed in the copy, a ``.git`` entry among the added ones), with
+      ``changed_in_source`` when the source changed too since it was copied
+      and ``not_from_source`` when the copy never came from the source;
+    - ``carried``: the copy holds what the source holds, which is not
+      recorded yet (:func:`update` records it);
+    - ``changed_in_source``: only the source changed since it was copied;
+    - ``only_in_source`` (with ``enabled``) and ``gone_from_source`` (with
+      ``path`` and ``modified``), as :func:`check` finds new and gone skills;
+    - ``local_state``: what ``profile.yaml`` says differently (``enabled``,
+      ``targets``, ``layers``), which an update never changes.
+    """
+    skills_dir = profile.path / profiles.SKILLS_DIR
+    only_in_copy: list[dict[str, object]] = []
+    edited: list[dict[str, object]] = []
+    carried: list[dict[str, object]] = []
+    changed: list[dict[str, object]] = []
+    gone: list[dict[str, object]] = []
+    for name, entry in profile.skills.items():
+        copy = skills_dir / name
+        mine = from_profile_source(profile, name)
+        theirs = found.profile.skills.get(name)
+        if theirs is None and mine:
+            gone.append(
+                {"skill": name, "path": str(copy), "modified": _modified(profile, name)}
+            )
+        elif theirs is None:
+            row: dict[str, object] = {"skill": name, "path": str(copy)}
+            if entry.source is not None:
+                row["source"] = entry.source.to_dict()
+            only_in_copy.append(row)
+        if theirs is None:
+            continue
+        if (
+            not mine
+            and entry.source is not None
+            and theirs.source is not None
+            and theirs.source.folder is None
+            and _place(entry.source) == _place(theirs.source)
+        ):
+            continue  # it follows the git source the profile's source names
+        original = scratch / name
+        taken = found.take(name, original).source
+        now, upstream = fetched_digest(copy), fetched_digest(original)
+        recorded = copied_digest(profile, name) if mine else None
+        if local_git(copy):
+            now = ""  # never the source's files, nor the ones that were copied
+        if now == upstream:
+            if (
+                now != recorded
+                and taken is not None
+                and _place(taken) == _skill_source(found.source, name)
+            ):
+                carried.append({"skill": name})
+        elif mine and now == recorded:
+            changed.append({"skill": name})
+        else:
+            row = {
+                "skill": name,
+                "path": str(copy),
+                "files": _file_changes(original, copy),
+            }
+            if mine and upstream != recorded:
+                row["changed_in_source"] = True
+            if not mine:
+                row["not_from_source"] = True
+            edited.append(row)
+    return {
+        "only_in_copy": only_in_copy,
+        "edited": edited,
+        "carried": carried,
+        "changed_in_source": changed,
+        "only_in_source": [
+            {"skill": name, "enabled": entry.enabled}
+            for name, entry in found.profile.skills.items()
+            if name not in profile.skills
+        ],
+        "gone_from_source": gone,
+        "local_state": _local_state(profile, found.profile),
+    }
+
+
+def _local_state(
+    profile: profiles.Profile, source: profiles.Profile
+) -> dict[str, object]:
+    """What the copy's ``profile.yaml`` says differently from the source's:
+    whether a skill both have is enabled, the targets and the layers."""
+    state: dict[str, object] = {
+        "enabled": [
+            {
+                "skill": name,
+                "copy": entry.enabled,
+                "source": source.skills[name].enabled,
+            }
+            for name, entry in profile.skills.items()
+            if name in source.skills and entry.enabled != source.skills[name].enabled
+        ]
+    }
+    if profile.targets != source.targets:
+        state["targets"] = {
+            "copy": list(profile.targets),
+            "source": list(source.targets),
+        }
+    layers: list[dict[str, object]] = []
+    for name in [
+        *profile.layers,
+        *(n for n in source.layers if n not in profile.layers),
+    ]:
+        sides = {
+            side: layer.to_dict()
+            for side, layer in (
+                ("copy", profile.layers.get(name)),
+                ("source", source.layers.get(name)),
+            )
+            if layer is not None
+        }
+        if sides.get("copy") != sides.get("source"):
+            layers.append({"layer": name, **sides})
+    state["layers"] = layers
+    return state
+
+
+def _file_changes(original: Path, copy: Path) -> dict[str, list[str]]:
+    """The files ``copy`` added, changed and removed relative to ``original``;
+    a ``.git`` entry of the copy (:func:`local_git`) is one it added."""
+    before, after = _files(original), _files(copy)
+    return {
+        "added": sorted([*(after.keys() - before.keys()), *local_git(copy)]),
+        "changed": sorted(
+            path for path in before.keys() & after.keys() if before[path] != after[path]
+        ),
+        "removed": sorted(before.keys() - after.keys()),
+    }
+
+
+def _files(folder: Path) -> dict[str, tuple[object, ...]]:
+    """What :func:`fetched_digest` hashes, per entry: every file and symlink
+    by its relative path, and every empty folder as ``path/``; ``.git`` and
+    ``.DS_Store`` entries are left out."""
+    found: dict[str, tuple[object, ...]] = {}
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [name for name in dirs if name not in NOT_CONTENT]
+        for name in dirs + [name for name in files if name not in NOT_CONTENT]:
+            entry = Path(root) / name
+            relative = entry.relative_to(folder).as_posix()
+            if entry.is_symlink():
+                found[relative] = ("l", os.readlink(entry))
+            elif not entry.is_dir():
+                content = hashlib.sha256(entry.read_bytes()).digest()
+                found[relative] = ("f", os.access(entry, os.X_OK), content)
+            elif not any(c.name not in NOT_CONTENT for c in entry.iterdir()):
+                found[f"{relative}/"] = ("d",)
+    return found
 
 
 # --- profile install -----------------------------------------------------------
@@ -869,9 +1674,34 @@ def install_profile(
     name: str | None = None,
     ref: str | None = None,
 ) -> profiles.Profile:
-    """Copy a whole profile from a repository once; it is then owned locally."""
-    spec = parse_spec(text, ref)
-    name = name or (spec.path.rsplit("/", 1)[-1] if spec.path else repo_name(spec.repo))
+    """Copy a whole profile from a local folder or a repository and record
+    where it came from. An existing local folder wins; it is only read."""
+    local = items.user_path(text)
+    if local.exists():
+        if ref is not None:
+            raise RespecError("--ref only applies to git sources")
+        folder = local.resolve()
+        if not folder.is_dir():
+            raise RespecError(
+                f"{folder} is not a folder; give the path of a profile folder"
+            )
+        if not (folder / profiles.PROFILE_FILE).is_file():
+            raise RespecError(f"{folder} has no {profiles.PROFILE_FILE}")
+        home = respec_home.resolve()
+        if paths.below(folder, home) is not None:
+            raise RespecError(
+                f"{folder} is inside respec's own data ({home}): what is there "
+                "is respec's copy of a profile, never a source. Install from "
+                "the folder or repository the profile came from"
+            )
+        source = profiles.Source(folder=str(folder))
+        name = name or folder.name
+    else:
+        spec = parse_spec(text, ref)
+        source = profiles.Source(repo=spec.repo, path=spec.path, ref=ref)
+        name = name or (
+            spec.path.rsplit("/", 1)[-1] if spec.path else repo_name(spec.repo)
+        )
     profiles.validate_name(name)
     destination = profiles.profiles_dir(respec_home) / name
     if os.path.lexists(destination):
@@ -881,52 +1711,29 @@ def install_profile(
         )
     journal.ready(respec_home)
     with journal.begin(respec_home, "install", profile=name, path=str(destination)):
-        return _install_profile(respec_home, spec, ref, name, destination)
+        return _install_profile(respec_home, source, name, destination)
 
 
 def _install_profile(
     respec_home: Path,
-    spec: Spec,
-    ref: str | None,
+    source: profiles.Source,
     name: str,
     destination: Path,
 ) -> profiles.Profile:
     """The changing part of :func:`install_profile`, inside its journal."""
-    where = f"{spec.repo}#{spec.path}" if spec.path else spec.repo
-    with checkout(spec.url, ref, spec.repo) as (tree, _commit):
-        folder = inside(tree, spec.path)
-        file = folder / profiles.PROFILE_FILE
-        if not file.is_file():
-            raise RespecError(f"{where} has no {profiles.PROFILE_FILE}")
-        _within(tree.resolve(), file)
-        try:
-            data = yaml.safe_load(file.read_text("utf-8"))
-        except yaml.YAMLError as error:
-            raise profiles.ProfileError(file, [f"not valid YAML: {error}"]) from None
-        # Validate against the fetched file so errors name it, then relocate.
-        profile = dataclasses.replace(
-            profiles.parse_profile(name, folder, data), path=destination
-        )
-        global_skills.refuse_reserved(respec_home, profile.skills, name)
-        missing = [
-            item
-            for item in profile.skills
-            if not (folder / profiles.SKILLS_DIR / item / items.SKILL_FILE).is_file()
-        ]
-        if missing:
-            raise RespecError(
-                f"{where} lists skills without a {profiles.SKILLS_DIR}/<skill>/"
-                f"{items.SKILL_FILE}: {', '.join(missing)}"
-            )
+    with reference(source, name) as found:
+        global_skills.refuse_reserved(respec_home, found.profile.skills, name)
+        skills: dict[str, profiles.SkillEntry] = {}
         try:
             (destination / profiles.SKILLS_DIR).mkdir(parents=True)
-            for item in profile.skills:
-                copy_fetched(
-                    tree,
-                    folder / profiles.SKILLS_DIR / item,
-                    destination / profiles.SKILLS_DIR / item,
+            for item in found.profile.skills:
+                skills[item] = found.take(
+                    item, destination / profiles.SKILLS_DIR / item
                 )
                 journal.checkpoint("copied")
+            profile = dataclasses.replace(
+                found.profile, path=destination, source=found.source, skills=skills
+            )
             profiles.save_profile(profile)
         except RespecError:
             shutil.rmtree(destination, ignore_errors=True)

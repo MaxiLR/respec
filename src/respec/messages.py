@@ -10,8 +10,11 @@ from respec.state import Installed
 
 
 def source_label(source: profiles.Source) -> str:
-    """``repo[#path][@ref]``, as written in ``profile.yaml``."""
-    label = source.repo
+    """``repo[#path][@ref]`` or the source folder, as written in
+    ``profile.yaml``."""
+    if source.folder is not None:
+        return source.folder
+    label = source.repo or ""
     if source.path:
         label += f"#{source.path}"
     if source.ref:
@@ -51,8 +54,9 @@ def link_lines(change: Any) -> list[str]:
 
 
 def skill_change(change: items.SkillChange) -> list[str]:
+    origin = f" from {change.source['folder']}" if change.source else ""
     lead = {
-        "add": f"Added {change.skill!r} to profile {change.profile!r}",
+        "add": f"Added {change.skill!r} to profile {change.profile!r}{origin}",
         "remove": f"Removed {change.skill!r} from profile {change.profile!r}",
         "enable": f"Enabled {change.skill!r} in profile {change.profile!r}",
         "disable": f"Disabled {change.skill!r} in profile {change.profile!r}",

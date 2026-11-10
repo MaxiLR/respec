@@ -563,7 +563,11 @@ def test_status_text_marks_shipped_and_global_skills(run, respec_home, dirs):
     by_name = {line.split()[0]: line for line in block}
     assert by_name["respec"].rstrip().endswith("shipped")
     assert by_name["notes"].rstrip().endswith("global")
-    assert by_name["tdd"].split() == ["tdd", "symlink"]
+    assert by_name["tdd"].split(None, 2) == [
+        "tdd",
+        "symlink",
+        "added locally, original",
+    ]
 
 
 # A user's own entry with a reserved name at the very first takeover.

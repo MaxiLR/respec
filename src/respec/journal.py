@@ -50,7 +50,9 @@ How each operation is recovered, after the step in flight is settled:
   once it differs. Only the skills journaled under ``swaps`` are touched: a
   rollback puts back their ``.old`` only while it has the recorded digest; a
   finished update deletes its own ``.old`` whatever is left of it. Any other
-  ``.old`` folder is kept and reported.
+  ``.old`` folder is kept and reported. Skills it adds from the profile's
+  source and removes because they are gone from it are journaled as a local
+  add and a remove are (``created``, ``removing``) and settled the same way.
 - ``add``: rolled back in ``copy`` (only the skill folders journaled under
   ``created``, which did not exist before, are removed), finished in
   ``refresh``.
@@ -1103,6 +1105,12 @@ def _recover_update(
         if os.path.lexists(incoming):
             # Fetched by this run (an older one was removed).
             trees.delete_entry(incoming)
+    for skill in journal.get("created", []) + journal.get("removing", []):
+        # A skill new in the profile's source (a copy; its source is untouched)
+        # or gone from it: profile.yaml decides, and it lists neither a new
+        # skill of a rolled-back update nor a removed one of a finished update.
+        if skill not in profile.skills and os.path.lexists(skills_dir / skill):
+            trees.delete_entry(skills_dir / skill)
     ours_dropping = {Path(path) for path in journal.get("dropping", [])}
     for dropping in sorted(skills_dir.glob(".*.dropping")):
         if not dropping.is_dir() or dropping.is_symlink():
