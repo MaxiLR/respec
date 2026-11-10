@@ -14,7 +14,7 @@ import typer
 
 from respec import adopt as adopt_entries
 from respec import global_skills, items, layers, messages, paths, profiles, sources
-from respec import switch, targets, unknown
+from respec import switch, targets, trees, unknown
 from respec import restore as restore_backups
 from respec.errors import RespecError
 from respec.state import load_state
@@ -965,9 +965,7 @@ def layer_repair(
 def _selector_matches(selector: str, entry: unknown.Unknown) -> bool:
     if selector == entry.name or selector == entry.path:
         return True
-    return unknown.real(Path(selector).expanduser().absolute()) == unknown.real(
-        entry.path
-    )
+    return trees.real(Path(selector).expanduser().absolute()) == trees.real(entry.path)
 
 
 @app.command("adopt")

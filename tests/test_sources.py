@@ -1089,7 +1089,7 @@ def test_file_url_under_the_configured_base_url_is_allowed(run, sourced):
 def test_update_in_copy_mode_refreshes_copies_and_records_their_digest(
     run, sourced, claude_dir, isolated_homes, monkeypatch
 ):
-    from respec import unknown
+    from respec import trees
 
     def refuse(*args, **kwargs):
         raise OSError("symlinks not permitted")
@@ -1107,7 +1107,7 @@ def test_update_in_copy_mode_refreshes_copies_and_records_their_digest(
     state = json.loads((isolated_homes.respec_home / "state.json").read_text())
     recorded = {Path(item["path"]).name: item for item in state["installed"]}
     assert recorded["tdd"]["mode"] == "copy"
-    assert recorded["tdd"]["digest"] == unknown.digest(copy)
+    assert recorded["tdd"]["digest"] == trees.digest(copy)
     # The refreshed copy counts as managed: a later switch is not blocked.
     ok(run("use", "work"))
 

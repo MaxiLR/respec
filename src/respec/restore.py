@@ -38,11 +38,10 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import adopt, global_skills, profiles, switch, targets, unknown
+from respec import adopt, global_skills, switch, targets, trees, unknown
 from respec.errors import RespecError
 from respec.state import Installed, State, load_state, save_state
 
@@ -138,43 +137,20 @@ def _within(path: Path, root: Path) -> bool:
 
 def _respec_link(respec_home: Path, entry: Path, folder: Path) -> bool:
     """Whether a backed-up entry is a symlink into respec's profiles folder
-    (or its global or shipped skill folders)."""
+    (or its global or shipped skill folders), by its written or real path."""
     if not entry.is_symlink():
         return False
     target = Path(os.readlink(entry))
     if not target.is_absolute():
         target = folder / target
-    roots = [
-        profiles.profiles_dir(respec_home),
-        respec_home / global_skills.GLOBAL_DIR,
-        global_skills.shipped_dir(respec_home),
-    ]
+    written = Path(os.path.normpath(target))
     return any(
-        _within(Path(os.path.normpath(target)), Path(os.path.normpath(root)))
-        or _within(target.resolve(), root.resolve())
-        for root in roots
+        _within(written, Path(os.path.normpath(root)))
+        for root in global_skills.source_roots(respec_home, resolve=False)
+    ) or any(
+        _within(target.resolve(), root)
+        for root in global_skills.source_roots(respec_home)
     )
-
-
-def _modes(path: Path) -> list[tuple[str, int]]:
-    """Permission bits of an entry and everything below it (links not followed)."""
-    found = [(".", os.lstat(path).st_mode)]
-    if path.is_dir() and not path.is_symlink():
-        for root, subdirs, files in os.walk(path):
-            for name in sorted(subdirs + files):
-                child = os.path.join(root, name)
-                found.append((os.path.relpath(child, path), os.lstat(child).st_mode))
-    return sorted(found)
-
-
-def _same(left: Path, right: Path) -> bool:
-    """Same names, bytes, link targets and permissions."""
-    try:
-        if unknown.digest(left) != unknown.digest(right):
-            return False
-        return _modes(left) == _modes(right)
-    except OSError:
-        return False
 
 
 def _recorded_at_backup(run: Path, target: str) -> list[dict[str, object]]:
@@ -211,7 +187,7 @@ def _entries(
         respec_own = _respec_link(respec_home, entry, folder)
         if not respec_own and entry.name in copies and not entry.is_symlink():
             try:
-                respec_own = unknown.digest(entry) == copies[entry.name]
+                respec_own = trees.digest(entry) == copies[entry.name]
             except OSError:
                 respec_own = False
         (skipped if respec_own else names).append(entry.name)
@@ -275,22 +251,22 @@ def _conflicts(
     """Unknown entries the restore would overwrite, and the hidden entries it
     leaves in place because the backup lacks them."""
     managed = {
-        unknown.real(item.path)
+        trees.real(item.path)
         for item in state.installed
         if unknown.is_managed(respec_home, item)
     }
-    recorded = {unknown.real(item.path) for item in state.installed}
+    recorded = {trees.real(item.path) for item in state.installed}
     found: list[unknown.Unknown] = []
     left: list[str] = []
     for plan in plans:
         if not plan.folder.is_dir():
             continue
         for entry in sorted(plan.folder.iterdir(), key=lambda child: child.name):
-            key = unknown.real(entry)
+            key = trees.real(entry)
             if key in managed:
                 continue
             backed_up = plan.source is not None and entry.name in plan.entries
-            if backed_up and _same(entry, plan.source / entry.name):
+            if backed_up and trees.same_entry(entry, plan.source / entry.name):
                 continue
             if entry.name.startswith(".") and not backed_up:
                 left.append(str(entry))
@@ -308,16 +284,11 @@ def _conflicts(
 
 def _put_back(source: Path, destination: Path) -> None:
     try:
-        if source.is_symlink():
-            os.symlink(os.readlink(source), destination)
-        elif source.is_dir():
-            shutil.copytree(source, destination, symlinks=True)
-        else:
-            shutil.copy2(source, destination)
-    except (OSError, shutil.Error) as error:
-        if destination.is_dir() and not destination.is_symlink():
-            shutil.rmtree(destination, ignore_errors=True)
-        raise OSError(f"could not restore {destination} from {source}: {error}")
+        trees.copy_entry(source, destination)
+    except OSError as error:
+        raise OSError(
+            f"could not restore {destination} from {source}: {error}"
+        ) from None
 
 
 def _restore_folder(plan: FolderPlan) -> None:
@@ -330,7 +301,7 @@ def _restore_folder(plan: FolderPlan) -> None:
     for name in plan.entries:
         source, destination = plan.source / name, folder / name
         if os.path.lexists(destination):
-            if _same(destination, source):
+            if trees.same_entry(destination, source):
                 continue
             raise OSError(f"{destination} appeared during the restore; left as is")
         _put_back(source, destination)

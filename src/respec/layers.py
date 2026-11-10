@@ -185,9 +185,7 @@ def add_skill(
     after, layer = _with_member(before, name, item)
     if layer.exclusive and layer.active:
         others = [
-            other
-            for other in layer.items
-            if other != item and after.skills[other].enabled
+            other for other in profiles.enabled_members(after, name) if other != item
         ]
         if others and after.skills[item].enabled:
             after = profiles.with_enabled(after, [item], False)

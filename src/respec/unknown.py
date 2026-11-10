@@ -18,15 +18,12 @@ first of them in registry order; the others are its aliases.
 
 from __future__ import annotations
 
-import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from respec import global_skills, targets
+from respec import global_skills, targets, trees
 from respec.state import Installed, State
-
-IGNORED_FILES = frozenset({".DS_Store"})
 
 
 @dataclass(frozen=True)
@@ -47,40 +44,6 @@ class Unknown:
         }
 
 
-def real(path: Path | str) -> Path:
-    """``path`` with its parent folders' symlinks resolved (not the entry itself)."""
-    path = Path(path)
-    return path.parent.resolve() / path.name
-
-
-def digest(path: Path | str) -> str:
-    """Fingerprint of an entry's content: names, file bytes and link targets.
-
-    Symlinks are recorded by target and never followed. ``.DS_Store`` files
-    (written by the macOS Finder when a folder is opened) are left out.
-    """
-    root = Path(path)
-    hasher = hashlib.sha256()
-
-    def add(relative: str, entry: Path) -> None:
-        if entry.is_symlink():
-            hasher.update(b"L\0" + relative.encode() + b"\0")
-            hasher.update(os.readlink(entry).encode() + b"\0")
-        elif entry.is_dir():
-            hasher.update(b"D\0" + relative.encode() + b"\0")
-            for child in sorted(entry.iterdir(), key=lambda c: c.name):
-                if child.name in IGNORED_FILES:
-                    continue
-                add(f"{relative}/{child.name}", child)
-        else:
-            content = entry.read_bytes()
-            hasher.update(b"F\0" + relative.encode() + b"\0")
-            hasher.update(str(len(content)).encode() + b"\0" + content)
-
-    add(".", root)
-    return "sha256:" + hasher.hexdigest()
-
-
 def is_managed(respec_home: Path, item: Installed) -> bool:
     """Whether the recorded path still holds what respec created there."""
     path = Path(item.path)
@@ -95,7 +58,7 @@ def is_managed(respec_home: Path, item: Installed) -> bool:
     if item.digest is None or not os.path.lexists(path):
         return False
     try:
-        return digest(path) == item.digest
+        return trees.digest(path) == item.digest
     except OSError:
         return False
 
@@ -127,9 +90,11 @@ def kind_of(entry: Path) -> str:
 def find_unknown(respec_home: Path, state: State) -> list[Unknown]:
     """Unknown entries in every owned folder, folder by folder, sorted by name."""
     managed = {
-        real(item.path) for item in state.installed if is_managed(respec_home, item)
+        trees.real(item.path)
+        for item in state.installed
+        if is_managed(respec_home, item)
     }
-    recorded = {real(item.path) for item in state.installed}
+    recorded = {trees.real(item.path) for item in state.installed}
     found: list[Unknown] = []
     for folder, group in folder_groups(state):
         if not folder.is_dir():
@@ -137,7 +102,7 @@ def find_unknown(respec_home: Path, state: State) -> list[Unknown]:
         for entry in sorted(folder.iterdir(), key=lambda child: child.name):
             if entry.name.startswith("."):
                 continue
-            key = real(entry)
+            key = trees.real(entry)
             if key in managed:
                 continue
             found.append(

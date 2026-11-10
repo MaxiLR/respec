@@ -23,7 +23,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import global_skills, profiles, switch, unknown
+from respec import global_skills, profiles, switch, trees, unknown
 from respec.errors import RespecError
 from respec.state import State, load_state
 
@@ -143,10 +143,10 @@ def _link_problems(
     }
     config = str(global_skills.config_path(respec_home))
     lasting = global_skills.lasting_or_shipped(respec_home)
-    recorded = {unknown.real(item.path): item for item in state.installed}
+    recorded = {trees.real(item.path): item for item in state.installed}
     # What the switching engine would install for the active profile.
     expected = {
-        unknown.real(destination): (target, skill, source)
+        trees.real(destination): (target, skill, source)
         for target, skill, source, destination in switch.plan(
             respec_home, user_home, active
         )

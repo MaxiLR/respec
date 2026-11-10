@@ -34,7 +34,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import global_skills, items, profiles, switch, unknown
+from respec import global_skills, items, profiles, switch, trees, unknown
 from respec.errors import RespecError
 from respec.state import State, load_state, save_state
 
@@ -137,24 +137,16 @@ def _delete(path: Path) -> None:
 def _settle(respec_home: Path, entry: unknown.Unknown) -> None:
     """Record the outcome: the path no longer holds anything of respec's."""
     state = load_state(respec_home)
-    key = unknown.real(entry.path)
-    state.installed = [i for i in state.installed if unknown.real(i.path) != key]
+    key = trees.real(entry.path)
+    state.installed = [i for i in state.installed if trees.real(i.path) != key]
     save_state(respec_home, state)
 
 
 def _copy_entry(source: Path, destination: Path) -> None:
-    """Copy one entry as it is (links stay links); clean up on failure."""
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    """Back up one entry as it is (:func:`respec.trees.copy_entry`)."""
     try:
-        if source.is_symlink():
-            os.symlink(os.readlink(source), destination)
-        elif source.is_dir():
-            shutil.copytree(source, destination, symlinks=True)
-        else:
-            shutil.copy2(source, destination)
-    except (OSError, shutil.Error) as error:
-        if destination.is_dir() and not destination.is_symlink():
-            shutil.rmtree(destination, ignore_errors=True)
+        trees.copy_entry(source, destination)
+    except OSError as error:
         raise RespecError(
             f"could not back up {source}; it was left in place: {error}"
         ) from None
@@ -164,18 +156,11 @@ STAGED = ".respec-new"
 RETIRED = ".respec-old"
 
 
-def _same_content(left: Path, right: Path) -> bool:
-    try:
-        return unknown.digest(left) == unknown.digest(right)
-    except OSError:
-        return False
-
-
 def _backed_up(respec_home: Path, profile: str, name: str, folder: Path) -> bool:
     """Whether a backup run holds a profile copy of ``name`` like ``folder``."""
     pattern = f"*/profiles/{profile}/{name}"
     return any(
-        _same_content(saved, folder)
+        trees.same_content(saved, folder)
         for saved in switch.backups_dir(respec_home).glob(pattern)
     )
 
@@ -202,7 +187,7 @@ def _clean_leftovers(respec_home: Path, profile: profiles.Profile) -> list[str]:
                 if not os.path.lexists(live) and suffix == RETIRED:
                     os.replace(leftover, live)
                     continue
-                if (os.path.lexists(live) and _same_content(live, leftover)) or (
+                if (os.path.lexists(live) and trees.same_content(live, leftover)) or (
                     suffix == RETIRED
                     and _backed_up(respec_home, profile.name, name, leftover)
                 ):
@@ -318,7 +303,7 @@ def _put_back(resolution: Resolution, copy: Path) -> bool:
             if original.resolve() != copy.resolve():
                 return False
             original.unlink()  # respec's link to the copy
-        elif original.is_dir() and unknown.digest(original) == unknown.digest(copy):
+        elif original.is_dir() and trees.digest(original) == trees.digest(copy):
             if link is None:
                 return True  # respec's copy holds exactly the original content
             shutil.rmtree(original)  # respec's copy; the content is in ``copy``
@@ -354,7 +339,7 @@ def _undo_adds(
         except (OSError, shutil.Error):
             back = False
         if back:
-            restored.add(unknown.real(resolution.entry.path))
+            restored.add(trees.real(resolution.entry.path))
             if copy.exists() or copy.is_symlink():
                 shutil.rmtree(copy, ignore_errors=True)
             if resolution.replaced_copy is not None:
@@ -380,10 +365,10 @@ def _undo_adds(
         profiles.restore_profile(before)
     state = load_state(respec_home)
     state.installed = [
-        item for item in state.installed if unknown.real(item.path) not in restored
+        item for item in state.installed if trees.real(item.path) not in restored
     ]
     for item in state_before.installed:
-        if unknown.real(item.path) in restored:
+        if trees.real(item.path) in restored:
             state.installed.append(item)
     save_state(respec_home, state)
     return notes

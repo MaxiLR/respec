@@ -22,7 +22,6 @@ need the same entry in a target folder, so the switch refuses.
 
 from __future__ import annotations
 
-import filecmp
 import shutil
 from collections.abc import Iterable
 from importlib import resources
@@ -31,7 +30,7 @@ from typing import Any
 
 import yaml
 
-from respec import profiles
+from respec import profiles, trees
 from respec.errors import RespecError
 
 CONFIG_FILE = "config.yaml"
@@ -53,13 +52,15 @@ def shipped_dir(respec_home: Path) -> Path:
     return respec_home / SHIPPED_DIR
 
 
-def source_roots(respec_home: Path) -> list[Path]:
-    """Folders that respec's links point into (resolved)."""
-    return [
-        profiles.profiles_dir(respec_home).resolve(),
-        (respec_home / GLOBAL_DIR).resolve(),
-        shipped_dir(respec_home).resolve(),
+def source_roots(respec_home: Path, resolve: bool = True) -> list[Path]:
+    """Folders that respec's links point into (resolved unless ``resolve`` is
+    false)."""
+    roots = [
+        profiles.profiles_dir(respec_home),
+        respec_home / GLOBAL_DIR,
+        shipped_dir(respec_home),
     ]
+    return [root.resolve() for root in roots] if resolve else roots
 
 
 def _bundled():
@@ -220,18 +221,6 @@ def check_sources(respec_home: Path, names: tuple[str, ...]) -> list[str]:
     ]
 
 
-def _same_tree(left: Path, right: Path) -> bool:
-    compared = filecmp.dircmp(left, right, ignore=[])
-    if compared.left_only or compared.right_only or compared.funny_files:
-        return False
-    _, mismatch, errors = filecmp.cmpfiles(
-        left, right, compared.common_files, shallow=False
-    )
-    if mismatch or errors:
-        return False
-    return all(_same_tree(left / sub, right / sub) for sub in compared.common_dirs)
-
-
 def refresh_shipped(respec_home: Path) -> None:
     """Bring ``<respec home>/shipped/<name>/`` in line with the bundled files.
 
@@ -244,7 +233,8 @@ def refresh_shipped(respec_home: Path) -> None:
         destination = root / name
         with resources.as_file(_bundled().joinpath(name)) as bundled:
             if destination.is_dir() and not destination.is_symlink():
-                if _same_tree(Path(bundled), destination):
+                # Exact: every name counts, hidden files included.
+                if trees.same_content(Path(bundled), destination, ignore=()):
                     continue
             staged = root / f".{name}.new"
             shutil.rmtree(staged, ignore_errors=True)

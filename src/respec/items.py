@@ -213,7 +213,7 @@ def add(
     return change
 
 
-def _load_with_item(
+def _load_with_skill(
     respec_home: Path, profile_name: str | None, item: str
 ) -> profiles.Profile:
     profile = profiles.load_profile(
@@ -235,7 +235,7 @@ def set_enabled(
     profile_name: str | None = None,
 ) -> SkillChange:
     """Enable or disable an item; its files and source record are kept."""
-    profile = _load_with_item(respec_home, profile_name, item)
+    profile = _load_with_skill(respec_home, profile_name, item)
     change = SkillChange(
         profile=profile.name,
         skill=item,
@@ -259,7 +259,7 @@ def remove(
     profile_name: str | None = None,
 ) -> SkillChange:
     """Remove an item: drop it from ``profile.yaml`` and delete its folder."""
-    profile = _load_with_item(respec_home, profile_name, item)
+    profile = _load_with_skill(respec_home, profile_name, item)
     folder = _skill_folder(profile, item)
     change = SkillChange(
         profile=profile.name,

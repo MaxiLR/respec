@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from respec import global_skills, profiles, targets, unknown
+from respec import global_skills, profiles, targets, trees, unknown
 from respec.errors import RespecError
 from respec.state import Installed, Owned, State, load_state, save_state
 
@@ -168,12 +168,12 @@ def _plan_all(
     """
     registry = targets.registry()
     plan = list(_plan(profile, user_home))
-    seen = {unknown.real(destination) for _, _, _, destination in plan}
+    seen = {trees.real(destination) for _, _, _, destination in plan}
 
     def add(target_names: list[str], skill: str, source: Path) -> None:
         for target in target_names:
             destination = registry[target].skills_dir(user_home) / skill
-            key = unknown.real(destination)
+            key = trees.real(destination)
             if key not in seen:
                 seen.add(key)
                 plan.append((target, skill, source, destination))
@@ -245,17 +245,17 @@ def conflicts(
     paths in folders respec does not own yet.
     """
     plan = _plan_all(respec_home, user_home, profile)
-    installs = {unknown.real(destination) for _, _, _, destination in plan}
-    recorded = {unknown.real(item.path) for item in state.installed}
+    installs = {trees.real(destination) for _, _, _, destination in plan}
+    recorded = {trees.real(item.path) for item in state.installed}
     found: list[unknown.Unknown] = []
     seen: set[Path] = set()
     for entry in unknown.find_unknown(respec_home, state):
-        key = unknown.real(entry.path)
+        key = trees.real(entry.path)
         if key in installs or key in recorded:
             found.append(entry)
             seen.add(key)
     managed = {
-        unknown.real(item.path)
+        trees.real(item.path)
         for item in state.installed
         if unknown.is_managed(respec_home, item)
     }
@@ -266,7 +266,7 @@ def conflicts(
             target
         )
     for _, skill, _, destination in plan:
-        key = unknown.real(destination)
+        key = trees.real(destination)
         if key in seen or key in managed or not os.path.lexists(destination):
             continue
         seen.add(key)
@@ -299,7 +299,7 @@ def _record_backed_up_items(
     items = [
         item.to_dict()
         for item in state.installed
-        if unknown.real(item.path).parent == real_folder
+        if trees.real(item.path).parent == real_folder
     ]
     if not items:
         return
@@ -451,8 +451,8 @@ def link_skills(
     for target, skill, source, destination in _plan(profile, user_home):
         if skill not in wanted or destination.parent.resolve() not in owned:
             continue
-        key = unknown.real(destination)
-        record = next((i for i in state.installed if unknown.real(i.path) == key), None)
+        key = trees.real(destination)
+        record = next((i for i in state.installed if trees.real(i.path) == key), None)
         if os.path.lexists(destination):
             if record is None or not unknown.is_managed(respec_home, record):
                 result.blocked.append(str(destination))
@@ -483,7 +483,7 @@ def link_skills(
                 name=skill,
                 path=str(destination),
                 mode=mode,
-                digest=unknown.digest(destination) if mode == "copy" else None,
+                digest=trees.digest(destination) if mode == "copy" else None,
             )
         )
         save_state(respec_home, state)
@@ -515,8 +515,8 @@ def relink_lasting(respec_home: Path, user_home: Path) -> list[str]:
             or not source.is_dir()
         ):
             continue
-        key = unknown.real(destination)
-        state.installed = [i for i in state.installed if unknown.real(i.path) != key]
+        key = trees.real(destination)
+        state.installed = [i for i in state.installed if trees.real(i.path) != key]
         try:
             mode = _install(source, destination)
         except OSError as error:
@@ -532,7 +532,7 @@ def relink_lasting(respec_home: Path, user_home: Path) -> list[str]:
                 name=skill,
                 path=str(destination),
                 mode=mode,
-                digest=unknown.digest(destination) if mode == "copy" else None,
+                digest=trees.digest(destination) if mode == "copy" else None,
             )
         )
         save_state(respec_home, state)
@@ -633,14 +633,14 @@ def use(
             )
     plan = _plan_all(respec_home, user_home, profile)
     kept = _kept(respec_home, state, plan)
-    plan = [entry for entry in plan if unknown.real(entry[3]) not in kept]
+    plan = [entry for entry in plan if trees.real(entry[3]) not in kept]
 
     # state.json is saved after every removal and every install, so it always
     # lists each path respec has created and a later switch can remove it.
     state.active_profile = None
     try:
         for item in list(state.installed):
-            if unknown.real(item.path) in kept:
+            if trees.real(item.path) in kept:
                 continue
             if remove_installed(respec_home, item):
                 result.removed.append(item)
@@ -654,7 +654,7 @@ def use(
                 name=skill,
                 path=str(destination),
                 mode=mode,
-                digest=unknown.digest(destination) if mode == "copy" else None,
+                digest=trees.digest(destination) if mode == "copy" else None,
             )
             state.installed.append(record)
             result.installed.append(record)
@@ -681,13 +681,13 @@ def _kept(
     they match the current files.
     """
     sources = {
-        unknown.real(destination): (skill, source)
+        trees.real(destination): (skill, source)
         for _, skill, source, destination in plan
     }
     lasting = global_skills.lasting(respec_home)
     kept: set[Path] = set()
     for item in state.installed:
-        key = unknown.real(item.path)
+        key = trees.real(item.path)
         planned = sources.get(key)
         if (
             item.mode == "symlink"
