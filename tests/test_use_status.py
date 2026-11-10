@@ -275,6 +275,7 @@ def test_status_json_before_any_switch(run):
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout) == {
+        "warnings": [],
         "active_profile": None,
         "targets": [],
         "folders": [],
@@ -297,6 +298,7 @@ def test_status_json_shows_profile_targets_and_items_per_folder(
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout) == {
+        "warnings": [],
         "active_profile": "b",
         "targets": ["agents"],
         "folders": [

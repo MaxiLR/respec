@@ -1286,3 +1286,32 @@ def test_users_own_ssh_command_is_kept(fake_ssh):
     logged = fake_ssh.read_text()
     assert "User=mine" in logged
     assert "BatchMode" not in logged
+
+
+def test_profile_install_of_conflicted_profile_warns(run, upstream):
+    pack = upstream("acme/conflicted")
+    pack.write(
+        "profile.yaml",
+        yaml.safe_dump(
+            {
+                "targets": ["claude-code"],
+                "skills": {"a": {"enabled": True}, "b": {"enabled": True}},
+                "layers": {"design-principles": {"skills": ["a", "b"]}},
+            }
+        ),
+    )
+    pack.write("skills/a/SKILL.md", "# a\n")
+    pack.write("skills/b/SKILL.md", "# b\n")
+    pack.commit()
+
+    text = ok(run("profile", "install", "acme/conflicted", "--name", "imp"))
+    assert "respec layer repair design-principles -p imp" in text.stderr
+
+    payload = json.loads(
+        ok(
+            run("profile", "install", "acme/conflicted", "--name", "imp2", "--json")
+        ).stdout
+    )
+    assert [(w["profile"], w["layer"], w["skills"]) for w in payload["warnings"]] == [
+        ("imp2", "design-principles", ["a", "b"])
+    ]

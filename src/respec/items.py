@@ -25,7 +25,7 @@ SKILL_FILE = "SKILL.md"
 
 
 @dataclass
-class ItemChange:
+class SkillChange:
     profile: str
     skill: str
     action: str
@@ -115,13 +115,13 @@ def add_local(
 def _refresh(
     respec_home: Path,
     user_home: Path,
-    change: ItemChange,
+    change: SkillChange,
     undo: Callable[[], None],
 ) -> None:
     """Re-apply the profile when it is active; fill in the link changes.
 
     ``change`` is any object with ``profile``, ``active``, ``linked`` and
-    ``unlinked`` attributes (an :class:`ItemChange` or a layer change).
+    ``unlinked`` attributes (an :class:`SkillChange` or a layer change).
     """
     if load_state(respec_home).active_profile != change.profile:
         return
@@ -159,11 +159,12 @@ def commit(
     user_home: Path,
     before: profiles.Profile,
     after: profiles.Profile,
-    change: ItemChange,
+    change: SkillChange,
 ) -> None:
-    """Save ``after`` and refresh an active profile; restore ``before`` if refused."""
+    """Save ``after`` and refresh an active profile; if refused, put back the
+    exact file ``before`` was loaded from."""
     profiles.save_profile(after)
-    _refresh(respec_home, user_home, change, lambda: profiles.save_profile(before))
+    _refresh(respec_home, user_home, change, lambda: profiles.restore_profile(before))
 
 
 def add(
@@ -171,19 +172,19 @@ def add(
     user_home: Path,
     source: Path,
     profile_name: str | None = None,
-) -> ItemChange:
+) -> SkillChange:
     """Add a local skill folder to a profile (default: the active one)."""
     name = resolve_profile_name(respec_home, profile_name)
     before = profiles.load_profile(respec_home, name)
     profile = add_local(respec_home, name, source)
     item = next(skill for skill in profile.skills if skill not in before.skills)
     folder = _skill_folder(profile, item)
-    change = ItemChange(
+    change = SkillChange(
         profile=name, skill=item, action="add", enabled=True, path=str(folder)
     )
 
     def undo() -> None:
-        profiles.save_profile(before)
+        profiles.restore_profile(before)
         shutil.rmtree(folder, ignore_errors=True)
 
     _refresh(respec_home, user_home, change, undo)
@@ -210,10 +211,10 @@ def set_enabled(
     item: str,
     enabled: bool,
     profile_name: str | None = None,
-) -> ItemChange:
+) -> SkillChange:
     """Enable or disable an item; its files and source record are kept."""
     profile = _load_with_item(respec_home, profile_name, item)
-    change = ItemChange(
+    change = SkillChange(
         profile=profile.name,
         skill=item,
         action="enable" if enabled else "disable",
@@ -234,11 +235,11 @@ def remove(
     user_home: Path,
     item: str,
     profile_name: str | None = None,
-) -> ItemChange:
+) -> SkillChange:
     """Remove an item: drop it from ``profile.yaml`` and delete its folder."""
     profile = _load_with_item(respec_home, profile_name, item)
     folder = _skill_folder(profile, item)
-    change = ItemChange(
+    change = SkillChange(
         profile=profile.name,
         skill=item,
         action="remove",
@@ -254,7 +255,9 @@ def remove(
     }
     profiles.save_profile(dataclasses.replace(profile, skills=skills, layers=layers))
     try:
-        _refresh(respec_home, user_home, change, lambda: profiles.save_profile(profile))
+        _refresh(
+            respec_home, user_home, change, lambda: profiles.restore_profile(profile)
+        )
     except switch.SwitchBlocked:
         raise
     except RespecError:

@@ -38,6 +38,9 @@ class Homes:
 @app.callback(invoke_without_command=True)
 def main(ctx: typer.Context) -> None:
     ctx.obj = Homes(respec_home=paths.respec_home(), user_home=paths.user_home())
+    profiles.take_warnings()  # start clean; one process may run several commands
+    _failure.clear()
+    ctx.call_on_close(_print_warnings)
     if ctx.invoked_subcommand is None:
         if not _interactive():
             # No terminal (pipe, script, CI): print help instead of the TUI.
@@ -69,12 +72,34 @@ def _homes(ctx: typer.Context) -> Homes:
     return ctx.find_root().obj
 
 
+# Error text already printed by _fail; conflicts it explains are not repeated.
+_failure: list[str] = []
+
+
+def _print_warnings() -> None:
+    """Print the layer conflicts of every profile the command read, as left."""
+    explained = "\n".join(_failure)
+    _failure.clear()
+    for conflict in profiles.take_warnings():
+        if conflict.message not in explained:
+            typer.echo(f"warning: {conflict.message}", err=True)
+
+
 def _fail(error: RespecError) -> NoReturn:
+    _failure.append(str(error))
     typer.echo(f"error: {error}", err=True)
     raise typer.Exit(code=1)
 
 
 def _print_json(data: Any) -> None:
+    """Print ``data``; an object always carries a ``warnings`` list.
+
+    ``warnings`` holds the layer conflicts of every profile the command read,
+    as the command left them (empty when there are none).
+    """
+    if isinstance(data, dict):
+        warnings = [conflict.to_dict() for conflict in profiles.peek_warnings()]
+        data = {**data, "warnings": warnings}
     typer.echo(json.dumps(data, indent=2))
 
 
@@ -374,7 +399,7 @@ ProfileOption = Annotated[
 SkillArgument = Annotated[str, typer.Argument(help="Skill name.")]
 
 
-def _report_change(change: items.ItemChange, as_json: bool) -> None:
+def _report_change(change: items.SkillChange, as_json: bool) -> None:
     if as_json:
         _print_json(change.to_dict())
         return
@@ -525,8 +550,13 @@ def _report_layer_change(change: layers.LayerChange, as_json: bool) -> None:
         "disable": f"Disabled the skills of {where}",
         "on": f"Turned on {where}",
         "off": f"Turned off {where}; its rules no longer apply",
+        "repair": f"Repaired {where}: kept {change.skill!r}",
+        "nothing": f"Nothing to repair in {where}: at most one skill is enabled",
+        "additive": f"Nothing to repair in {where}: it is additive",
     }
     typer.echo(messages[change.action])
+    for skill in change.disabled:
+        typer.echo(f"  disabled {skill!r}")
     for path in change.linked:
         typer.echo(f"  linked {path}")
     for path in change.unlinked:
@@ -734,6 +764,51 @@ def layer_off(
 ) -> None:
     """Turn a layer off: its skills become plain additive skills."""
     _layer_flag_command(ctx, layers.set_active, name, False, profile, as_json)
+
+
+def _prompt_keep(skills: list[str]) -> str:
+    """Ask which enabled skill of a conflicted exclusive layer to keep."""
+    typer.echo("Enabled skills:")
+    for number, skill in enumerate(skills, start=1):
+        typer.echo(f"  {number}. {skill}")
+    while True:
+        answer = typer.prompt("Skill to keep (name or number)", default=skills[0])
+        answer = answer.strip()
+        if answer in skills:
+            return answer
+        if answer.isdigit() and 1 <= int(answer) <= len(skills):
+            return skills[int(answer) - 1]
+        typer.echo(f"  please answer one of: {', '.join(skills)}")
+
+
+@layer_app.command("repair")
+def layer_repair(
+    ctx: typer.Context,
+    name: LayerArgument,
+    keep: Annotated[
+        Optional[str],
+        typer.Option(
+            "--keep",
+            help=(
+                "Skill to keep enabled. Without it, a terminal asks; other runs "
+                "keep the first listed skill."
+            ),
+            show_default=False,
+        ),
+    ] = None,
+    profile: ProfileOption = None,
+    as_json: JsonOption = False,
+) -> None:
+    """Fix an exclusive layer with several enabled skills: keep one, disable the rest."""
+    homes = _homes(ctx)
+    choose = _prompt_keep if _interactive() and not as_json else None
+    try:
+        change = layers.repair(
+            homes.respec_home, homes.user_home, name, keep, choose, profile
+        )
+    except RespecError as error:
+        _fail(error)
+    _report_layer_change(change, as_json)
 
 
 def _selector_matches(selector: str, entry: unknown.Unknown) -> bool:

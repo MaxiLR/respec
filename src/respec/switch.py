@@ -267,6 +267,18 @@ def _forget_replaced(respec_home: Path) -> None:
     save_state(respec_home, state)
 
 
+def refuse_layer_conflicts(
+    profile: profiles.Profile, action: str = "switch to"
+) -> None:
+    """Never install two skills of one exclusive layer; nothing changes."""
+    conflicts = profiles.exclusivity_conflicts(profile)
+    if conflicts:
+        raise SwitchBlocked(
+            f"cannot {action} profile {profile.name!r}:\n"
+            + "\n".join(f"  - {conflict.message}" for conflict in conflicts)
+        )
+
+
 def use(
     respec_home: Path,
     user_home: Path,
@@ -280,6 +292,7 @@ def use(
     anything else happens; entries it leaves in place stay untouched.
     """
     profile = profiles.load_profile(respec_home, name)
+    refuse_layer_conflicts(profile)
     entries = unknown.find_unknown(respec_home, load_state(respec_home))
     if entries:
         if on_unknown is None:

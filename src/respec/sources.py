@@ -456,7 +456,7 @@ def add(
 
 
 def _forget(before: profiles.Profile, added: list[str]) -> None:
-    profiles.save_profile(before)
+    profiles.restore_profile(before)
     for item in added:
         shutil.rmtree(before.path / profiles.SKILLS_DIR / item, ignore_errors=True)
 
@@ -639,7 +639,7 @@ def _replace(
 
 
 def _restore(profile: profiles.Profile, replaced: list[tuple[Path, Path]]) -> None:
-    profiles.save_profile(profile)
+    profiles.restore_profile(profile)
     for live, old in reversed(replaced):
         shutil.rmtree(live, ignore_errors=True)
         os.replace(old, live)

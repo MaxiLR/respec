@@ -300,6 +300,7 @@ def test_commands_support_json(run, tmp_path, profiles_root, dirs):
         "active": True,
         "linked": [link],
         "unlinked": [],
+        "warnings": [],
     }
     assert disabled["action"] == "disable"
     assert disabled["enabled"] is False

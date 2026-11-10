@@ -14,17 +14,22 @@ schema of ``profile.yaml``::
           commit: 0123abcd           # optional resolved commit
           digest: sha256:...         # optional hash of the files as fetched
     layers:                          # optional; named groups of skills
-      design-principles:             # built-in: only items and active allowed
-        items: [my-skill]
+      design-principles:             # built-in: only skills and active allowed
+        skills: [my-skill]
       my-layer:                      # custom layer
         exclusive: false             # required boolean
         description: What belongs    # required string
-        items: [other-skill]         # optional; each skill in at most one layer
+        skills: [other-skill]        # optional; each skill in at most one layer
         active: false                # optional; false turns the layer's rules off
 
-Layers only decide which items are enabled, never where they are installed.
-An active exclusive layer has at most one enabled item. Items outside layers,
-and items of a layer that is turned off, are plain additive items.
+A layer's member list is read from ``skills`` (or the legacy ``items`` key, but
+never both) and always written as ``skills``.
+
+Layers only decide which skills are enabled, never where they are installed.
+An active exclusive layer should have at most one enabled skill. A hand-edited
+file that breaks this still loads: each conflict is recorded as a warning (see
+:func:`take_warnings`) and ``respec layer repair`` fixes it. Skills outside
+layers, and skills of a layer that is turned off, are plain additive skills.
 """
 
 from __future__ import annotations
@@ -49,8 +54,10 @@ NAME_RULE = "use letters, digits, '.', '_' or '-', starting with a letter or dig
 TOP_LEVEL_KEYS = ("targets", "skills", "layers")
 SKILL_KEYS = ("enabled", "source")
 SOURCE_KEYS = ("repo", "path", "ref", "commit", "digest")
-LAYER_KEYS = ("exclusive", "description", "items", "active")
-BUILTIN_LAYER_KEYS = ("items", "active")
+LAYER_SKILLS_KEY = "skills"
+LEGACY_LAYER_SKILLS_KEY = "items"
+LAYER_KEYS = ("exclusive", "description", "skills", "active", "items")
+BUILTIN_LAYER_KEYS = ("skills", "active", "items")
 
 OUTPUT_STYLE = "output-style"
 OUTPUT_STYLE_UNSUPPORTED = (
@@ -117,7 +124,7 @@ class Layer:
             data["exclusive"] = self.exclusive
             data["description"] = self.description
         if self.items or self.builtin:
-            data["items"] = list(self.items)
+            data[LAYER_SKILLS_KEY] = list(self.items)
         if not self.active:
             data["active"] = False
         return data
@@ -137,6 +144,10 @@ class Profile:
     targets: list[str]
     skills: dict[str, SkillEntry] = field(default_factory=dict)
     layers: dict[str, Layer] = field(default_factory=builtin_layers)
+    # The exact text this profile was loaded from, for byte-exact rollback.
+    # ``init=False``: ``dataclasses.replace`` never copies it, so an edited
+    # copy of a loaded profile cannot roll back to the original's bytes.
+    loaded_text: str | None = field(default=None, init=False, compare=False, repr=False)
 
     def to_yaml_data(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -160,23 +171,90 @@ class Profile:
         return None
 
 
-def exclusivity_problems(profile: Profile) -> list[str]:
-    """Active exclusive layers with more than one enabled item."""
-    problems: list[str] = []
+@dataclass(frozen=True)
+class LayerConflict:
+    """An active exclusive layer with more than one enabled skill."""
+
+    profile: str
+    layer: str
+    skills: tuple[str, ...]
+
+    @property
+    def fix(self) -> str:
+        return f"respec layer repair {self.layer} -p {self.profile}"
+
+    @property
+    def message(self) -> str:
+        return (
+            f"layer {self.layer!r} of profile {self.profile!r} is exclusive but has "
+            f"{len(self.skills)} enabled skills ({', '.join(self.skills)}); "
+            f"fix it with '{self.fix}' (keeps {self.skills[0]!r}) or "
+            f"'{self.fix} --keep <skill>'"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "profile": self.profile,
+            "layer": self.layer,
+            "skills": list(self.skills),
+            "message": self.message,
+            "fix": self.fix,
+        }
+
+
+def enabled_members(profile: Profile, layer_name: str) -> list[str]:
+    """The enabled skills of a layer, in layer order."""
+    return [
+        skill
+        for skill in profile.layers[layer_name].items
+        if skill in profile.skills and profile.skills[skill].enabled
+    ]
+
+
+def exclusivity_conflicts(profile: Profile) -> list[LayerConflict]:
+    """Active exclusive layers with more than one enabled skill."""
+    conflicts: list[LayerConflict] = []
     for name, layer in profile.layers.items():
         if not (layer.exclusive and layer.active):
             continue
-        enabled = [
-            item
-            for item in layer.items
-            if item in profile.skills and profile.skills[item].enabled
-        ]
+        enabled = enabled_members(profile, name)
         if len(enabled) > 1:
-            problems.append(
-                f"layer {name!r} is exclusive but has {len(enabled)} enabled skills "
-                f"({', '.join(enabled)}); keep at most one enabled"
-            )
-    return problems
+            conflicts.append(LayerConflict(profile.name, name, tuple(enabled)))
+    return conflicts
+
+
+def exclusivity_problems(profile: Profile) -> list[str]:
+    """Messages for :func:`exclusivity_conflicts`."""
+    return [conflict.message for conflict in exclusivity_conflicts(profile)]
+
+
+# Profile folders read or written since the last take_warnings(), in order.
+_touched: dict[tuple[Path, str], None] = {}
+
+
+def peek_warnings() -> list[LayerConflict]:
+    """Conflicts of every profile read or written so far, as they are on disk.
+
+    Every profile that :func:`load_profile` read or :func:`save_profile` /
+    :func:`restore_profile` wrote (created and installed profiles included) is
+    read again, so a command reports the state it left behind. Profiles that
+    no longer load are skipped.
+    """
+    found: list[LayerConflict] = []
+    for folder, name in list(_touched):
+        try:
+            profile = _read_folder(name, folder)
+        except RespecError:
+            continue
+        found.extend(exclusivity_conflicts(profile))
+    return found
+
+
+def take_warnings() -> list[LayerConflict]:
+    """:func:`peek_warnings`, then forget which profiles were loaded."""
+    found = peek_warnings()
+    _touched.clear()
+    return found
 
 
 def with_enabled(profile: Profile, items: list[str], enabled: bool) -> Profile:
@@ -387,18 +465,28 @@ def _parse_layer(
     if not isinstance(active, bool):
         problems.append(f"{where}.active must be true or false")
 
+    key = LAYER_SKILLS_KEY
+    if LEGACY_LAYER_SKILLS_KEY in raw:
+        if LAYER_SKILLS_KEY in raw:
+            problems.append(
+                f"{where}: has both {LAYER_SKILLS_KEY!r} and the legacy "
+                f"{LEGACY_LAYER_SKILLS_KEY!r} key; keep only {LAYER_SKILLS_KEY!r}"
+            )
+        else:
+            key = LEGACY_LAYER_SKILLS_KEY
+    members = f"{where}.{LAYER_SKILLS_KEY}"
     items: list[str] = []
-    raw_items = raw.get("items")
+    raw_items = raw.get(key)
     if raw_items is None:
         raw_items = []
     if not isinstance(raw_items, list):
-        problems.append(f"{where}.items must be a list of skill names")
+        problems.append(f"{members} must be a list of skill names")
         raw_items = []
     for item in raw_items:
         if not isinstance(item, str) or item not in skills:
-            problems.append(f"{where}.items: {item!r} is not a skill of this profile")
+            problems.append(f"{members}: {item!r} is not a skill of this profile")
         elif item in items:
-            problems.append(f"{where}.items: {item!r} is listed more than once")
+            problems.append(f"{members}: {item!r} is listed more than once")
         else:
             items.append(item)
     if name == OUTPUT_STYLE and raw_items:
@@ -477,29 +565,36 @@ def parse_profile(name: str, folder: Path, data: Any) -> Profile:
     profile = Profile(
         name=name, path=folder, targets=targets, skills=skills, layers=layers
     )
-    if not problems:
-        problems.extend(exclusivity_problems(profile))
     if problems:
         raise ProfileError(file, problems)
     return profile
 
 
 def load_profile(respec_home: Path, name: str) -> Profile:
+    """Read and validate a profile; its layer conflicts become warnings."""
     validate_name(name)
     folder = profiles_dir(respec_home) / name
-    file = folder / PROFILE_FILE
     if not folder.is_dir():
         raise RespecError(
             f"profile {name!r} does not exist; create it with "
             f"'respec profile new {name} --target <target>'"
         )
+    _touched[(folder, name)] = None
+    return _read_folder(name, folder)
+
+
+def _read_folder(name: str, folder: Path) -> Profile:
+    file = folder / PROFILE_FILE
     if not file.is_file():
         raise ProfileError(file, [f"{PROFILE_FILE} is missing"])
+    text = file.read_text("utf-8")
     try:
-        data = yaml.safe_load(file.read_text("utf-8"))
+        data = yaml.safe_load(text)
     except yaml.YAMLError as error:
         raise ProfileError(file, [f"not valid YAML: {error}"]) from None
-    return parse_profile(name, folder, data)
+    profile = parse_profile(name, folder, data)
+    object.__setattr__(profile, "loaded_text", text)
+    return profile
 
 
 def list_profile_names(respec_home: Path) -> list[str]:
@@ -529,10 +624,27 @@ def create_profile(respec_home: Path, name: str, targets: list[str]) -> Profile:
     return profile
 
 
-def save_profile(profile: Profile) -> None:
-    """Write ``profile.yaml``; the only writer, atomic so a crash never truncates."""
+def _write(profile: Profile, text: str) -> None:
+    """Write ``profile.yaml`` atomically, so a crash never truncates it."""
     file = profile.path / PROFILE_FILE
     temporary = file.with_name(f".{PROFILE_FILE}.tmp")
-    text = yaml.safe_dump(profile.to_yaml_data(), sort_keys=False)
     temporary.write_text(text, "utf-8")
     os.replace(temporary, file)
+    _touched[(profile.path, profile.name)] = None
+
+
+def save_profile(profile: Profile) -> None:
+    """Write ``profile.yaml`` from ``profile``; respec's only schema writer."""
+    _write(profile, yaml.safe_dump(profile.to_yaml_data(), sort_keys=False))
+
+
+def restore_profile(profile: Profile) -> None:
+    """Undo a save: write back the exact text ``profile`` was loaded from.
+
+    Only a profile returned by :func:`load_profile` carries that text; any
+    other (including an edited copy) is written from its own data instead.
+    """
+    if profile.loaded_text is None:
+        save_profile(profile)
+    else:
+        _write(profile, profile.loaded_text)

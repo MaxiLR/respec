@@ -81,7 +81,7 @@ def test_layer_use_in_exclusive_layer_keeps_one_item_enabled_and_linked(
     ok(run("layer", "use", "design-principles", "b"))
 
     data = read_yaml(profiles_root)
-    assert data["layers"]["design-principles"]["items"] == ["a", "b"]
+    assert data["layers"]["design-principles"]["skills"] == ["a", "b"]
     assert enabled_items(profiles_root) == {"b", "c"}
     assert linked(claude_dir) == {"b", "c"}
 
@@ -98,7 +98,7 @@ def test_adding_enabled_item_to_exclusive_layer_keeps_current_choice(
 
     ok(run("layer", "add-skill", "design-principles", "b"))
 
-    assert read_yaml(profiles_root)["layers"]["design-principles"]["items"] == [
+    assert read_yaml(profiles_root)["layers"]["design-principles"]["skills"] == [
         "a",
         "b",
     ]
@@ -145,7 +145,7 @@ def test_custom_additive_layer_enables_and_disables_as_a_group(
     assert read_yaml(profiles_root)["layers"]["review"] == {
         "exclusive": False,
         "description": "Code review helpers",
-        "items": ["a", "b"],
+        "skills": ["a", "b"],
     }
 
 
@@ -156,6 +156,7 @@ def test_custom_exclusive_layer_show_and_rm(run, work, profiles_root, claude_dir
 
     shown = json.loads(ok(run("layer", "show", "tone", "--json")).output)
     assert shown == {
+        "warnings": [],
         "name": "tone",
         "profile": "work",
         "exclusive": True,
@@ -288,7 +289,7 @@ def test_layer_commands_target_named_profile_without_touching_targets(
     )
 
     assert change["profile"] == "home" and change["active"] is False
-    assert read_yaml(profiles_root, "home")["layers"]["design-principles"]["items"] == [
-        "x"
-    ]
+    assert read_yaml(profiles_root, "home")["layers"]["design-principles"][
+        "skills"
+    ] == ["x"]
     assert not claude_dir.exists()

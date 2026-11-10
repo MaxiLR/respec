@@ -12,20 +12,23 @@ Each entry gets one of three choices:
 
 An original is only removed after its copy (in a profile or in a backup) is
 complete, so nothing is lost. A symlink entry is removed by unlinking it; what
-it points to is never touched.
+it points to is never touched. If re-linking the active profile fails after an
+add, the entry is put back; its profile copy is deleted only once the original
+is verifiably restored, and is otherwise kept in the profile.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import items, switch, unknown
+from respec import items, profiles, switch, unknown
 from respec.errors import RespecError
-from respec.state import load_state, save_state
+from respec.state import State, load_state, save_state
 
 CHOICES = ("add", "backup", "keep")
 
@@ -38,6 +41,8 @@ class Resolution:
     choice: str
     profile: str | None = None
     backup: str | None = None
+    # Where an added symlink entry pointed, to put it back on rollback.
+    link: str | None = field(default=None, repr=False)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -72,12 +77,96 @@ def _settle(respec_home: Path, entry: unknown.Unknown, keep: bool) -> None:
     save_state(respec_home, state)
 
 
-def _add(respec_home: Path, entry: unknown.Unknown, profile_name: str | None) -> str:
+def _add(respec_home: Path, resolution: Resolution, profile_name: str | None) -> str:
+    entry = resolution.entry
     profile = items.resolve_profile_name(respec_home, profile_name)
     items.add_local(respec_home, profile, Path(entry.path), name=entry.name)
+    if Path(entry.path).is_symlink():
+        resolution.link = os.readlink(entry.path)
     _delete(Path(entry.path))
     _settle(respec_home, entry, keep=False)
     return profile
+
+
+def _put_back(resolution: Resolution, copy: Path) -> bool:
+    """Restore an added entry at its original path from the profile copy.
+
+    Returns True only when the original is verifiably back: the moved folder
+    itself, a folder with the same content, or the same symlink. Whatever
+    respec placed there (its link to the copy, or its copy of it) is replaced.
+    Anything else at the original path is left alone and False is returned,
+    so the caller keeps the copy.
+    """
+    original = Path(resolution.entry.path)
+    link = resolution.link
+    if not copy.is_dir() or copy.is_symlink():
+        return False
+    if os.path.lexists(original):
+        if original.is_symlink():
+            if original.resolve() != copy.resolve():
+                return False
+            original.unlink()  # respec's link to the copy
+        elif original.is_dir() and unknown.digest(original) == unknown.digest(copy):
+            if link is None:
+                return True  # respec's copy holds exactly the original content
+            shutil.rmtree(original)  # respec's copy; the content is in ``copy``
+        else:
+            return False
+    if link is not None:
+        os.symlink(link, original)
+        return original.is_symlink() and os.readlink(original) == link
+    shutil.move(str(copy), str(original))
+    return original.is_dir() and not original.is_symlink() and not copy.exists()
+
+
+def _undo_adds(
+    respec_home: Path,
+    before: profiles.Profile,
+    state_before: State,
+    adds: list[Resolution],
+) -> list[str]:
+    """Put added entries back where they were, never losing their content.
+
+    A profile copy is deleted only after :func:`_put_back` verified the
+    original is restored; otherwise the copy stays in the profile (listed and
+    enabled) and a note says where. Returns those notes.
+    """
+    notes: list[str] = []
+    restored: set[Path] = set()
+    kept: list[str] = []
+    for resolution in adds:
+        name = resolution.entry.name
+        copy = before.path / profiles.SKILLS_DIR / name
+        try:
+            back = _put_back(resolution, copy)
+        except (OSError, shutil.Error):
+            back = False
+        if back:
+            restored.add(unknown.real(resolution.entry.path))
+            if copy.exists() or copy.is_symlink():
+                shutil.rmtree(copy, ignore_errors=True)
+        else:
+            kept.append(name)
+            notes.append(
+                f"could not put {resolution.entry.path} back; its content is kept "
+                f"in profile {before.name!r} at {copy}"
+            )
+    if kept:
+        skills = dict(before.skills)
+        for name in kept:
+            skills[name] = profiles.SkillEntry(enabled=True)
+        profiles.save_profile(dataclasses.replace(before, skills=skills))
+    else:
+        profiles.restore_profile(before)
+    state = load_state(respec_home)
+    state.installed = [
+        item for item in state.installed if unknown.real(item.path) not in restored
+    ]
+    for item in state_before.installed:
+        if unknown.real(item.path) in restored:
+            state.installed.append(item)
+    save_state(respec_home, state)
+    return notes
 
 
 def _backup(respec_home: Path, entry: unknown.Unknown, run_dir: Path) -> str:
@@ -127,7 +216,7 @@ def resolve(
             )
         resolution = Resolution(entry=entry, choice=choice)
         if choice == "add":
-            resolution.profile = _add(respec_home, entry, profile_name)
+            resolution.profile = _add(respec_home, resolution, profile_name)
         elif choice == "backup":
             if run_dir is None:
                 run_dir = switch.new_backup_run(respec_home, now())
@@ -156,12 +245,38 @@ def adopt(
     that profile; other unknown entries stay as they are.
     """
     result = AdoptResult()
-    result.resolved = resolve(respec_home, find(respec_home), decide, profile_name, now)
+    entries = find(respec_home)
     active = load_state(respec_home).active_profile
-    if any(r.choice == "add" and r.profile == active for r in result.resolved):
-        applied = switch.use(
-            respec_home, user_home, active, now=now, on_unknown=lambda entries: None
-        )
+    before: profiles.Profile | None = None
+    if active is not None and (profile_name or active) == active:
+        # Ask everything first, so a refusal below happens before any change.
+        choices = {entry.path: decide(entry) for entry in entries}
+        decide = lambda entry: choices[entry.path]  # noqa: E731
+        if "add" in choices.values():
+            before = profiles.load_profile(respec_home, active)
+            switch.refuse_layer_conflicts(before, "adopt into")
+    state_before = load_state(respec_home)
+    result.resolved = resolve(respec_home, entries, decide, profile_name, now)
+    adds = [r for r in result.resolved if r.choice == "add" and r.profile == active]
+    if adds:
+        assert before is not None
+        try:
+            applied = switch.use(
+                respec_home, user_home, active, now=now, on_unknown=lambda e: None
+            )
+        except RespecError as error:
+            notes = _undo_adds(respec_home, before, state_before, adds)
+            notes += [
+                f"{r.entry.path} was backed up to {r.backup} and removed earlier "
+                "in this run"
+                for r in result.resolved
+                if r.choice == "backup"
+            ]
+            if not notes:
+                raise
+            raise RespecError(
+                f"{error}\n" + "\n".join(f"  - {note}" for note in notes)
+            ) from None
         removed = {item.path for item in applied.removed}
         result.linked = sorted(
             item.path for item in applied.installed if item.path not in removed
