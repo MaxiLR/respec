@@ -131,7 +131,8 @@ warnings.
   first).
 
 The first `respec use` that touches a folder backs up its full contents to
-`~/.respec/backups/<timestamp>/<target>/` before taking it over.
+`~/.respec/backups/<timestamp>/<target>/` before taking it over. Folders respec
+had to create are removed again by `respec restore` once they are empty.
 
 ## `profile.yaml`
 
@@ -179,8 +180,11 @@ switch:
     skills: [my-notes]
   ```
 
-A profile skill cannot have the name of a global or shipped skill; the switch
-refuses until one is renamed.
+No profile skill may take the name of a global or shipped skill: `add`,
+`profile install` and adopt's add refuse such a name before changing
+anything. An unknown entry with such a name (for example a replaced
+shipped link) can only be removed; it is backed up and respec links its
+own skill there again.
 
 ## Hook scope (next phase, not built yet)
 

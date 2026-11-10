@@ -160,8 +160,10 @@ def test_restore_named_backup_restores_the_folders_it_holds(
     assert out["backup"] == name
     assert snapshot(dirs["claude-code"]) == taken_over["claude-code"]
     assert snapshot(dirs["agents"]) == taken_over["agents"]
-    # oh-my-pi is not in that backup: respec's items are removed, ownership released.
-    assert respec_links(dirs["oh-my-pi"], respec_home) == []
+    # oh-my-pi is not in that backup: respec's items are removed, ownership
+    # released, and the folder respec created for it is gone with its parents.
+    assert not dirs["oh-my-pi"].exists()
+    assert not (dirs["oh-my-pi"].parent.parent).exists()
     assert read_state(respec_home)["owned"] == {}
 
 

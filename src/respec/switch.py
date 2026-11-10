@@ -295,6 +295,18 @@ def _record_backed_up_items(
     manifest.write_text(json.dumps(data, indent=2) + "\n", "utf-8")
 
 
+def _missing_folders(folder: Path, user_home: Path) -> tuple[str, ...]:
+    """``folder`` and its missing parents, deepest first, up to ``user_home``."""
+    missing: list[str] = []
+    current = folder
+    while not os.path.lexists(current) and current != current.parent:
+        if current == user_home:
+            break
+        missing.append(str(current))
+        current = current.parent
+    return tuple(missing)
+
+
 def _take_over(
     respec_home: Path,
     user_home: Path,
@@ -334,6 +346,7 @@ def _take_over(
             skills_dir=str(folder),
             backup=backup,
             taken_over_at=moment.isoformat(),
+            created=_missing_folders(folder, user_home),
         )
     state.owned.update(owned)
     return backups
@@ -461,6 +474,56 @@ def link_skills(
         save_state(respec_home, state)
         result.linked.append(str(destination))
     return result
+
+
+def relink_lasting(respec_home: Path, user_home: Path) -> list[str]:
+    """Link missing shipped and global skills of the active profile's switch
+    into folders respec owns, where nothing is in the way (for example after
+    an entry in their place was removed). Returns the paths linked."""
+    state = load_state(respec_home)
+    if state.active_profile is None:
+        return []
+    lasting = set(global_skills.load_global(respec_home))
+    lasting.update(global_skills.shipped_names())
+    if not lasting:
+        return []
+    profile = profiles.load_profile(respec_home, state.active_profile)
+    global_skills.refresh_shipped(respec_home)
+    owned = {Path(entry.skills_dir).resolve() for entry in state.owned.values()}
+    linked: list[str] = []
+    for target, skill, source, destination in _plan_all(
+        respec_home, user_home, profile
+    ):
+        if (
+            skill not in lasting
+            or destination.parent.resolve() not in owned
+            or os.path.lexists(destination)
+            or not source.is_dir()
+        ):
+            continue
+        key = _real(destination)
+        state.installed = [i for i in state.installed if _real(Path(i.path)) != key]
+        try:
+            mode = _install(source, destination)
+        except OSError as error:
+            save_state(respec_home, state)
+            raise LinkFailed(
+                f"linking {skill!r} into {destination.parent} did not complete: "
+                f"{error}; the next 'respec use' puts it back.",
+                linked,
+            ) from None
+        state.installed.append(
+            Installed(
+                target=target,
+                name=skill,
+                path=str(destination),
+                mode=mode,
+                digest=unknown.digest(destination) if mode == "copy" else None,
+            )
+        )
+        save_state(respec_home, state)
+        linked.append(str(destination))
+    return linked
 
 
 def new_backups(respec_home: Path, owned_before: set[str]) -> dict[str, str]:

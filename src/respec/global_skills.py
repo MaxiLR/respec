@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import filecmp
 import shutil
+from collections.abc import Iterable
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -129,6 +130,34 @@ def load_global(respec_home: Path) -> tuple[str, ...]:
             )
         seen.append(name)
     return tuple(seen)
+
+
+def reserved(respec_home: Path) -> dict[str, str]:
+    """Names no profile skill may take, each with the reason."""
+    taken = {
+        name: "respec ships a skill of that name and installs it into every target"
+        for name in shipped_names()
+    }
+    for name in load_global(respec_home):
+        taken[name] = f"it is a global skill listed in {config_path(respec_home)}"
+    return taken
+
+
+def refuse_reserved(
+    respec_home: Path, names: Iterable[str], profile: str, hint: str = ""
+) -> None:
+    """Refuse to add any of ``names`` to ``profile`` when a shipped or global
+    skill has that name. Every path that adds a skill to a profile calls this
+    before changing anything."""
+    taken = reserved(respec_home)
+    clashes = [name for name in names if name in taken]
+    if not clashes:
+        return
+    reasons = "; ".join(f"{name!r}: {taken[name]}" for name in clashes)
+    raise RespecError(
+        f"cannot add {', '.join(map(repr, clashes))} to profile {profile!r} "
+        f"({reasons}). Nothing was changed." + (f" {hint}" if hint else "")
+    )
 
 
 def global_source(respec_home: Path, name: str) -> Path:

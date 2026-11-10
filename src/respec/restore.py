@@ -336,6 +336,30 @@ def _restore_folder(plan: FolderPlan) -> None:
         _put_back(source, destination)
 
 
+def _remove_created(state: State, plans: list[FolderPlan]) -> None:
+    """Remove the folders respec created at takeover that are empty again.
+
+    Only folders of targets left without a backup to restore (it did not exist
+    at takeover, or a named backup does not hold it) are considered; a folder
+    that holds anything, or is a symlink, stays.
+    """
+    restored = {
+        target for plan in plans if plan.source is not None for target in plan.targets
+    }
+    folders = {
+        Path(path)
+        for target, entry in state.owned.items()
+        if target not in restored
+        for path in entry.created
+    }
+    for folder in sorted(folders, key=lambda p: len(p.parts), reverse=True):
+        try:
+            if folder.is_dir() and not folder.is_symlink():
+                folder.rmdir()
+        except OSError:
+            pass  # not empty: something else lives there now
+
+
 def _apply(
     respec_home: Path,
     plans: list[FolderPlan],
@@ -370,6 +394,7 @@ def _apply(
             f"owns its folders. Run 'respec restore{again}' again to finish."
         ) from None
     result.released = sorted(state.owned)
+    _remove_created(state, plans)
     save_state(respec_home, State())
 
 

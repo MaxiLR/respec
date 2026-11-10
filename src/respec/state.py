@@ -9,7 +9,8 @@ Schema (version 1)::
         "claude-code": {
           "skills_dir": "/home/me/.claude/skills",
           "backup": "/home/me/.respec/backups/20261109T120000Z/claude-code",
-          "taken_over_at": "2026-11-09T12:00:00+00:00"
+          "taken_over_at": "2026-11-09T12:00:00+00:00",
+          "created": ["/home/me/.omp/agent/skills", "/home/me/.omp/agent"]
         }
       },
       "installed": [                       # every path respec created
@@ -21,7 +22,9 @@ Schema (version 1)::
       ]
     }
 
-``backup`` is null when the folder did not exist at takeover. ``mode`` is
+``backup`` is null when the folder did not exist at takeover. ``created`` (left
+out when empty) lists the folders missing at takeover, deepest first, which
+respec then created; ``respec restore`` removes those that are empty again. ``mode`` is
 ``symlink`` or ``copy``. ``digest`` fingerprints a copy's content as installed,
 so a copy that was later edited or replaced is not mistaken for respec's own; a
 copy recorded without one is never treated as respec's. Removal only ever touches paths listed in
@@ -52,6 +55,19 @@ class Owned:
     skills_dir: str
     backup: str | None
     taken_over_at: str
+    # Folders missing at takeover (the skills folder and missing parents,
+    # deepest first): respec created them, so a restore may remove them again.
+    created: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "skills_dir": self.skills_dir,
+            "backup": self.backup,
+            "taken_over_at": self.taken_over_at,
+        }
+        if self.created:
+            data["created"] = list(self.created)
+        return data
 
 
 @dataclass(frozen=True)
@@ -84,7 +100,7 @@ class State:
         return {
             "version": VERSION,
             "active_profile": self.active_profile,
-            "owned": {name: vars(entry) for name, entry in self.owned.items()},
+            "owned": {name: entry.to_dict() for name, entry in self.owned.items()},
             "installed": [item.to_dict() for item in self.installed],
         }
 
@@ -108,7 +124,10 @@ def load_state(respec_home: Path) -> State:
     if not isinstance(data, dict) or data.get("version") != VERSION:
         raise _invalid(path, f"expected a mapping with version {VERSION}")
     try:
-        owned = {name: Owned(**entry) for name, entry in data["owned"].items()}
+        owned = {
+            name: Owned(**{**entry, "created": tuple(entry.get("created", ()))})
+            for name, entry in data["owned"].items()
+        }
         installed = [Installed(**item) for item in data["installed"]]
     except (KeyError, TypeError, AttributeError) as error:
         raise _invalid(path, f"malformed entry ({error})") from None

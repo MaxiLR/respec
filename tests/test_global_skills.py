@@ -326,3 +326,206 @@ def test_invalid_config_refuses_a_refresh_and_leaves_the_profile_unchanged(
     profile = yaml.safe_load((respec_home / "profiles/a/profile.yaml").read_text())
     assert profile["skills"]["tdd"]["enabled"] is True
     assert (dirs["agents"] / "tdd").is_symlink()
+
+
+# --- reserved names: no path adds a shipped or global skill to a profile ----
+
+
+def replace_with_folder(path, text="edited\n"):
+    path.unlink()
+    path.mkdir()
+    (path / "SKILL.md").write_text(text)
+
+
+def profile_skills(respec_home, name):
+    data = yaml.safe_load(
+        (respec_home / "profiles" / name / "profile.yaml").read_text()
+    )
+    return data.get("skills") or {}
+
+
+def is_shipped_link(path, respec_home):
+    return (
+        path.is_symlink()
+        and path.resolve() == (respec_home / "shipped" / path.name).resolve()
+    )
+
+
+def test_adopt_add_of_a_replaced_shipped_skill_is_refused_and_remove_relinks_it(
+    run, respec_home, dirs
+):
+    # The review's reproduction: p2 targets oh-my-pi only.
+    make_profile(respec_home, "p2", ["oh-my-pi"], ["tdd"])
+    assert run("use", "p2").exit_code == 0
+    entry = dirs["oh-my-pi"] / "profile-maker"
+    replace_with_folder(entry)
+
+    refused = run("adopt", "--add", "profile-maker")
+
+    assert refused.exit_code == 1
+    assert "'profile-maker'" in refused.output and "ships" in refused.output
+    assert "--remove" in refused.output
+    assert (entry / "SKILL.md").read_text() == "edited\n"
+    assert "profile-maker" not in profile_skills(respec_home, "p2")
+
+    removed = run("adopt", "--remove", "profile-maker", "--json")
+
+    assert removed.exit_code == 0, removed.output
+    data = json.loads(removed.stdout)
+    assert open(os.path.join(data["resolved"][0]["backup"], "SKILL.md")).read() == (
+        "edited\n"
+    )
+    assert is_shipped_link(entry, respec_home)
+    assert str(entry) in data["linked"]
+    assert run("disable", "tdd").exit_code == 0
+    assert run("use", "p2").exit_code == 0
+
+
+def test_adopt_add_of_a_shipped_skill_outside_the_profile_targets_is_refused(
+    run, respec_home, dirs
+):
+    make_profile(respec_home, "pi", ["oh-my-pi"], ["tdd"])
+    assert run("use", "pi").exit_code == 0
+    replace_with_folder(dirs["agents"] / "respec")
+
+    assert run("adopt", "--add", "respec").exit_code == 1
+    assert (dirs["agents"] / "respec" / "SKILL.md").read_text() == "edited\n"
+
+    assert run("adopt", "--remove", "respec").exit_code == 0
+    assert is_shipped_link(dirs["agents"] / "respec", respec_home)
+    assert run("use", "pi").exit_code == 0
+
+
+def test_adopt_all_add_is_refused_before_any_entry_changes(run, respec_home, dirs):
+    make_profile(respec_home, "a", ["agents"], ["tdd"])
+    assert run("use", "a").exit_code == 0
+    (dirs["agents"] / "aaa").mkdir()
+    (dirs["agents"] / "aaa" / "SKILL.md").write_text("aaa\n")
+    replace_with_folder(dirs["agents"] / "respec")
+
+    result = run("adopt", "--all", "add")
+
+    assert result.exit_code == 1
+    assert (dirs["agents"] / "aaa" / "SKILL.md").read_text() == "aaa\n"
+    assert set(profile_skills(respec_home, "a")) == {"tdd"}
+
+
+def test_use_unknown_add_of_a_reserved_entry_is_refused(run, respec_home, dirs):
+    make_profile(respec_home, "a", ["agents"], ["tdd"])
+    make_profile(respec_home, "b", ["agents"], ["lint"])
+    assert run("use", "a").exit_code == 0
+    replace_with_folder(dirs["agents"] / "respec")
+
+    result = run("use", "b", "--unknown", "add")
+
+    assert result.exit_code == 1
+    assert "'respec'" in result.output
+    assert (dirs["agents"] / "respec" / "SKILL.md").read_text() == "edited\n"
+    assert set(profile_skills(respec_home, "a")) == {"tdd"}
+    assert json.loads(run("status", "--json").stdout)["active_profile"] == "a"
+
+    assert run("use", "b", "--unknown", "remove").exit_code == 0
+    assert is_shipped_link(dirs["agents"] / "respec", respec_home)
+
+
+def test_adopt_prompt_offers_only_remove_for_a_reserved_entry(
+    run, respec_home, dirs, monkeypatch
+):
+    from respec import cli
+
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    make_profile(respec_home, "a", ["agents"], ["tdd"])
+    assert run("use", "a").exit_code == 0
+    replace_with_folder(dirs["agents"] / "respec")
+
+    result = run("adopt", input="add\nremove\n")
+
+    assert result.exit_code == 0, result.output
+    assert "please answer: remove" in result.output
+    assert is_shipped_link(dirs["agents"] / "respec", respec_home)
+    assert "respec" not in profile_skills(respec_home, "a")
+
+
+def test_resolve_api_refuses_add_of_a_reserved_entry_before_changes(
+    respec_home, dirs, run
+):
+    from respec import adopt
+    from respec.errors import RespecError
+
+    make_profile(respec_home, "a", ["agents"], ["tdd"])
+    assert run("use", "a").exit_code == 0
+    (dirs["agents"] / "aaa").mkdir()
+    (dirs["agents"] / "aaa" / "SKILL.md").write_text("aaa\n")
+    replace_with_folder(dirs["agents"] / "respec")
+    entries = adopt.unresolved(respec_home)
+    assert [e.name for e in entries] == ["aaa", "respec"]
+
+    with pytest.raises(RespecError, match="ships"):
+        adopt.resolve(respec_home, entries, lambda entry: "add", "a")
+
+    assert (dirs["agents"] / "aaa").is_dir()
+    assert set(profile_skills(respec_home, "a")) == {"tdd"}
+
+
+@pytest.mark.parametrize("reserved", ["respec", "notes"])
+def test_local_add_of_a_reserved_name_to_an_inactive_profile_is_refused(
+    run, respec_home, tmp_path, reserved
+):
+    make_profile(respec_home, "b", ["agents"], [])
+    make_global(respec_home, "notes")
+    source = tmp_path / "src" / reserved
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("mine\n")
+
+    result = run("add", str(source), "-p", "b")
+
+    assert result.exit_code == 1
+    assert f"'{reserved}'" in result.output
+    assert profile_skills(respec_home, "b") == {}
+    assert not (respec_home / "profiles" / "b" / "skills" / reserved).exists()
+
+
+# --- restore removes the parent folders respec created ----------------------
+
+
+def test_restore_removes_parent_folders_respec_created(run, respec_home, dirs):
+    home = respec_home.parent / "home"
+    dirs["claude-code"].mkdir(parents=True)
+    (dirs["claude-code"] / "mine").mkdir()
+    (home / ".omp").mkdir()  # existed before respec; must stay
+    make_profile(respec_home, "pi", ["oh-my-pi"], ["tdd"])
+    assert run("use", "pi").exit_code == 0
+
+    assert run("restore").exit_code == 0
+
+    assert names(dirs["claude-code"]) == ["mine"]
+    assert not (home / ".agents").exists()
+    assert not (home / ".omp" / "agent").exists()
+    assert (home / ".omp").is_dir()
+
+
+def test_restore_keeps_created_parents_that_gained_other_content(
+    run, respec_home, dirs
+):
+    home = respec_home.parent / "home"
+    make_profile(respec_home, "pi", ["oh-my-pi"], ["tdd"])
+    assert run("use", "pi").exit_code == 0
+    (home / ".omp" / "agent" / "config.yml").write_text("installed later\n")
+
+    assert run("restore").exit_code == 0
+
+    assert (home / ".omp" / "agent" / "config.yml").read_text() == "installed later\n"
+    assert not dirs["oh-my-pi"].exists()
+    assert not (home / ".agents").exists()
+
+
+def test_restore_never_removes_folders_that_existed_before_takeover(
+    run, respec_home, dirs
+):
+    dirs["agents"].mkdir(parents=True)  # empty, but the user's
+    make_profile(respec_home, "pi", ["oh-my-pi"], ["tdd"])
+    assert run("use", "pi").exit_code == 0
+
+    assert run("restore").exit_code == 0
+
+    assert dirs["agents"].is_dir() and names(dirs["agents"]) == []

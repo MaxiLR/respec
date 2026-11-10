@@ -34,7 +34,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import items, profiles, switch, unknown
+from respec import global_skills, items, profiles, switch, unknown
 from respec.errors import RespecError
 from respec.state import State, load_state, save_state
 
@@ -43,9 +43,38 @@ CHOICES = ("add", "remove")
 Decide = Callable[[unknown.Unknown], str | None]
 
 
-def choices(profile: str | None) -> tuple[str, ...]:
-    """The choices available when ``add`` would go to ``profile``."""
-    return CHOICES if profile is not None else ("remove",)
+def _reserved(respec_home: Path) -> dict[str, str]:
+    """Names a profile skill may not take (shipped skills at least, even when
+    ``config.yaml`` cannot be read)."""
+    try:
+        return global_skills.reserved(respec_home)
+    except RespecError:
+        return {name: "" for name in global_skills.shipped_names()}
+
+
+def choices(
+    profile: str | None,
+    entry: unknown.Unknown | None = None,
+    respec_home: Path | None = None,
+) -> tuple[str, ...]:
+    """The choices available when ``add`` would go to ``profile``.
+
+    Given ``entry`` and ``respec_home``, an entry named like a shipped or
+    global skill can only be removed: respec links its own skill there again.
+    """
+    if profile is None:
+        return ("remove",)
+    if entry is not None and respec_home is not None:
+        if entry.name in _reserved(respec_home):
+            return ("remove",)
+    return CHOICES
+
+
+def _reserved_hint(name: str) -> str:
+    return (
+        f"Choose remove instead ('respec adopt --remove {name}'): the entry is "
+        "backed up first, and respec links its own skill there again."
+    )
 
 
 @dataclass
@@ -256,6 +285,9 @@ def _add(
             "remove it instead (it is backed up first), or activate a profile "
             "with 'respec use <profile>'"
         )
+    global_skills.refuse_reserved(
+        respec_home, [entry.name], profile_name, _reserved_hint(entry.name)
+    )
     profile = profiles.load_profile(respec_home, profile_name)
     if entry.replaced and entry.name in profile.skills:
         resolution.replaced_copy, resolution.leftovers = _overwrite(
@@ -400,8 +432,20 @@ def resolve(
             run_dir = switch.new_backup_run(respec_home, now())
         return run_dir
 
+    # Entries named like a shipped or global skill are asked about first, so
+    # an ``add`` of one is refused before any entry changes.
+    taken = _reserved(respec_home)
+    early: dict[str, str | None] = {}
     for entry in entries:
-        choice = decide(entry)
+        if entry.name in taken:
+            early[entry.path] = decide(entry)
+            if early[entry.path] == "add" and profile is not None:
+                global_skills.refuse_reserved(
+                    respec_home, [entry.name], profile, _reserved_hint(entry.name)
+                )
+
+    for entry in entries:
+        choice = early[entry.path] if entry.path in early else decide(entry)
         if choice is None:
             continue
         if choice not in CHOICES:
@@ -434,9 +478,20 @@ def link_added(
     added = [
         r.entry.name for r in resolutions if r.choice == "add" and r.profile == active
     ]
-    if active is None or not added:
+    if active is None:
         return switch.LinkResult()
-    return switch.link_skills(respec_home, user_home, active, added)
+    result = (
+        switch.link_skills(respec_home, user_home, active, added)
+        if added
+        else switch.LinkResult()
+    )
+    if resolutions:
+        # A removed entry may have sat where a shipped or global skill goes.
+        try:
+            result.linked += switch.relink_lasting(respec_home, user_home)
+        except switch.LinkFailed as error:
+            raise switch.LinkFailed(str(error), result.linked + error.linked) from None
+    return result
 
 
 def taken_over(respec_home: Path, targets: Iterable[str]) -> list[unknown.Unknown]:
