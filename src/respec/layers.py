@@ -265,18 +265,29 @@ def set_active(
     active: bool,
     profile_name: str | None = None,
 ) -> LayerChange:
-    """Turn a layer's rules on or off; which items are enabled is unchanged."""
+    """Turn a layer's rules on or off; which skills are enabled is unchanged.
+
+    Turning a layer off is always allowed: it can only remove conflicts.
+    Turning it on is refused only when that layer itself would have more than
+    one enabled skill; other layers' conflicts stay warnings. No skill changes
+    state, so the target folders are not touched.
+    """
     before = _load(respec_home, profile_name)
     after = _with_layer(
         before, name, dataclasses.replace(_layer(before, name), active=active)
     )
-    problems = profiles.exclusivity_problems(after)
-    if problems:
-        raise RespecError(f"cannot turn layer {name!r} on: {problems[0]}")
+    own = [c for c in profiles.exclusivity_conflicts(after) if c.layer == name]
+    if active and own:
+        raise RespecError(f"cannot turn layer {name!r} on: {own[0].message}")
     change = LayerChange(
-        profile=before.name, layer=name, action="on" if active else "off"
+        profile=before.name,
+        layer=name,
+        action="on" if active else "off",
+        active=load_state(respec_home).active_profile == before.name,
     )
-    return _apply(respec_home, user_home, before, after, change)
+    if after != before:
+        profiles.save_profile(after)
+    return change
 
 
 def repair(

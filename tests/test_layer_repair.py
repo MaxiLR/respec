@@ -406,3 +406,100 @@ def test_restoring_an_edited_copy_writes_the_copy_not_the_loaded_bytes(
     profiles.restore_profile(copy)
 
     assert read_yaml(profiles_root)["targets"] == ["agents"]
+
+
+# Review round 3 regressions.
+
+
+def test_adopt_add_into_conflicted_active_profile_refuses_and_changes_nothing(
+    run, conflict, profiles_root, claude_dir, isolated_homes
+):
+    foreign = claude_dir / "foreign"
+    foreign.mkdir()
+    (foreign / "SKILL.md").write_text("# foreign\n")
+    yaml_file = profiles_root / "work" / "profile.yaml"
+    yaml_before = yaml_file.read_bytes()
+    state_file = isolated_homes.respec_home / "state.json"
+    state_before = state_file.read_bytes()
+
+    result = fails(run("adopt", "--add", "foreign"))
+
+    assert "respec layer repair design-principles" in result.output
+    assert (foreign / "SKILL.md").read_text() == "# foreign\n"
+    assert not (profiles_root / "work" / "skills" / "foreign").exists()
+    assert yaml_file.read_bytes() == yaml_before
+    assert state_file.read_bytes() == state_before
+
+
+def test_adopt_rolls_back_an_add_when_the_relink_is_refused(
+    run, work, profiles_root, claude_dir, isolated_homes, monkeypatch
+):
+    from respec import switch
+
+    foreign = claude_dir / "foreign"
+    foreign.mkdir()
+    (foreign / "SKILL.md").write_text("# foreign\n")
+    target = isolated_homes.home / "elsewhere"
+    target.mkdir()
+    (target / "SKILL.md").write_text("# linked\n")
+    (claude_dir / "pointer").symlink_to(target)
+    yaml_file = profiles_root / "work" / "profile.yaml"
+    yaml_before = yaml_file.read_bytes()
+
+    def refuse(*args, **kwargs):
+        raise switch.SwitchBlocked("cannot switch: refused for the test")
+
+    monkeypatch.setattr(switch, "use", refuse)
+
+    result = fails(run("adopt", "--add", "foreign", "--add", "pointer"))
+
+    assert "refused for the test" in result.output
+    assert (foreign / "SKILL.md").read_text() == "# foreign\n"
+    assert not foreign.is_symlink()
+    assert (claude_dir / "pointer").is_symlink()
+    assert (claude_dir / "pointer").resolve() == target.resolve()
+    assert not (profiles_root / "work" / "skills" / "foreign").exists()
+    assert not (profiles_root / "work" / "skills" / "pointer").exists()
+    assert yaml_file.read_bytes() == yaml_before
+
+
+@pytest.mark.parametrize("profile_args", [(), ("-p", "work")])
+def test_layer_off_of_another_layer_is_allowed_on_a_conflicted_profile(
+    run, conflict, profiles_root, profile_args
+):
+    result = ok(run("layer", "off", "output-style", *profile_args))
+
+    assert read_yaml(profiles_root)["layers"]["output-style"]["active"] is False
+    assert "respec layer repair design-principles" in result.stderr
+
+
+def test_two_conflicted_layers_can_each_be_turned_off_on_inactive_profile(
+    run, tmp_path, work, profiles_root
+):
+    ok(run("add", str(make_skill(tmp_path, "d"))))
+    ok(run("profile", "new", "home", "-t", "claude-code"))
+    ok(run("use", "home"))
+    data = read_yaml(profiles_root)
+    data["layers"] = {
+        "design-principles": {"skills": ["a", "b"]},
+        "mine": {"exclusive": True, "description": "Mine", "skills": ["c", "d"]},
+    }
+    write_yaml(profiles_root, data)
+
+    ok(run("layer", "off", "design-principles", "-p", "work"))
+    ok(run("layer", "off", "mine", "-p", "work"))
+
+    layers = read_yaml(profiles_root)["layers"]
+    assert layers["design-principles"]["active"] is False
+    assert layers["mine"]["active"] is False
+
+
+def test_layer_on_is_refused_only_for_its_own_conflict(run, conflict, profiles_root):
+    ok(run("layer", "off", "output-style"))
+    ok(run("layer", "on", "output-style"))
+
+    ok(run("layer", "off", "design-principles"))
+    result = fails(run("layer", "on", "design-principles"))
+
+    assert "cannot turn layer 'design-principles' on" in result.output
+    assert "(a, b)" in result.output

@@ -267,7 +267,7 @@ def _forget_replaced(respec_home: Path) -> None:
     save_state(respec_home, state)
 
 
-def _refuse_layer_conflicts(profile: profiles.Profile) -> None:
+def refuse_layer_conflicts(profile: profiles.Profile) -> None:
     """Never install two skills of one exclusive layer; nothing changes."""
     conflicts = profiles.exclusivity_conflicts(profile)
     if conflicts:
@@ -290,7 +290,7 @@ def use(
     anything else happens; entries it leaves in place stay untouched.
     """
     profile = profiles.load_profile(respec_home, name)
-    _refuse_layer_conflicts(profile)
+    refuse_layer_conflicts(profile)
     entries = unknown.find_unknown(respec_home, load_state(respec_home))
     if entries:
         if on_unknown is None:
