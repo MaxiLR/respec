@@ -195,11 +195,15 @@ Turning a layer off (or on) in the active profile re-applies the profile once it
 has no conflicts left, so skills that a conflict kept out of the target folders
 are linked right away. A change that cannot be applied to the active profile is
 refused with `cannot refresh profile '<name>'` and leaves `profile.yaml` as it
-was. `respec layer repair` is the one exception: when the entries in the way
-belong only to skills the repair does not change (for example an edited copy
-of another skill), it still disables the skills, unlinks them and links the
-kept one, and leaves those entries for `respec adopt`. So a conflict and an
-edited copy never block each other's fix.
+was. `respec layer repair` is the one exception for unknown entries: a repair
+only disables skills, so when unknown entries refuse the refresh it still
+saves the repair, unlinks the disabled skills and links the kept one. It only
+removes links that still hold what respec placed and only links into free
+paths, so an unknown entry (also an edited copy of a skill of that layer) is
+never touched and waits for `respec adopt`: add keeps the edit in the profile,
+remove backs it up. So a conflict and an edited copy never block each other's
+fix. Other refusals (such as a missing skill folder) still leave the profile
+unchanged.
 
 Every `--json` output that is an object uses one vocabulary:
 
@@ -222,13 +226,17 @@ Every `--json` output that is an object uses one vocabulary:
   with what was done before the failure. Other commands print their error on
   stderr only.
 
-A field that does not apply is left out rather than given as `null`: a linked
-skill has no `digest`, and `restore` gives `backup` only when a backup run was
-named. Where `null` remains it means "none": no `active_profile` or
-`previous_profile`, a `restored` folder that did not exist at takeover, a
-`same_as` of a folder that is its own. In `status`, each skill of a folder
-gives its `origin`: `profile`, `shipped` (respec's own skills) or `global`
-(from `config.yaml`).
+A field that does not apply is left out rather than given as `null`: for
+example a resolved entry has `profile` only when it was added and `backup`
+only when it was removed, a linked skill has no `digest`, a layer change has
+`skill` only when it names one, a skill without a git source has no `source`,
+and `restore` gives `backup` only when a backup run was named. Only these
+fields can be `null`, each meaning "none": `active_profile` and
+`previous_profile` (no profile), `same_as` (the folder is not shared with
+another target) and a value under `restored` (that folder did not exist at
+takeover). In `status`, each skill of a folder gives its `origin`: `profile`,
+`shipped` (respec's own skills) or `global` (from `config.yaml`); a link is
+judged by the folder it points into.
 
 The same warnings are printed on stderr. `respec restore --list --json` prints a
 bare list of backups instead: it reads no profile, so it has nothing to warn

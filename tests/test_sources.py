@@ -1424,3 +1424,17 @@ def test_git_can_be_cancelled_and_nothing_is_added(run, silent_server, profiles_
             )
 
     assert read_yaml(profiles_root, "work")["skills"] == {}
+
+
+def test_git_commands_print_no_undocumented_nulls(run, upstream, assert_no_nulls):
+    repo = upstream("acme/skills")
+    repo.write("skills/tdd/SKILL.md", "# tdd v1\n")
+    repo.commit()
+    new_profile(run)
+    ok(run("use", "work"))
+    assert_no_nulls(json.loads(ok(run("add", "acme/skills", "--json")).stdout))
+    repo.write("skills/tdd/SKILL.md", "# tdd v2\n")
+    repo.commit()
+
+    for args in (("update", "--check"), ("update",), ("update", "--check")):
+        assert_no_nulls(json.loads(ok(run(*args, "--json")).stdout))

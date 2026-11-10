@@ -108,7 +108,28 @@ def _print_json(data: Any) -> None:
             for conflict in profiles.peek_warnings()
         ]
         data = {**data, "warnings": layer_conflicts + list(data.get("warnings", []))}
-    typer.echo(json.dumps(data, indent=2))
+    typer.echo(json.dumps(_without_nulls(data), indent=2))
+
+
+# The only fields JSON output gives as null, each meaning "none": no active or
+# previous profile, a folder that is not the same as another target's, and
+# (as a value under ``restored``) a folder that did not exist at takeover.
+NULLABLE = frozenset({"active_profile", "previous_profile", "same_as"})
+NULLABLE_VALUES_OF = frozenset({"restored"})
+
+
+def _without_nulls(data: Any, parent: str | None = None) -> Any:
+    """``data`` without fields that do not apply: every ``null`` is left out
+    except in the fields of :data:`NULLABLE` and :data:`NULLABLE_VALUES_OF`."""
+    if isinstance(data, dict):
+        return {
+            key: _without_nulls(value, key)
+            for key, value in data.items()
+            if value is not None or key in NULLABLE or parent in NULLABLE_VALUES_OF
+        }
+    if isinstance(data, list):
+        return [_without_nulls(value) for value in data if value is not None]
+    return data
 
 
 @profile_app.command("new")
@@ -1194,9 +1215,8 @@ def _restore_payload(
     result: restore_backups.RestoreResult, unresolved: list[dict[str, Any]]
 ) -> dict[str, Any]:
     """What a restore did (or got to before it stopped), as JSON."""
-    data: dict[str, Any] = {"backup": result.backup} if result.backup else {}
     return {
-        **data,
+        "backup": result.backup,
         "restored": result.restored,
         "removed": [item.path for item in result.removed],
         "overwritten": [r.to_dict() for r in result.set_aside],
@@ -1266,7 +1286,8 @@ def _update_line(row: dict[str, Any]) -> str:
     name = row["skill"]
     outcome = row["result"]
     if outcome == "updated":
-        return f"{name}  updated {messages.short(row['current'])} -> {messages.short(row['latest'])}"
+        current, latest = messages.short(row["current"]), messages.short(row["latest"])
+        return f"{name}  updated {current} -> {latest}"
     if outcome == "up-to-date":
         return f"{name}  up to date"
     if outcome == "skipped-local-edits":
@@ -1291,7 +1312,10 @@ def _update_check(
             if row.error:
                 state = f"error: {row.error}"
             elif row.update_available:
-                state = f"update available {messages.short(row.current)} -> {messages.short(row.latest)}"
+                current, latest = messages.short(row.current), messages.short(
+                    row.latest
+                )
+                state = f"update available {current} -> {latest}"
             else:
                 state = "up to date"
             typer.echo(f"{row.skill}  {state}{edits}")

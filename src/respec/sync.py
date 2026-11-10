@@ -33,7 +33,7 @@ NOT_LINKED = "not linked"
 NOT_ENABLED = "no longer enabled"
 
 
-PROFILE = "profile"
+PROFILE = global_skills.PROFILE
 
 
 @dataclass(frozen=True)
@@ -106,20 +106,6 @@ class SyncReport:
         return not (self.unknown or self.conflicts or self.links or self.invalid)
 
 
-def _origin_of_link(respec_home: Path, path: Path) -> str:
-    """Whether a recorded link points into the shipped or global folders."""
-    if not path.is_symlink():
-        return PROFILE
-    linked = path.resolve()
-    for root, origin in (
-        (global_skills.shipped_dir(respec_home).resolve(), global_skills.SHIPPED),
-        (global_skills.global_skills_dir(respec_home).resolve(), global_skills.GLOBAL),
-    ):
-        if linked == root or root in linked.parents:
-            return origin
-    return PROFILE
-
-
 def _link_problems(
     respec_home: Path,
     user_home: Path,
@@ -171,7 +157,7 @@ def _link_problems(
             )
     for key, item in recorded.items():
         if key not in expected and os.path.lexists(key):
-            origin = _origin_of_link(respec_home, Path(item.path))
+            origin = global_skills.origin(respec_home, Path(item.path), item.name)
             problems.append(
                 LinkProblem(
                     item.target,

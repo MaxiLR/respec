@@ -137,7 +137,7 @@ def test_show_json_includes_resolved_target_dirs_and_skills(
                     "commit": "0123abcd",
                 },
             },
-            {"name": "notes", "enabled": False, "source": None},
+            {"name": "notes", "enabled": False},
         ],
     }
 

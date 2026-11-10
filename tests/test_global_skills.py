@@ -599,3 +599,19 @@ def test_first_takeover_says_an_entry_clashes_with_a_global_skill(
     assert result.exit_code == 1
     assert "'notes' is a global skill listed in" in result.output
     assert "config.yaml" in result.output
+
+
+def test_status_judges_a_link_by_what_it_points_into_not_its_name(
+    run, respec_home, dirs
+):
+    make_profile(respec_home, "a", ["agents"], ["tdd"])
+    assert run("use", "a").exit_code == 0
+    # A global skill of the same name is listed by hand afterwards.
+    make_global(respec_home, "tdd")
+
+    report = json.loads(run("status", "--json").stdout)
+
+    folders = {folder["target"]: folder for folder in report["folders"]}
+    origins = {s["name"]: s["origin"] for s in folders["agents"]["skills"]}
+    assert origins["tdd"] == "profile"
+    assert origins["respec"] == "shipped"

@@ -713,7 +713,6 @@ def status(respec_home: Path) -> dict[str, object]:
             active_targets = list(profile.targets)
         except RespecError:
             active_targets = sorted({item.target for item in state.installed})
-    lasting = global_skills.lasting_or_shipped(respec_home)
     # Targets sharing one real folder list its items once, under the first.
     first_of = {
         target: group[0]
@@ -736,7 +735,9 @@ def status(respec_home: Path) -> dict[str, object]:
                         "name": item.name,
                         "path": item.path,
                         "mode": item.mode,
-                        "origin": lasting.get(item.name, "profile"),
+                        "origin": global_skills.origin(
+                            respec_home, Path(item.path), item.name
+                        ),
                     }
                     for item in sorted(state.installed, key=lambda i: i.name)
                     if target == first

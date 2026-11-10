@@ -135,6 +135,7 @@ def load_global(respec_home: Path) -> tuple[str, ...]:
 
 SHIPPED = "shipped"
 GLOBAL = "global"
+PROFILE = "profile"
 
 
 def kinds(global_names: Iterable[str]) -> dict[str, str]:
@@ -170,6 +171,22 @@ def reserved(respec_home: Path) -> dict[str, str]:
         )
         for name, kind in lasting(respec_home).items()
     }
+
+
+def origin(respec_home: Path, path: Path, name: str) -> str:
+    """Where an installed entry comes from: :data:`SHIPPED`, :data:`GLOBAL`
+    or ``"profile"``. A link is judged by what it points into; a copy, which
+    does not say, by its name."""
+    if path.is_symlink():
+        linked = path.resolve()
+        for root, kind in (
+            (shipped_dir(respec_home).resolve(), SHIPPED),
+            (global_skills_dir(respec_home).resolve(), GLOBAL),
+        ):
+            if linked == root or root in linked.parents:
+                return kind
+        return PROFILE
+    return lasting_or_shipped(respec_home).get(name, PROFILE)
 
 
 def clash(respec_home: Path, name: str) -> str | None:

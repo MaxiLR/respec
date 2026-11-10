@@ -220,16 +220,16 @@ def test_repair_of_named_inactive_profile_does_not_touch_targets(
 def test_repair_refused_by_switch_preflight_leaves_profile_unchanged(
     run, conflict, profiles_root, claude_dir
 ):
-    # A hand-made folder replaced a's link: the repair would unlink it.
-    # (One that replaced an unrelated skill's link no longer refuses a repair;
-    # see test_repair_goes_ahead_while_an_unrelated_edited_copy_waits.)
-    (claude_dir / "a").unlink()
-    (claude_dir / "a").mkdir()
+    # The enabled skill c lost its folder: the refresh refuses. (Unknown
+    # entries no longer refuse a repair; see the fix-7 tests below.)
+    import shutil
+
+    shutil.rmtree(profiles_root / "work" / "skills" / "c")
     before = read_yaml(profiles_root)
 
     result = fails(run("layer", "repair", "design-principles", "--keep", "b"))
 
-    assert "not managed by respec" in result.output
+    assert "has no folder" in result.output
     assert read_yaml(profiles_root) == before
     assert linked(claude_dir) == {"a", "b", "c"}
 
@@ -747,17 +747,80 @@ def test_repair_json_reports_what_it_unlinked_beside_the_waiting_entry(
     assert [entry["path"] for entry in data["unresolved"]] == [str(edited)]
 
 
-def test_repair_that_would_unlink_an_edited_copy_still_changes_nothing(
+def test_repair_refused_for_another_reason_beside_an_edited_copy_changes_nothing(
     run, conflict, claude_dir, profiles_root, isolated_homes
 ):
     edited = replace_with_edited_copy(claude_dir, "a")
+    (isolated_homes.respec_home / "config.yaml").write_text("global: [\n")
     yaml_before = (profiles_root / "work" / "profile.yaml").read_bytes()
     state_file = isolated_homes.respec_home / "state.json"
     state_before = state_file.read_bytes()
 
     result = fails(run("layer", "repair", "design-principles", "--keep", "b"))
 
-    assert str(edited) in result.output
+    assert "config.yaml" in result.output
     assert (edited / "SKILL.md").read_text() == "edited by hand\n"
     assert (profiles_root / "work" / "profile.yaml").read_bytes() == yaml_before
     assert state_file.read_bytes() == state_before
+
+
+def test_repair_link_failure_says_the_repair_was_kept(
+    run, conflict, claude_dir, profiles_root, monkeypatch
+):
+    from respec import switch
+
+    replace_with_edited_copy(claude_dir, "c")
+
+    def fail(*args, **kwargs):
+        raise switch.LinkFailed("linking refused for the test", [])
+
+    monkeypatch.setattr(switch, "link_skills", fail)
+
+    result = fails(run("layer", "repair", "design-principles", "--keep", "b"))
+
+    assert "refused for the test" in result.output
+    assert "keeps the repair" in result.output
+    assert enabled_skills(profiles_root) == {"b", "c"}
+
+
+# fix-7 review 1 B2: an edited copy of a member of the conflicted layer.
+
+
+def test_repair_keeping_the_edited_member_goes_ahead_and_the_copy_can_be_added(
+    run, conflict, claude_dir, profiles_root, isolated_homes
+):
+    edited = replace_with_edited_copy(claude_dir, "b")
+
+    ok(run("layer", "repair", "design-principles", "--keep", "b"))
+
+    assert enabled_skills(profiles_root) == {"b", "c"}
+    assert not (claude_dir / "a").exists()
+    assert (edited / "SKILL.md").read_text() == "edited by hand\n"
+    ok(run("adopt", "--add", "b"))
+    assert (claude_dir / "b").is_symlink()
+    copy = profiles_root / "work" / "skills" / "b" / "SKILL.md"
+    assert copy.read_text() == "edited by hand\n"
+    ok(run("use", "work"))
+
+
+def test_repair_disabling_the_edited_member_leaves_the_copy_waiting(
+    run, conflict, claude_dir, profiles_root
+):
+    edited = replace_with_edited_copy(claude_dir, "b")
+
+    data = json.loads(
+        ok(run("layer", "repair", "design-principles", "--keep", "a", "--json")).stdout
+    )
+
+    assert data["disabled"] == ["b"]
+    assert data["unlinked"] == []
+    assert [entry["path"] for entry in data["unresolved"]] == [str(edited)]
+    assert enabled_skills(profiles_root) == {"a", "c"}
+    assert (claude_dir / "a").is_symlink()
+    assert (edited / "SKILL.md").read_text() == "edited by hand\n"
+    # The edit is kept by adding it (to the now disabled skill), or removed.
+    ok(run("adopt", "--add", "b"))
+    copy = profiles_root / "work" / "skills" / "b" / "SKILL.md"
+    assert copy.read_text() == "edited by hand\n"
+    assert not (claude_dir / "b").exists()
+    ok(run("use", "work"))

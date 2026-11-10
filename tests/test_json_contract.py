@@ -178,3 +178,53 @@ def test_change_commands_list_unknown_entries_under_unresolved(run, work, comman
 
     assert unresolved_paths(data) == [str(work)]
     assert data["warnings"] == []
+
+
+# No command prints an undocumented null, on success or failure.
+
+
+def test_no_undocumented_nulls_in_any_local_command(
+    run, work, respec_home, claude_dir, tmp_path, assert_no_nulls
+):
+    source = tmp_path / "src" / "extra"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("# extra\n")
+    drop_skill(claude_dir, "zzz")
+    commands = [
+        ("profile", "new", "third", "-t", "agents"),
+        ("profile", "list"),
+        ("profile", "show", "work"),
+        ("status",),
+        ("add", str(source)),
+        ("disable", "extra"),
+        ("enable", "extra"),
+        ("remove", "extra"),
+        ("layer", "add", "lay", "--exclusive", "-d", "L"),
+        ("layer", "list"),
+        ("layer", "show", "lay"),
+        ("layer", "use", "lay", "tdd"),
+        ("layer", "remove-skill", "lay", "tdd"),
+        ("layer", "repair", "lay"),
+        ("layer", "off", "lay"),
+        ("layer", "rm", "lay"),
+        ("adopt",),
+        ("adopt", "--add", "stray"),
+        ("adopt", "--remove", "zzz"),
+        ("use", "other"),
+        ("update",),
+        ("update", "--check"),
+        ("restore", "--list"),
+    ]
+    for command in commands:
+        assert_no_nulls(payload(run(*command, "--json")))
+
+
+def test_no_undocumented_nulls_in_failures_or_restore(
+    run, work, claude_dir, assert_no_nulls
+):
+    blocking = drop_skill(claude_dir, "lint")
+    assert_no_nulls(payload(run("use", "other", "--json"), code=1))
+    assert_no_nulls(payload(run("adopt", "--add", "nosuch", "--json"), code=1))
+    assert_no_nulls(payload(run("restore", "--json"), code=1))
+    assert blocking.exists()
+    assert_no_nulls(payload(run("restore", "--unknown", "remove", "--json")))

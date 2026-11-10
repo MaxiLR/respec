@@ -19,7 +19,9 @@ every path it creates, and hand edits make its record disagree with disk.
   objects carry a `warnings` list; each warning has a `type`
   (`layer-conflict`) and a `message`. Unknown entries still waiting for a
   decision are listed under `unresolved`; entries a command resolved are
-  under `resolved`.
+  under `resolved`. Fields that do not apply are left out; only
+  `active_profile`, `previous_profile`, `same_as` and values under `restored`
+  can be `null` (meaning none).
 - Exit code 0 means done; 1 means refused or failed. `use`, `adopt` and
   `restore` then print their usual JSON keys plus `error`; other commands
   print the reason on stderr. A refused command changes nothing unless its
@@ -104,8 +106,9 @@ yet). Skills outside layers, and skills of a layer turned off, are additive.
   exclusive layer with several enabled skills (for example after a hand edit):
   keep one, disable the rest. Without `--keep`, a terminal asks; other runs
   keep the first listed skill. `respec use` refuses a profile with such a
-  conflict until it is repaired. A repair goes ahead while unknown entries of
-  other skills wait for `respec adopt`.
+  conflict until it is repaired. A repair goes ahead while unknown entries
+  (even an edited copy of a skill in that layer) wait for `respec adopt`; it
+  never touches them.
 
 ### Unknown entries (adopt)
 

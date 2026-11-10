@@ -339,14 +339,13 @@ def repair(
     )
     try:
         return _apply(respec_home, user_home, before, after, change)
-    except switch.UnknownEntries as error:
-        # The full refresh is refused (profile.yaml is back as it was). When no
-        # entry in the way belongs to a skill this repair changes, only those
-        # skills' links need to change, so the repair goes ahead without the
-        # refresh and the entries keep waiting for 'respec adopt'.
-        if not change.active or any(
-            entry.name == keep or entry.name in disabled for entry in error.entries
-        ):
+    except switch.UnknownEntries:
+        # The full refresh is refused by unknown entries (profile.yaml is back
+        # as it was). A repair only disables skills, so it goes ahead without
+        # the refresh: it changes only links respec manages and never touches
+        # an unknown entry, which keeps waiting for 'respec adopt' (an edited
+        # copy of a layer skill included).
+        if not change.active:
             raise
     return _repair_links(respec_home, user_home, after, change)
 
@@ -358,8 +357,10 @@ def _repair_links(
     change: LayerChange,
 ) -> LayerChange:
     """Save a repair of the active profile and change only the links of its
-    skills: unlink the disabled ones and link the kept one. Unknown entries
-    elsewhere are left for 'respec adopt'."""
+    skills: unlink the disabled ones and link the kept one. Only paths that
+    still hold what respec placed are removed, and only free paths are linked;
+    unknown entries (also at those skills' paths) are left for 'respec adopt'.
+    """
     profiles.save_profile(after)
     state = load_state(respec_home)
     try:
@@ -370,15 +371,15 @@ def _repair_links(
                 state.installed.remove(item)
                 change.unlinked.append(item.path)
                 save_state(respec_home, state)
-    except OSError as error:
+        assert change.skill is not None
+        change.linked = switch.link_skills(
+            respec_home, user_home, after.name, [change.skill]
+        ).linked
+    except (OSError, RespecError) as error:
         raise RespecError(
             f"repair of layer {change.layer!r} did not complete: {error}\n"
-            f"Profile {change.profile!r} keeps the repair; the links removed so "
+            f"Profile {change.profile!r} keeps the repair; the links changed so "
             "far are recorded, and the next 'respec use' puts the rest in line."
         ) from None
-    assert change.skill is not None
-    change.linked = switch.link_skills(
-        respec_home, user_home, after.name, [change.skill]
-    ).linked
     change.unlinked.sort()
     return change
