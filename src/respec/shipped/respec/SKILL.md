@@ -72,8 +72,9 @@ Every enabled skill of a profile goes to all of that profile's targets.
   is deleted: its folder (`profile.yaml` and its skills) moves to
   `~/.respec/removed-profiles/<timestamp>/<name>/`, reported as `backup`; move
   it back to `~/.respec/profiles/<name>/` to restore it. Refused for the active
-  profile (`respec use <other>` first, or `respec restore`) and while an
-  interrupted change waits (`respec recover` first).
+  profile or one whose skills are still linked (`respec use <other>` first,
+  or `respec restore`) and while an interrupted change waits (`respec recover`
+  first). Profile names are case-sensitive.
 - `respec use <profile> [--unknown add|remove]`: activate a profile.
 - `respec status`: active profile, its targets, and the managed skills in
   each folder respec owns (each marked by `origin`: `profile`, `shipped` or

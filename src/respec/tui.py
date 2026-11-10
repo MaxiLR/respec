@@ -1597,7 +1597,10 @@ class RespecApp(App[None]):
 
     def _update_activate(self) -> None:
         self.query_one("#edit", Button).disabled = self.selected is None
-        self.query_one("#remove", Button).disabled = self.selected is None
+        # The active profile cannot be removed; say so before asking.
+        self.query_one("#remove", Button).disabled = (
+            self.selected is None or self.selected == self.active
+        )
         button = self.query_one("#activate", Button)
         button.disabled = self.selected is None or self.selected == self.active
         button.label = (
@@ -1663,6 +1666,13 @@ class RespecApp(App[None]):
         if name is None:
             self.show_feedback("Select a profile to remove first.", ok=False)
             return
+        if name == self.active:
+            self.show_feedback(
+                f"Profile {name!r} is active, so it cannot be removed. Activate "
+                "another profile first (or undo respec with 'respec restore').",
+                ok=False,
+            )
+            return
 
         def confirmed(sure: bool | None) -> None:
             if not sure:
@@ -1670,7 +1680,9 @@ class RespecApp(App[None]):
             try:
                 removed = _changing(
                     self.respec_home,
-                    lambda: removal.remove_profile(self.respec_home, name),
+                    lambda: removal.remove_profile(
+                        self.respec_home, name, self.user_home
+                    ),
                 )
             except FAILURES as problem:
                 self.show_feedback(f"error: {_one_line(problem)}", ok=False)

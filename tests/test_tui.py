@@ -632,13 +632,16 @@ def test_removing_the_active_profile_is_refused(
 ):
     async def scenario(app, pilot):
         await select(app, pilot, "alpha")
+        assert app.query_one("#remove").disabled
         await pilot.press("d")
         await pilot.pause()
-        await pilot.click("#remove-confirm")
-        await pilot.pause()
+        # Refused before any confirmation is asked for.
+        assert not app.screen.query("#remove-question")
         feedback = text_of(app.query_one("#feedback"))
-        assert "active" in feedback and "respec use" in feedback
+        assert "active" in feedback and "Activate another profile" in feedback
         assert app.query("#profile-alpha")
+        await select(app, pilot, "beta")
+        assert not app.query_one("#remove").disabled
 
     drive(isolated_homes, scenario)
 

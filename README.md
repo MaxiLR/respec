@@ -53,11 +53,16 @@ once; the profile is then owned locally and its skills keep their own sources.
 (`profile.yaml` and its skills) in one rename to
 `~/.respec/removed-profiles/<timestamp>/<name>/` and prints that path (`backup`
 with `--json`). To get the profile back, move that folder to
-`~/.respec/profiles/<name>/`. It refuses the active profile (switch first with
-`respec use <other>`, or undo respec with `respec restore`), an unknown or
-invalid name, and an interrupted change that still waits (run `respec recover`
-first); each refusal changes nothing. A kill leaves the profile either in place
-or complete in its backup.
+`~/.respec/profiles/<name>/`; `restore` never does this, and nothing prunes
+`removed-profiles/`. It refuses the active profile (switch first with
+`respec use <other>`, or undo respec with `respec restore`), a profile whose
+skills are still linked into a target folder (possible after `respec recover`
+rebuilt `state.json`), an unknown or invalid name, and an interrupted change
+that still waits (run `respec recover` first); each refusal changes nothing.
+Profile names are case-sensitive in every command, also on a case-insensitive
+file system: `WORK` does not name the profile `work`. A kill leaves the profile
+either in place or complete in its backup; the empty timestamp folder a kill
+can leave is removed by the next `profile remove`.
 
 `respec use` links every enabled skill of the profile into each of its targets'
 folders (symlinks, or copies where symlinking fails) and records every created

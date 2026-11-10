@@ -1703,7 +1703,7 @@ def profile_remove(
     homes = _homes(ctx)
     _hold_lock(homes, as_json, {"name": name})
     try:
-        removed = removal.remove_profile(homes.respec_home, name)
+        removed = removal.remove_profile(homes.respec_home, name, homes.user_home)
     except RespecError as error:
         if as_json:
             _failure.append(str(error))
