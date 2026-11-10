@@ -228,3 +228,65 @@ def test_no_undocumented_nulls_in_failures_or_restore(
     assert_no_nulls(payload(run("restore", "--json"), code=1))
     assert blocking.exists()
     assert_no_nulls(payload(run("restore", "--unknown", "remove", "--json")))
+
+
+# What a command changing things prints with --json while another respec holds
+# the lock: use, adopt, restore and recover give their usual keys (empty, as
+# nothing was done) plus error; every other command gives error and warnings.
+BUSY_SHAPES = [
+    (("add", "/nowhere"), {"error", "warnings"}),
+    (("remove", "tdd"), {"error", "warnings"}),
+    (("enable", "tdd"), {"error", "warnings"}),
+    (("disable", "tdd"), {"error", "warnings"}),
+    (("update",), {"error", "warnings"}),
+    (("layer", "add", "x", "--additive", "-d", "x"), {"error", "warnings"}),
+    (("layer", "rm", "x"), {"error", "warnings"}),
+    (("layer", "use", "x", "tdd"), {"error", "warnings"}),
+    (("layer", "add-skill", "x", "tdd"), {"error", "warnings"}),
+    (("layer", "remove-skill", "x", "tdd"), {"error", "warnings"}),
+    (("layer", "enable", "x"), {"error", "warnings"}),
+    (("layer", "disable", "x"), {"error", "warnings"}),
+    (("layer", "on", "x"), {"error", "warnings"}),
+    (("layer", "off", "x"), {"error", "warnings"}),
+    (("layer", "repair", "x"), {"error", "warnings"}),
+    (("profile", "new", "n", "-t", "agents"), {"error", "warnings"}),
+    (("profile", "install", "acme/x"), {"error", "warnings"}),
+    (
+        ("use", "other"),
+        {
+            "active_profile",
+            "previous_profile",
+            "backups",
+            "removed",
+            "installed",
+            "resolved",
+            "linked",
+            "unresolved",
+            "warnings",
+            "error",
+        },
+    ),
+    (("adopt", "--all", "remove"), {"resolved", "linked", "unresolved", "warnings"}),
+    (("restore",), RESTORE_KEYS | {"error"}),
+    (("restore", "--release-only"), RESTORE_KEYS | {"kept", "error"}),
+    (("recover",), {"active_profile", "recovered", "warnings", "error"}),
+]
+
+
+def test_a_change_refused_while_another_respec_runs_prints_the_documented_json(
+    run, work, holder, monkeypatch, assert_no_nulls
+):
+    from respec import lock
+
+    monkeypatch.setattr(lock, "WAIT", 0.05)
+    holder("links:begin", "disable", "tdd")
+
+    for args, keys in BUSY_SHAPES:
+        result = run(*args, "--json")
+        assert result.exit_code == 1, (args, result.output)
+        data = assert_no_nulls(json.loads(result.stdout))
+        assert set(data) == keys | {"error"}, args
+        assert "another respec is running" in data["error"], args
+        assert data["warnings"] == [], args
+        for key in keys - {"error", "warnings", "active_profile", "recovered"}:
+            assert not data[key], (args, key)

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import os
 import pwd
+import subprocess
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -201,3 +204,82 @@ def killed(request):
         return False
 
     return kill
+
+
+# Runs the CLI in a child process that stops at the checkpoint ``point`` (a
+# step boundary inside its change, so after it took whatever it holds), says
+# so by creating ``held`` and waits there until ``release`` exists.
+HOLD_SCRIPT = """
+import os, sys, time
+from pathlib import Path
+from respec import global_skills, journal
+if os.environ.get("RESPEC_TEST_NO_SHIPPED"):
+    global_skills.shipped_names = lambda: ()
+held, release, point = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+def fault(name):
+    if name == point:
+        held.touch()
+        while not release.exists():
+            time.sleep(0.01)
+journal._fault = fault
+from respec.cli import app
+app(sys.argv[4:])
+"""
+
+
+def _child_env(request):
+    env = os.environ.copy()  # read now: a test may move the homes
+    if request.node.get_closest_marker("shipped") is None:
+        env["RESPEC_TEST_NO_SHIPPED"] = "1"
+    return env
+
+
+class Holder:
+    """A respec command paused inside its change, in another process."""
+
+    def __init__(self, tmp_path, request, point, *args):
+        self.held = tmp_path / "held"
+        self.release_file = tmp_path / "release"
+        self.process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                HOLD_SCRIPT,
+                str(self.held),
+                str(self.release_file),
+                point,
+                *args,
+            ],
+            env=_child_env(request),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 60
+        while not self.held.exists():
+            assert self.process.poll() is None, self.process.communicate()
+            assert time.monotonic() < deadline, "the holder never reached its point"
+            time.sleep(0.01)
+
+    def finish(self):
+        self.release_file.touch()
+        out, err = self.process.communicate(timeout=60)
+        return self.process.returncode, out, err
+
+    def kill(self):
+        if self.process.poll() is None:
+            self.process.kill()
+            self.process.communicate()
+
+
+@pytest.fixture
+def holder(tmp_path, request):
+    started = []
+
+    def start(point, *args):
+        started.append(Holder(tmp_path, request, point, *args))
+        return started[-1]
+
+    yield start
+    for running in started:
+        running.kill()

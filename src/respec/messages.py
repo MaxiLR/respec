@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from respec import items, layers, profiles, sources
+from respec.state import Installed
 
 
 def source_label(source: profiles.Source) -> str:
@@ -20,6 +22,24 @@ def source_label(source: profiles.Source) -> str:
 def short(commit: str | None) -> str:
     """A commit for messages; skills installed without one show as unknown."""
     return commit[:12] if commit else "unknown"
+
+
+def plural(count: int, one: str, many: str | None = None) -> str:
+    """``1 skill``, ``2 skills``."""
+    return f"{count} {one if count == 1 else many or one + 's'}"
+
+
+def skills_placed(entries: Sequence[Installed]) -> str:
+    """How many skills ``entries`` (records of what respec placed, one per
+    target folder) hold, and how many links and copies that took:
+    ``2 skills (4 links)``."""
+    links = sum(entry.mode == "symlink" for entry in entries)
+    copies = len(entries) - links
+    parts = [plural(links, "link")] if links else []
+    if copies:
+        parts.append(plural(copies, "copy", "copies"))
+    skills = plural(len({entry.name for entry in entries}), "skill")
+    return f"{skills} ({', '.join(parts)})" if parts else skills
 
 
 def link_lines(change: Any) -> list[str]:

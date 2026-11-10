@@ -1322,6 +1322,22 @@ def test_a_corrupt_takeover_log_is_kept_and_reported_before_a_new_takeover(
     assert [r["target"] for r in log["records"]] == ["agents"]
 
 
+def test_status_warns_about_a_corrupt_takeover_log_and_leaves_it(run, isolated_homes):
+    respec_home = isolated_homes.respec_home
+    make_profile(respec_home, "one", ["claude-code"], ["tdd"])
+    assert run("use", "one").exit_code == 0
+    takeover_log(respec_home).write_text("{ damaged")
+
+    data = payload(run("status", "--json"))
+    text = run("status")
+
+    (warning,) = [w for w in data["warnings"] if w["type"] == "unreadable-takeover-log"]
+    assert warning["path"] == str(takeover_log(respec_home))
+    assert text.exit_code == 0, text.output
+    assert "warning:" in text.stderr and "takeovers.json" in text.stderr
+    assert takeover_log(respec_home).read_text() == "{ damaged"
+
+
 def test_a_corrupt_takeover_log_is_kept_before_a_restore_rewrites_it(
     run, isolated_homes
 ):

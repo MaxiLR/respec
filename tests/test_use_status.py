@@ -436,3 +436,20 @@ def test_failed_backup_leaves_no_partial_backup_and_no_changes(
     assert not backups.exists() or list(backups.iterdir()) == []
     assert not (isolated_homes.respec_home / "state.json").exists()
     assert not (dirs["claude-code"] / "tdd").exists()
+
+
+def test_use_reports_skills_and_links_separately_with_plurals(
+    run, isolated_homes, dirs
+):
+    home = isolated_homes.respec_home
+    make_profile(home, "a", ["claude-code", "agents"], {"tdd": True, "lint": True})
+    make_profile(home, "b", ["claude-code"], {"solo": True})
+
+    first = run("use", "a")
+    second = run("use", "b")
+
+    assert first.exit_code == 0, first.output
+    assert "installed 2 skills (4 links)" in first.stdout
+    assert second.exit_code == 0, second.output
+    assert "Removed 2 skills (4 links) of profile 'a'" in second.stdout
+    assert "installed 1 skill (1 link)" in second.stdout

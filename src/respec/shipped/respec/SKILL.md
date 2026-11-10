@@ -30,6 +30,13 @@ every path it creates, and hand edits make its record disagree with disk.
   JSON keys plus `error`; other commands, and a refused combination of
   options, print the reason on stderr. A refused command changes nothing unless its
   output reports what it already did.
+- Only one respec changes things at a time. A change started while another
+  respec (a command, a prompt waiting for an answer, or the TUI) is changing
+  things waits up to a second, then exits 1 with `another respec is running`
+  and changes nothing; with `--json`, `use`, `adopt`, `restore` and `recover`
+  print their usual keys plus `error`, every other command prints only
+  `error` and `warnings`. Retry once the other run has finished. Commands that
+  only read never wait.
 - Commands that change a profile take `-p <profile>`; without it they change
   the active profile.
 - Only global skills belong in respec. Project-scoped content (a project's

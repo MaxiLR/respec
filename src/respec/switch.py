@@ -814,8 +814,10 @@ def _kept(
 def status(respec_home: Path) -> dict[str, object]:
     """Active profile, its targets, the skills respec placed in each folder
     (each with its ``origin``: ``profile``, ``shipped`` or ``global``) and the
-    unknown entries still waiting for a decision (``unresolved``)."""
+    unknown entries still waiting for a decision (``unresolved``). A
+    takeover log that cannot be read is reported (:func:`takeovers.inspect`)."""
     state = load_state(respec_home)
+    takeovers.inspect(respec_home)
     active_targets: list[str] = []
     if state.active_profile is not None:
         try:

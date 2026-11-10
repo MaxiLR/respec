@@ -164,6 +164,29 @@ def test_toggle_refused_by_an_unknown_entry_leaves_the_profile_unchanged(
     assert (claude_dir / "s1" / "SKILL.md").read_text() == "foreign\n"
 
 
+def test_toggle_while_another_respec_changes_skills_is_refused_cleanly(
+    isolated_homes, respec_home, work, claude_dir, holder
+):
+    other = holder("links:begin", "disable", "s2")
+
+    async def scenario(app, pilot):
+        await open_editor(app, pilot, "work")
+        await pilot.click("#toggle-s1")
+        await pilot.pause()
+        feedback = text_of(app.screen.query_one("#editor-feedback"))
+        assert "another respec is running" in feedback
+        assert "interrupted" not in feedback
+
+    drive(isolated_homes, scenario)
+
+    # The other process stopped before it saved; the TUI changed nothing.
+    assert enabled(respec_home, "work") == {"s1", "s2"}
+    code, out, err = other.finish()
+    assert code == 0, out + err
+    assert enabled(respec_home, "work") == {"s1"}
+    assert linked(claude_dir) == {"s1"}
+
+
 # --- layers ----------------------------------------------------------------
 
 

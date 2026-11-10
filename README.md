@@ -24,7 +24,7 @@ respec profile install owner/repo[#path] [--name mine]  # copy a whole profile o
 
 `add`, `remove`, `enable` and `disable` change the active profile unless `-p`
 names another. When the changed profile is active, its target folders are
-refreshed right away. Every command accepts `--json`.
+refreshed right away. Every command except `tui` accepts `--json`.
 
 `add` also takes `owner/repo[#path]` (resolved against `RESPEC_GIT_BASE_URL`,
 default `https://github.com`) or a git URL with an optional `#path`; an
@@ -228,7 +228,33 @@ After a power loss:
   rebuilt or rewritten: every command that needs it says so and changes
   nothing. A `takeovers.json` that cannot be read is reported
   (`unreadable-takeover-log`) and moved to a new backup run before respec
-  writes a new log.
+  writes a new log. `respec status` reports one too, and leaves it as it is.
+
+### Running two at once
+
+Only one respec changes things at a time. Every command that changes skills,
+profiles, layers, takeovers or backups (`use`, `add`, `remove`, `enable`,
+`disable`, `update`, the `layer` changes, `adopt`, `restore`, `recover`,
+`profile new` and `profile install`), and every change made in the TUI, holds
+a lock on `~/.respec/.lock` while it runs, including while it waits for an
+answer at a prompt (the answer decides part of a change that has already
+started, so the lock cannot be let go in between). Another one, in another
+process or another thread, waits up to a second for it, then fails with
+`another respec is running`, exit code 1, and changes nothing. With `--json`
+it then prints on stdout:
+
+- `use`, `adopt`, `restore` (also `--release-only`) and `recover`: their usual
+  keys, empty or as on disk (nothing was done), plus `error`;
+- every other command: only `error` and `warnings`.
+
+Commands that only read (`status`, `profile list` and `show`, `layer list` and
+`show`, `update --check`, `restore --list`) never wait for it, and while
+another respec holds it they do not report its change as interrupted: it is
+still running. The lock belongs to the running process, so the system
+releases it when that process ends, also when it is killed; a kill never
+leaves a stale lock behind (the journal then reports the change as
+interrupted, as above). The next command that takes the lock also removes the
+temporary `state.json` files such a kill can leave in `~/.respec`.
 
 ### TUI
 
@@ -341,14 +367,19 @@ Every `--json` output that is an object uses one vocabulary:
   (also `--release-only`, which adds `kept`) and `recover` then print every
   other key of their success output too, filled with what was done before the
   failure (`recover` gives `active_profile` and `recovered: false`). Other
-  commands, and a refused combination of options (such as `restore --list
---release-only`), print their error on stderr only.
+  commands print their error on stderr only, with one exception: refused
+  because another respec is running, they print `error` and `warnings` on
+  stdout (see [Running two at once](#running-two-at-once)). A refused
+  combination of options (such as `restore --list --release-only`) prints its
+  error on stderr only.
 
 A field that does not apply is left out rather than given as `null`: for
 example a resolved entry has `profile` only when it was added and `backup`
 only when it was removed, a linked skill has no `digest`, a layer change has
 `skill` only when it names one, a skill without a git source has no `source`,
-and `restore` gives `backup` only when a backup run was named. Only these
+and `restore` gives `backup` only when a backup run was named. A change of a
+profile (`add`, `remove`, `enable`, `disable`, `update`) gives `active`:
+whether that profile is the active one. Only these
 fields can be `null`, each meaning "none": `active_profile` and
 `previous_profile` (no profile), `same_as` (the folder is not shared with
 another target) and a value under `restored` (that folder did not exist at

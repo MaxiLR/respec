@@ -374,6 +374,30 @@ def test_update_refreshes_links_of_active_profile(
     assert recorded == ["lint", "mine", "tdd"]
 
 
+def test_update_json_says_the_profile_is_active_also_when_nothing_changed(
+    run, sourced, profiles_root
+):
+    ok(run("use", "work"))
+    (profiles_root / "work" / "skills" / "tdd" / "SKILL.md").write_text("# edit\n")
+    sourced.write("tdd/SKILL.md", "# tdd v2\n")
+    sourced.commit()
+
+    skipped = json.loads(ok(run("update", "tdd", "--json")).output)
+    ok(run("update", "lint"))
+    current = json.loads(ok(run("update", "lint", "--json")).output)
+
+    assert skipped["skills"][0]["result"] == "skipped-local-edits"
+    assert skipped["active"] is True
+    assert current["skills"][0]["result"] == "up-to-date"
+    assert current["active"] is True
+
+
+def test_update_json_says_an_inactive_profile_is_not_active(run, sourced):
+    data = json.loads(ok(run("update", "-p", "work", "--json")).output)
+
+    assert data["active"] is False
+
+
 def test_check_reports_local_edits(run, sourced, profiles_root):
     (profiles_root / "work" / "skills" / "tdd" / "SKILL.md").write_text("# edited\n")
 
@@ -511,6 +535,22 @@ def test_profile_install_copies_whole_profile(
     assert not (folder / ".git").exists()
     shown = json.loads(ok(run("profile", "show", "modpack", "--json")).output)
     assert {row["name"] for row in shown["skills"]} == {"tdd", "house"}
+
+
+def test_profile_install_counts_one_skill_in_the_singular(run, upstream):
+    pack = upstream("acme/solo")
+    pack.write(
+        "profile.yaml",
+        yaml.safe_dump(
+            {"targets": ["claude-code"], "skills": {"only": {"enabled": True}}}
+        ),
+    )
+    pack.write("skills/only/SKILL.md", "# only\n")
+    pack.commit()
+
+    result = ok(run("profile", "install", "acme/solo"))
+
+    assert "(1 skill)" in result.stdout
 
 
 def test_profile_install_with_name_and_then_owned_locally(
