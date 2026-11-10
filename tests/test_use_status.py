@@ -36,6 +36,12 @@ def tree(folder):
     return result
 
 
+def backed_up(run_dir):
+    """A backup run's copied folders, without its manifest.json (which records
+    the takeover, see test_journal.py)."""
+    return {k: v for k, v in tree(run_dir).items() if k != "manifest.json"}
+
+
 @pytest.fixture
 def dirs(isolated_homes):
     home = isolated_homes.home
@@ -159,7 +165,7 @@ def test_folder_is_backed_up_only_on_first_takeover(run, isolated_homes, dirs):
 
     backups = isolated_homes.respec_home / "backups"
     [backup_run] = list(backups.iterdir())
-    assert tree(backup_run) == {
+    assert backed_up(backup_run) == {
         "claude-code/": None,
         "claude-code/loose.txt": "loose\n",
     }
@@ -183,7 +189,7 @@ def test_backups_taken_in_the_same_second_do_not_collide(
 
     runs = sorted((isolated_homes.respec_home / "backups").iterdir())
     assert len(runs) == 2
-    contents = [tree(run_dir) for run_dir in runs]
+    contents = [backed_up(run_dir) for run_dir in runs]
     assert {"claude-code/": None, "claude-code/first.txt": "first\n"} in contents
     assert {"oh-my-pi/": None, "oh-my-pi/second.txt": "second\n"} in contents
 
