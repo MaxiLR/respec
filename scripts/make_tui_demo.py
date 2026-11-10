@@ -17,7 +17,6 @@ import asyncio
 import html
 import os
 import re
-import shutil
 import tempfile
 from pathlib import Path
 
@@ -51,23 +50,32 @@ STEPS: list[tuple[tuple[str, ...], float]] = [
 ]
 
 
-def build_home(home: Path) -> None:
-    """Create the made-up skills and profiles through respec itself."""
-    from respec import items, profiles, switch
+def respec(*args: str) -> None:
+    """Run one respec command in this process; stop on a failure."""
+    from typer.testing import CliRunner
 
-    library = home / "skills-library"
-    respec_home = home / ".respec"
+    from respec.cli import app
+
+    result = CliRunner().invoke(app, list(args))
+    if result.exit_code != 0:
+        raise SystemExit(f"respec {' '.join(args)} failed:\n{result.output}")
+
+
+def build_home(home: Path) -> None:
+    """Write made-up profiles in ``dev-setup/`` and install them with respec."""
     for name, (targets, skills) in PROFILES.items():
-        profiles.create_profile(respec_home, name, targets)
+        source = home / "dev-setup" / name
         for skill in skills:
-            folder = library / skill
-            folder.mkdir(parents=True, exist_ok=True)
+            folder = source / "skills" / skill
+            folder.mkdir(parents=True)
             (folder / "SKILL.md").write_text(
                 f"---\nname: {skill}\ndescription: Demo skill.\n---\n\n# {skill}\n"
             )
-            items.add(respec_home, home, folder, profile_name=name)
-    switch.use(respec_home, home, "coding")
-    shutil.rmtree(library)
+        lines = ["targets:", *(f"  - {target}" for target in targets), "skills:"]
+        lines += [f"  {skill}:\n    enabled: true" for skill in skills]
+        (source / "profile.yaml").write_text("\n".join(lines) + "\n")
+        respec("profile", "install", str(source))
+    respec("use", "coding")
 
 
 async def record(home: Path) -> list[str]:
