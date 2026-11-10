@@ -380,3 +380,29 @@ def test_refused_change_restores_legacy_file_bytes(run, work, profiles_root):
 
     fails(run("disable", "a"))
     assert file.read_bytes() == original
+
+
+def test_layer_use_json_lists_the_skill_it_disabled(run, work):
+    ok(run("layer", "use", "design-principles", "a"))
+    ok(run("layer", "add-skill", "design-principles", "b"))
+
+    change = json.loads(
+        ok(run("layer", "use", "design-principles", "b", "--json")).stdout
+    )
+
+    assert change["disabled"] == ["a"]
+
+
+def test_restoring_an_edited_copy_writes_the_copy_not_the_loaded_bytes(
+    work, profiles_root, isolated_homes
+):
+    import dataclasses
+
+    from respec import profiles
+
+    loaded = profiles.load_profile(isolated_homes.respec_home, "work")
+    copy = dataclasses.replace(loaded, targets=["agents"])
+
+    profiles.restore_profile(copy)
+
+    assert read_yaml(profiles_root)["targets"] == ["agents"]

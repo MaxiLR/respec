@@ -73,6 +73,14 @@ def _apply(
     change: LayerChange,
 ) -> LayerChange:
     change.active = load_state(respec_home).active_profile == before.name
+    if not change.disabled:
+        change.disabled = [
+            skill
+            for skill, entry in before.skills.items()
+            if entry.enabled
+            and skill in after.skills
+            and not after.skills[skill].enabled
+        ]
     if after != before:
         items.commit(respec_home, user_home, before, after, change)
     return change

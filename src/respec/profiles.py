@@ -145,7 +145,9 @@ class Profile:
     skills: dict[str, SkillEntry] = field(default_factory=dict)
     layers: dict[str, Layer] = field(default_factory=builtin_layers)
     # The exact text this profile was loaded from, for byte-exact rollback.
-    loaded_text: str | None = field(default=None, compare=False, repr=False)
+    # ``init=False``: ``dataclasses.replace`` never copies it, so an edited
+    # copy of a loaded profile cannot roll back to the original's bytes.
+    loaded_text: str | None = field(default=None, init=False, compare=False, repr=False)
 
     def to_yaml_data(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -226,20 +228,22 @@ def exclusivity_problems(profile: Profile) -> list[str]:
     return [conflict.message for conflict in exclusivity_conflicts(profile)]
 
 
-# Profiles read by load_profile since the last take_warnings(), in load order.
-_loaded: dict[tuple[Path, str], None] = {}
+# Profile folders read or written since the last take_warnings(), in order.
+_touched: dict[tuple[Path, str], None] = {}
 
 
 def peek_warnings() -> list[LayerConflict]:
-    """Conflicts of every profile loaded so far, as the profiles are now.
+    """Conflicts of every profile read or written so far, as they are on disk.
 
-    Each profile is read again, so a command that fixed (or caused) a conflict
-    reports the state it left behind. Profiles that no longer load are skipped.
+    Every profile that :func:`load_profile` read or :func:`save_profile` /
+    :func:`restore_profile` wrote (created and installed profiles included) is
+    read again, so a command reports the state it left behind. Profiles that
+    no longer load are skipped.
     """
     found: list[LayerConflict] = []
-    for respec_home, name in _loaded:
+    for folder, name in list(_touched):
         try:
-            profile = _read_profile(respec_home, name)
+            profile = _read_folder(name, folder)
         except RespecError:
             continue
         found.extend(exclusivity_conflicts(profile))
@@ -249,7 +253,7 @@ def peek_warnings() -> list[LayerConflict]:
 def take_warnings() -> list[LayerConflict]:
     """:func:`peek_warnings`, then forget which profiles were loaded."""
     found = peek_warnings()
-    _loaded.clear()
+    _touched.clear()
     return found
 
 
@@ -568,20 +572,19 @@ def parse_profile(name: str, folder: Path, data: Any) -> Profile:
 
 def load_profile(respec_home: Path, name: str) -> Profile:
     """Read and validate a profile; its layer conflicts become warnings."""
-    profile = _read_profile(respec_home, name)
-    _loaded[(respec_home, name)] = None
-    return profile
-
-
-def _read_profile(respec_home: Path, name: str) -> Profile:
     validate_name(name)
     folder = profiles_dir(respec_home) / name
-    file = folder / PROFILE_FILE
     if not folder.is_dir():
         raise RespecError(
             f"profile {name!r} does not exist; create it with "
             f"'respec profile new {name} --target <target>'"
         )
+    _touched[(folder, name)] = None
+    return _read_folder(name, folder)
+
+
+def _read_folder(name: str, folder: Path) -> Profile:
+    file = folder / PROFILE_FILE
     if not file.is_file():
         raise ProfileError(file, [f"{PROFILE_FILE} is missing"])
     text = file.read_text("utf-8")
@@ -589,7 +592,9 @@ def _read_profile(respec_home: Path, name: str) -> Profile:
         data = yaml.safe_load(text)
     except yaml.YAMLError as error:
         raise ProfileError(file, [f"not valid YAML: {error}"]) from None
-    return replace(parse_profile(name, folder, data), loaded_text=text)
+    profile = parse_profile(name, folder, data)
+    object.__setattr__(profile, "loaded_text", text)
+    return profile
 
 
 def list_profile_names(respec_home: Path) -> list[str]:
@@ -619,21 +624,27 @@ def create_profile(respec_home: Path, name: str, targets: list[str]) -> Profile:
     return profile
 
 
-def save_profile(profile: Profile) -> None:
-    """Write ``profile.yaml``; the only writer, atomic so a crash never truncates."""
+def _write(profile: Profile, text: str) -> None:
+    """Write ``profile.yaml`` atomically, so a crash never truncates it."""
     file = profile.path / PROFILE_FILE
     temporary = file.with_name(f".{PROFILE_FILE}.tmp")
-    text = yaml.safe_dump(profile.to_yaml_data(), sort_keys=False)
     temporary.write_text(text, "utf-8")
     os.replace(temporary, file)
+    _touched[(profile.path, profile.name)] = None
+
+
+def save_profile(profile: Profile) -> None:
+    """Write ``profile.yaml`` from ``profile``; respec's only schema writer."""
+    _write(profile, yaml.safe_dump(profile.to_yaml_data(), sort_keys=False))
 
 
 def restore_profile(profile: Profile) -> None:
-    """Undo a save: write back the exact text ``profile`` was loaded from."""
+    """Undo a save: write back the exact text ``profile`` was loaded from.
+
+    Only a profile returned by :func:`load_profile` carries that text; any
+    other (including an edited copy) is written from its own data instead.
+    """
     if profile.loaded_text is None:
         save_profile(profile)
-        return
-    file = profile.path / PROFILE_FILE
-    temporary = file.with_name(f".{PROFILE_FILE}.tmp")
-    temporary.write_text(profile.loaded_text, "utf-8")
-    os.replace(temporary, file)
+    else:
+        _write(profile, profile.loaded_text)

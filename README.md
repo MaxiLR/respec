@@ -107,13 +107,13 @@ off, are plain additive skills.
 
 In `profile.yaml` a layer lists its members under `skills:` (the older `items:`
 key is still read; respec always writes `skills:`). If a hand edit leaves an
-exclusive layer with several enabled skills, every command that reads the profile
-warns on stderr, and `respec use` refuses the profile. The warning reflects the
+exclusive layer with several enabled skills, every command that reads, creates or
+installs the profile warns on stderr, and `respec use` refuses the profile. The warning reflects the
 profile as the command left it, so a command that fixes the conflict does not
 warn. `respec layer repair <layer>` keeps one skill and disables the rest, also
 in a layer that is turned off: `--keep <skill>` picks it, a terminal asks, and
-other runs keep the first listed skill. Its `--json` output lists the others
-under `disabled`.
+other runs keep the first listed skill. The `--json` output of every `respec
+layer` change lists the skills it disabled under `disabled`.
 
 Every `--json` output that is an object has a `warnings` list, empty when there
 are no conflicts; each entry gives `profile`, `layer`, `skills`, `message` and
