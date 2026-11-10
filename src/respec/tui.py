@@ -39,6 +39,7 @@ from respec import (
     adopt,
     global_skills,
     items,
+    journal,
     layers,
     messages,
     profiles,
@@ -228,6 +229,8 @@ SyncScreen #dialog { height: 90%; }
 }
 .conflict RadioButton { background: $surface-base; margin-right: 2; }
 .section Button { margin-top: 1; }
+.section-actions { height: auto; }
+.section-actions Button { margin-right: 1; }
 """
 
 
@@ -1055,6 +1058,16 @@ class SyncScreen(ModalScreen[None]):
             await self.query_one("#sync-findings").remove_children()
             return
         report = self.report
+        if report.interrupted is not None:
+            self._summary(
+                "An interrupted change waits: finish it or roll it back before "
+                "anything else changes.",
+                clean=False,
+            )
+            findings = self.query_one("#sync-findings", Vertical)
+            await findings.remove_children()
+            await findings.mount(self._interrupted_section(report.interrupted))
+            return
         if report.clean:
             self._summary(
                 "All in sync: no unknown entries, layer conflicts or link problems.",
@@ -1102,6 +1115,20 @@ class SyncScreen(ModalScreen[None]):
         section = Vertical(id=section_id, classes="section")
         section.compose_add_child(Static(title, classes="section-title"))
         section.compose_add_child(Static(intro, classes="section-intro"))
+        return section
+
+    def _interrupted_section(self, waiting: journal.Recovery) -> Vertical:
+        section = self._section(
+            "Interrupted change",
+            "respec was stopped part way through a change. Finish it, or roll "
+            "it back; the other checks run once it is resolved.",
+            "sync-interrupted-section",
+        )
+        section.compose_add_child(Static(waiting.message, id="sync-interrupted"))
+        actions = Horizontal(classes="section-actions")
+        actions.compose_add_child(Button("Finish", id="sync-finish", variant="primary"))
+        actions.compose_add_child(Button("Roll back", id="sync-rollback"))
+        section.compose_add_child(actions)
         return section
 
     def _unknown_section(self, report: sync.SyncReport) -> Vertical:
@@ -1287,6 +1314,27 @@ class SyncScreen(ModalScreen[None]):
                 self._log(line, ok=True)
         await self.run_check()
 
+    @on(Button.Pressed, "#sync-finish")
+    async def _finish(self) -> None:
+        await self._recover(rollback=False)
+
+    @on(Button.Pressed, "#sync-rollback")
+    async def _rollback(self) -> None:
+        await self._recover(rollback=True)
+
+    async def _recover(self, rollback: bool) -> None:
+        """Finish or roll back the interrupted change (``respec recover``)."""
+        try:
+            report = journal.recover(self.respec_home, self.user_home, rollback)
+        except FAILURES as error:
+            self._log_error(error)
+        else:
+            if report is not None:
+                journal.take_reports()
+                for line in report.message.splitlines():
+                    self._log(line.strip(), ok=True)
+        await self.run_check()
+
     @on(Button.Pressed, "#sync-relink")
     async def _relink(self) -> None:
         try:
@@ -1409,6 +1457,16 @@ class RespecApp(App[None]):
             }
             self.show_feedback(f"error: {error}", ok=False)
         self.active = report["active_profile"]
+        try:
+            waiting = journal.pending(self.respec_home)
+        except RespecError:
+            waiting = None
+        if waiting is not None:
+            self.show_feedback(
+                "An interrupted change waits; open Sync (s) to finish it or roll "
+                "it back. Until then respec changes nothing else.",
+                ok=False,
+            )
         if self.active is None:
             self.query_one("#active", Static).update("No active profile")
         else:

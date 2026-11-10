@@ -41,7 +41,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import adopt, global_skills, switch, targets, trees, unknown
+from respec import adopt, global_skills, journal, switch, takeovers, targets
+from respec import trees, unknown
 from respec.errors import RespecError
 from respec.state import Installed, State, load_state, save_state
 
@@ -80,6 +81,8 @@ class RestoreResult:
     released: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)  # backup paths left out
     left: list[str] = field(default_factory=list)  # hidden, not in the backup
+    # release_only: recorded paths it could not verify as respec's, left as is.
+    kept: list[str] = field(default_factory=list)
 
 
 class RestoreBlocked(RespecError):
@@ -111,13 +114,25 @@ def list_backups(respec_home: Path) -> list[Backup]:
     found: list[Backup] = []
     for run in runs:
         held = tuple(sorted(p.name for p in run.iterdir() if p.is_dir()))
+        if not held:
+            continue  # nothing to restore (for example a damaged state.json)
+        recorded = takeovers.backup_targets(respec_home)
         takeover = tuple(
             target
-            for target, entry in state.owned.items()
-            if entry.backup is not None and Path(entry.backup).parent == run
+            for target in held
+            if run / target in recorded
+            or any(
+                entry.backup is not None and Path(entry.backup) == run / target
+                for entry in state.owned.values()
+            )
         )
         found.append(Backup(run.name, str(run), held, takeover))
     return found
+
+
+def find_run(respec_home: Path, name: str) -> Path:
+    """The backup run named ``name`` (by name or path)."""
+    return _find_run(respec_home, name)
 
 
 def _find_run(respec_home: Path, name: str) -> Path:
@@ -161,9 +176,28 @@ def _recorded_at_backup(run: Path, target: str) -> list[dict[str, object]]:
     try:
         data = json.loads(manifest.read_text("utf-8"))
         items = data["installed"].get(target, [])
-    except (OSError, ValueError, KeyError, AttributeError) as error:
-        raise RespecError(f"invalid backup manifest {manifest}: {error}") from None
+    except (OSError, ValueError, KeyError, AttributeError):
+        # Its record of respec's own copies is lost: every entry of the run
+        # is put back as the user's (nothing is left out), and it is reported.
+        if str(manifest) not in _unreadable:
+            _unreadable.append(str(manifest))
+        return []
     return [item for item in items if isinstance(item, dict)]
+
+
+# Manifests a restore could not read, reported as ``unreadable-manifest``
+# warnings by the CLI.
+_unreadable: list[str] = []
+
+
+def peek_unreadable() -> list[str]:
+    return list(_unreadable)
+
+
+def take_unreadable() -> list[str]:
+    found = list(_unreadable)
+    _unreadable.clear()
+    return found
 
 
 def _entries(
@@ -203,6 +237,19 @@ def _plan(
     }
     plans: list[FolderPlan] = []
     if run is None:
+        unknown_takeover = sorted(
+            target for target, entry in state.owned.items() if entry.takeover_unknown
+        )
+        if unknown_takeover:
+            raise RespecError(
+                "cannot restore without naming a backup: state.json was rebuilt "
+                "and respec no longer knows the takeover backup of "
+                f"{', '.join(unknown_takeover)}. Nothing was changed. Name the "
+                "backup run to put back: 'respec restore <backup>' "
+                "('respec restore --list' shows them), or let go of the folders "
+                "without putting anything back: 'respec restore --release-only' "
+                "(it removes only what it can verify as respec's)."
+            )
         for folder, group in groups.values():
             first = min(
                 group,
@@ -291,7 +338,7 @@ def _put_back(source: Path, destination: Path) -> None:
         ) from None
 
 
-def _restore_folder(plan: FolderPlan) -> None:
+def _restore_folder(respec_home: Path, plan: FolderPlan) -> None:
     folder = plan.folder
     if plan.source is None:
         if folder.is_dir() and not folder.is_symlink() and not any(folder.iterdir()):
@@ -304,7 +351,18 @@ def _restore_folder(plan: FolderPlan) -> None:
             if trees.same_entry(destination, source):
                 continue
             raise OSError(f"{destination} appeared during the restore; left as is")
+        journal.mark(
+            respec_home,
+            {
+                "step": "put-back",
+                "path": str(destination),
+                "source": str(source),
+                "target": plan.targets[0],
+            },
+        )
         _put_back(source, destination)
+        journal.checkpoint("put-back")
+        journal.mark(respec_home, None)
 
 
 def _remove_created(state: State, plans: list[FolderPlan]) -> None:
@@ -338,40 +396,44 @@ def _apply(
     result: RestoreResult,
     now: switch.Clock,
 ) -> None:
-    """Every change a restore makes to disk and ``state.json``, in order."""
-    if overwritten:
-        adopt.resolve(
-            respec_home,
-            overwritten,
-            lambda entry: "remove",
-            None,
-            now=now,
-            done=result.set_aside,
-        )
-    state = load_state(respec_home)
-    state.active_profile = None
-    save_state(respec_home, state)
-    try:
-        for item in list(state.installed):
-            if switch.remove_installed(respec_home, item):
-                result.removed.append(item)
-            state.installed.remove(item)
-            save_state(respec_home, state)
-        for plan in plans:
-            _restore_folder(plan)
-            for target in plan.targets:
-                result.restored[target] = str(plan.source) if plan.source else None
-    except OSError as error:
-        save_state(respec_home, state)
-        again = f" {result.backup}" if result.backup else ""
-        raise RespecError(
-            f"restore did not complete: {error}\n"
-            "respec's skills are removed and no profile is active; respec still "
-            f"owns its folders. Run 'respec restore{again}' again to finish."
-        ) from None
-    result.released = sorted(state.owned)
-    _remove_created(state, plans)
-    save_state(respec_home, State())
+    """Every change a restore makes to disk and ``state.json``, in order.
+
+    Journaled (see :mod:`respec.journal`): a crash part way is finished by
+    the next respec command.
+    """
+    with journal.begin(respec_home, "restore", backup=result.backup, phase="prepare"):
+        if overwritten:
+            adopt.resolve(
+                respec_home,
+                overwritten,
+                lambda entry: "remove",
+                None,
+                now=now,
+                done=result.set_aside,
+            )
+        state = load_state(respec_home)
+        state.active_profile = None
+        journal.set_phase(respec_home, "apply", state)
+        try:
+            for item in list(state.installed):
+                if switch.remove_step(respec_home, state, item):
+                    result.removed.append(item)
+            for plan in plans:
+                _restore_folder(respec_home, plan)
+                for target in plan.targets:
+                    result.restored[target] = str(plan.source) if plan.source else None
+        except OSError as error:
+            again = f" {result.backup}" if result.backup else ""
+            raise RespecError(
+                f"restore did not complete: {error}\n"
+                "respec's skills are removed and no profile is active; respec "
+                f"still owns its folders. Run 'respec restore{again}' (or any "
+                "respec command that changes skills) to finish it."
+            ) from None
+        result.released = sorted(state.owned)
+        _remove_created(state, plans)
+        takeovers.release(respec_home, state.owned)
+        save_state(respec_home, State())
 
 
 def restore(
@@ -388,6 +450,7 @@ def restore(
     Given ``progress``, that result is filled in as the restore goes and
     returned, so a caller can report what was done when it fails part way.
     """
+    journal.ready(respec_home, user_home)
     state = load_state(respec_home)
     if backup is None and not state.owned:
         raise RespecError(
@@ -414,4 +477,40 @@ def restore(
         for name in plan.skipped
     ]
     _apply(respec_home, plans, found, result, now)
+    return result
+
+
+def release_only(
+    respec_home: Path,
+    user_home: Path,
+    progress: RestoreResult | None = None,
+) -> RestoreResult:
+    """Let go of every owned folder without putting any backup back.
+
+    Removes only the recorded items that are verifiably respec's (a link into
+    its own folders, or a copy whose digest matches) and lists the others
+    under ``kept``; removes only folders respec recorded creating, once
+    empty. Backup runs stay. The way out when a takeover backup is unknown.
+    """
+    journal.ready(respec_home, user_home)
+    state = load_state(respec_home)
+    if not state.owned:
+        raise RespecError("respec owns no folders; nothing to release.")
+    result = progress if progress is not None else RestoreResult(backup=None)
+    with journal.begin(respec_home, "restore", release_only=True, phase="apply"):
+        state = load_state(respec_home)
+        state.active_profile = None
+        save_state(respec_home, state)
+        for item in list(state.installed):
+            if unknown.is_managed(respec_home, item):
+                if switch.remove_step(respec_home, state, item):
+                    result.removed.append(item)
+            else:
+                result.kept.append(item.path)
+                state.installed.remove(item)
+                save_state(respec_home, state)
+        result.released = sorted(state.owned)
+        _remove_created(state, [])
+        takeovers.release(respec_home, state.owned)
+        save_state(respec_home, State())
     return result

@@ -1438,3 +1438,563 @@ def test_git_commands_print_no_undocumented_nulls(run, upstream, assert_no_nulls
 
     for args in (("update", "--check"), ("update",), ("update", "--check")):
         assert_no_nulls(json.loads(ok(run(*args, "--json")).stdout))
+
+
+# --- interruption (see tests/test_journal.py) ------------------------------------
+
+
+class Crash(BaseException):
+    """Stands for the process being killed at a step boundary."""
+
+
+def _points(monkeypatch, action):
+    from respec import journal
+
+    seen: list[str] = []
+    monkeypatch.setattr(journal, "_fault", seen.append)
+    action()
+    monkeypatch.setattr(journal, "_fault", lambda name: None)
+    return len(seen)
+
+
+def _crash(monkeypatch, index, action):
+    from respec import journal
+
+    calls: list[str] = []
+
+    def fault(name):
+        calls.append(name)
+        if len(calls) == index:
+            raise Crash(name)
+
+    monkeypatch.setattr(journal, "_fault", fault)
+    with pytest.raises(Crash):
+        action()
+    monkeypatch.setattr(journal, "_fault", lambda name: None)
+
+
+def _fresh(tmp_path, monkeypatch, label):
+    home = tmp_path / label / "home"
+    respec_home = tmp_path / label / "respec-home"
+    home.mkdir(parents=True)
+    respec_home.mkdir()
+    for key, value in (
+        ("HOME", home),
+        ("RESPEC_HOME", respec_home),
+        ("RESPEC_USER_HOME", home),
+    ):
+        monkeypatch.setenv(key, str(value))
+    return home, respec_home
+
+
+def _recovered(run):
+    data = json.loads(ok(run("recover", "--json")).stdout)
+    (warning,) = [w for w in data["warnings"] if w["type"] == "interrupted-operation"]
+    return warning
+
+
+def _no_journal(respec_home):
+    from respec.state import load_state
+
+    return load_state(respec_home).journal is None
+
+
+def test_update_interrupted_at_every_step_rolls_back_or_finishes(
+    run, upstream, tmp_path, monkeypatch
+):
+    from respec import sources
+
+    repo = upstream("acme/skills")
+    repo.write("tdd/SKILL.md", "# tdd v1\n")
+    first = repo.commit()
+    repo.write("tdd/SKILL.md", "# tdd v2\n")
+    second = repo.commit()
+
+    def setup(label):
+        home, respec_home = _fresh(tmp_path, monkeypatch, label)
+        new_profile(run)
+        ok(run("add", "acme/skills#tdd", "-p", "work"))
+        ok(run("use", "work"))
+        # Pretend 'work' still has v1, so the update has something to apply.
+        path = respec_home / "profiles" / "work" / "profile.yaml"
+        data = yaml.safe_load(path.read_text())
+        data["skills"]["tdd"]["source"]["commit"] = first
+        path.write_text(yaml.safe_dump(data))
+        (respec_home / "profiles" / "work" / "skills" / "tdd" / "SKILL.md").write_text(
+            "# tdd v1\n"
+        )
+        return home, respec_home
+
+    def action(home, respec_home):
+        return lambda: sources.update(
+            respec_home, home, "work", overwrite_edits=lambda name: True
+        )
+
+    total = _points(monkeypatch, action(*setup("count")))
+    assert total > 4
+    outcomes = set()
+    for index in range(1, total + 1):
+        home, respec_home = setup(f"update-{index}")
+        _crash(monkeypatch, index, action(home, respec_home))
+
+        warning = _recovered(run)
+
+        outcomes.add(warning["outcome"])
+        assert _no_journal(respec_home)
+        skills = respec_home / "profiles" / "work" / "skills"
+        assert sorted(p.name for p in skills.iterdir()) == ["tdd"], index
+        text = (skills / "tdd" / "SKILL.md").read_text()
+        commit = read_yaml(respec_home / "profiles", "work")["skills"]["tdd"]
+        expected = {first: "# tdd v1\n", second: "# tdd v2\n"}
+        assert text == expected[commit["source"]["commit"]], index
+        linked = home / ".claude" / "skills" / "tdd"
+        assert linked.is_symlink() and (linked / "SKILL.md").read_text() == text
+    assert outcomes == {"rolled-back", "finished"}
+
+
+def test_add_from_git_interrupted_at_every_step_rolls_back_or_finishes(
+    run, upstream, tmp_path, monkeypatch
+):
+    from respec import sources
+
+    repo = upstream("acme/skills")
+    repo.write("skills/tdd/SKILL.md", "# tdd\n")
+    repo.write("skills/lint/SKILL.md", "# lint\n")
+    repo.commit()
+
+    def setup(label):
+        home, respec_home = _fresh(tmp_path, monkeypatch, label)
+        new_profile(run)
+        ok(run("use", "work"))
+        return home, respec_home
+
+    def action(home, respec_home):
+        return lambda: sources.add(respec_home, home, "acme/skills", "work")
+
+    total = _points(monkeypatch, action(*setup("count")))
+    assert total > 3
+    for index in range(1, total + 1):
+        home, respec_home = setup(f"add-{index}")
+        _crash(monkeypatch, index, action(home, respec_home))
+
+        warning = _recovered(run)
+
+        assert _no_journal(respec_home)
+        listed = set(read_yaml(respec_home / "profiles", "work")["skills"])
+        skills = respec_home / "profiles" / "work" / "skills"
+        assert {p.name for p in skills.iterdir()} == listed, index
+        if warning["outcome"] == "rolled-back":
+            assert listed == set(), index
+        else:
+            assert listed == {"tdd", "lint"}, index
+        claude = home / ".claude" / "skills"
+        linked = {p.name for p in claude.iterdir()} if claude.exists() else set()
+        assert linked == listed, index
+
+
+def test_profile_install_interrupted_at_every_step(
+    run, upstream, skills_repo, tmp_path, monkeypatch
+):
+    from respec import profiles, sources
+
+    make_modpack(upstream, skills_repo)
+
+    def setup(label):
+        return _fresh(tmp_path, monkeypatch, label)
+
+    def action(home, respec_home):
+        return lambda: sources.install_profile(respec_home, "acme/modpack")
+
+    total = _points(monkeypatch, action(*setup("count")))
+    assert total > 2
+    for index in range(1, total + 1):
+        home, respec_home = setup(f"install-{index}")
+        _crash(monkeypatch, index, action(home, respec_home))
+
+        warning = _recovered(run)
+
+        assert _no_journal(respec_home)
+        folder = respec_home / "profiles" / "modpack"
+        if warning["outcome"] == "rolled-back":
+            assert not folder.exists(), index
+        else:
+            profile = profiles.load_profile(respec_home, "modpack")
+            assert set(profile.skills) == {"tdd", "house"}
+
+
+# --- review 1: rollback only what the interrupted run made ------------------------
+
+
+def _unlisted_folder(respec_home):
+    folder = respec_home / "profiles" / "work" / "skills" / "up"
+    folder.mkdir(parents=True)
+    (folder / "SKILL.md").write_text("hand-placed, not listed\n")
+    return folder
+
+
+@pytest.fixture
+def up_repo(upstream):
+    repo = upstream("acme/skills")
+    repo.write("skills/up/SKILL.md", "# up v1\n")
+    repo.first = repo.commit()
+    return repo
+
+
+def test_interrupted_add_never_deletes_a_folder_it_did_not_create(
+    run, up_repo, isolated_homes, monkeypatch
+):
+    from respec import journal, sources
+
+    respec_home = isolated_homes.respec_home
+    new_profile(run)
+    folder = _unlisted_folder(respec_home)
+    _crash(
+        monkeypatch,
+        1 + 1,  # add:begin, then phase:copy
+        lambda: sources.add(respec_home, isolated_homes.home, "acme/skills", "work"),
+    )
+    assert journal.pending(respec_home) is not None
+
+    warning = _recovered(run)
+
+    assert warning["outcome"] == "rolled-back"
+    assert (folder / "SKILL.md").read_text() == "hand-placed, not listed\n"
+    assert read_yaml(respec_home / "profiles", "work")["skills"] == {}
+
+
+def test_killed_add_never_deletes_a_folder_it_did_not_create(
+    run, killed, up_repo, isolated_homes
+):
+    respec_home = isolated_homes.respec_home
+    new_profile(run)
+    folder = _unlisted_folder(respec_home)
+    assert killed("phase:copy", 1, "add", "acme/skills", "-p", "work")
+
+    warning = _recovered(run)
+
+    assert warning["outcome"] == "rolled-back"
+    assert (folder / "SKILL.md").read_text() == "hand-placed, not listed\n"
+
+
+@pytest.fixture
+def edited_with_stale_old(run, upstream, isolated_homes):
+    """'work' has sourced 'up' with local edits, an unrelated stale '.up.old'
+    and a newer upstream commit."""
+    repo = upstream("acme/skills")
+    repo.write("skills/up/SKILL.md", "# up v1\n")
+    repo.first = repo.commit()
+    new_profile(run)
+    ok(run("add", "acme/skills#skills/up", "-p", "work"))
+    repo.write("skills/up/SKILL.md", "# up v2\n")
+    repo.second = repo.commit()
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    (skills / "up" / "SKILL.md").write_text("USER-EDIT\n")
+    (skills / ".up.old").mkdir()
+    (skills / ".up.old" / "SKILL.md").write_text("stale\n")
+    return skills
+
+
+def test_interrupted_update_never_restores_a_stale_old_copy(
+    run, edited_with_stale_old, isolated_homes, monkeypatch
+):
+    from respec import sources
+
+    skills = edited_with_stale_old
+    _crash(
+        monkeypatch,
+        1,  # update:begin
+        lambda: sources.update(isolated_homes.respec_home, isolated_homes.home, "work"),
+    )
+
+    _recovered(run)
+
+    assert (skills / "up" / "SKILL.md").read_text() == "USER-EDIT\n"
+    assert (skills / ".up.old" / "SKILL.md").read_text() == "stale\n"
+
+
+def test_killed_update_never_restores_a_stale_old_copy(
+    run, killed, edited_with_stale_old, isolated_homes
+):
+    skills = edited_with_stale_old
+    assert killed("update:begin", 1, "update", "-p", "work")
+
+    warning = _recovered(run)
+
+    assert (skills / "up" / "SKILL.md").read_text() == "USER-EDIT\n"
+    assert (skills / ".up.old" / "SKILL.md").read_text() == "stale\n"
+    assert str(skills / ".up.old") in warning["message"]
+
+
+def test_update_killed_after_saving_profile_yaml_is_finished_consistently(
+    run, killed, upstream, isolated_homes
+):
+    respec_home = isolated_homes.respec_home
+    repo = upstream("acme/skills")
+    repo.write("skills/up/SKILL.md", "# up v1\n")
+    first = repo.commit()
+    new_profile(run)
+    ok(run("add", "acme/skills#skills/up", "-p", "work"))
+    ok(run("use", "work"))
+    repo.write("skills/up/SKILL.md", "# up v2\n")
+    second = repo.commit()
+    assert killed("after-save-profile", 1, "update", "-p", "work")
+
+    warning = _recovered(run)
+
+    commit = read_yaml(respec_home / "profiles", "work")["skills"]["up"]["source"]
+    text = respec_home / "profiles" / "work" / "skills" / "up" / "SKILL.md"
+    expected = {first: "# up v1\n", second: "# up v2\n"}
+    assert text.read_text() == expected[commit["commit"]]
+    assert warning["outcome"] == (
+        "finished" if commit["commit"] == second else "rolled-back"
+    )
+    assert warning["outcome"] == "finished"
+    assert not list((respec_home / "profiles" / "work" / "skills").glob(".up.*"))
+    linked = isolated_homes.home / ".claude" / "skills" / "up"
+    assert (linked / "SKILL.md").read_text() == "# up v2\n"
+
+
+def test_update_killed_at_every_step_is_consistent(
+    run, killed, upstream, tmp_path, monkeypatch
+):
+    """Real SIGKILLs: no finally block or handler runs in the killed process."""
+    repo = upstream("acme/skills")
+    repo.write("skills/up/SKILL.md", "# up v1\n")
+    first = repo.commit()
+
+    seen = set()
+    first_yaml = ""  # profile.yaml as the first run added 'up' (at v1)
+    index = 0
+    while True:
+        index += 1
+        home, respec_home = _fresh(tmp_path, monkeypatch, f"kill-update-{index}")
+        new_profile(run)
+        ok(run("add", "acme/skills#skills/up", "-p", "work"))
+        if index == 1:
+            repo.write("skills/up/SKILL.md", "# up v2\n")
+            second = repo.commit()
+        else:  # pin 'up' back to v1, as the first run added it
+            path = respec_home / "profiles" / "work" / "profile.yaml"
+            path.write_text(first_yaml)
+            folder = respec_home / "profiles" / "work" / "skills" / "up"
+            (folder / "SKILL.md").write_text("# up v1\n")
+        first_yaml = (respec_home / "profiles" / "work" / "profile.yaml").read_text()
+        ok(run("use", "work"))
+        if not killed("#", index, "update", "-p", "work"):
+            break
+        warning = _recovered(run)
+        seen.add(warning["outcome"])
+        skills = respec_home / "profiles" / "work" / "skills"
+        assert sorted(p.name for p in skills.iterdir()) == ["up"], index
+        source = read_yaml(respec_home / "profiles", "work")["skills"]["up"]["source"]
+        text = (skills / "up" / "SKILL.md").read_text()
+        assert text == {first: "# up v1\n", second: "# up v2\n"}[source["commit"]]
+        assert warning["outcome"] == (
+            "finished" if source["commit"] == second else "rolled-back"
+        ), index
+        linked = home / ".claude" / "skills" / "up"
+        assert (linked / "SKILL.md").read_text() == text, index
+        # A later update brings it to v2 or says it is there already.
+        ok(run("update", "-p", "work"))
+        assert (skills / "up" / "SKILL.md").read_text() == "# up v2\n", index
+    assert index > 5 and seen == {"finished", "rolled-back"}
+
+
+def test_add_from_git_killed_at_every_step_keeps_a_hand_placed_folder(
+    run, killed, upstream, tmp_path, monkeypatch
+):
+    repo = upstream("acme/skills")
+    repo.write("skills/tdd/SKILL.md", "# tdd\n")
+    repo.write("skills/up/SKILL.md", "# up\n")
+    repo.commit()
+
+    index = 0
+    while True:
+        index += 1
+        home, respec_home = _fresh(tmp_path, monkeypatch, f"kill-add-{index}")
+        new_profile(run)
+        ok(run("use", "work"))
+        mine = _unlisted_folder(respec_home)
+        if not killed("#", index, "add", "acme/skills", "-p", "work"):
+            break
+        json.loads(ok(run("recover", "--json")).stdout)
+        assert (mine / "SKILL.md").read_text() == "hand-placed, not listed\n", index
+        listed = set(read_yaml(respec_home / "profiles", "work")["skills"])
+        assert listed <= {"tdd"}, index
+        skills = respec_home / "profiles" / "work" / "skills"
+        assert {p.name for p in skills.iterdir()} == listed | {"up"}, index
+    assert index > 2
+
+
+# --- review 2 ------------------------------------------------------------------
+
+
+@pytest.fixture
+def at_v1_with_v2_upstream(run, upstream, isolated_homes):
+    """Active 'work' with sourced 'up' (several files) at v1; v2 upstream."""
+    repo = upstream("acme/skills")
+    repo.write("skills/up/SKILL.md", "# up v1\n")
+    for number in range(6):
+        repo.write(f"skills/up/part{number}.md", f"v1 part {number}\n")
+    repo.first = repo.commit()
+    new_profile(run)
+    ok(run("add", "acme/skills#skills/up", "-p", "work"))
+    ok(run("use", "work"))
+    repo.write("skills/up/SKILL.md", "# up v2\n")
+    repo.second = repo.commit()
+    return repo
+
+
+def test_update_killed_while_dropping_its_old_copy_settles_it(
+    run, killed, at_v1_with_v2_upstream, isolated_homes
+):
+    repo = at_v1_with_v2_upstream
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    assert killed("rmtree-old", 3, "update", "-p", "work")
+    assert (skills / ".up.old").is_dir()  # cut part way through the delete
+
+    warning = _recovered(run)
+
+    assert warning["outcome"] == "finished"
+    assert "not from this update" not in warning["message"]
+    assert not (skills / ".up.old").exists()
+    assert (skills / "up" / "SKILL.md").read_text() == "# up v2\n"
+    repo.write("skills/up/SKILL.md", "# up v3\n")
+    repo.commit()
+    ok(run("update", "-p", "work"))
+    assert (skills / "up" / "SKILL.md").read_text() == "# up v3\n"
+
+
+def test_update_interrupted_at_refresh_and_undone_in_process_says_rolled_back(
+    run, at_v1_with_v2_upstream, isolated_homes, monkeypatch
+):
+    """Ctrl-C at phase:refresh: _update's own handler puts v1 back, so the
+    recovery must not claim the new commits were kept."""
+    from respec import journal, sources
+
+    calls: list[str] = []
+
+    def fault(name):
+        calls.append(name)
+        if name == "phase:refresh":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(journal, "_fault", fault)
+    with pytest.raises(KeyboardInterrupt):
+        sources.update(isolated_homes.respec_home, isolated_homes.home, "work")
+    monkeypatch.setattr(journal, "_fault", lambda name: None)
+
+    warning = _recovered(run)
+
+    assert warning["outcome"] == "rolled-back"
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    assert (skills / "up" / "SKILL.md").read_text() == "# up v1\n"
+    commit = read_yaml(isolated_homes.respec_home / "profiles", "work")
+    assert commit["skills"]["up"]["source"]["commit"] == at_v1_with_v2_upstream.first
+
+
+def test_a_foreign_old_copy_that_is_verifiably_redundant_does_not_block_update(
+    run, at_v1_with_v2_upstream, isolated_homes
+):
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    import shutil
+
+    shutil.copytree(skills / "up", skills / ".up.old")  # same as the live folder
+
+    ok(run("update", "-p", "work"))
+
+    assert (skills / "up" / "SKILL.md").read_text() == "# up v2\n"
+    assert not (skills / ".up.old").exists()
+
+
+# --- review 3 ------------------------------------------------------------------
+
+
+def test_update_killed_while_dropping_a_redundant_foreign_old_does_not_block(
+    run, killed, at_v1_with_v2_upstream, isolated_homes
+):
+    import shutil
+
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    shutil.copytree(skills / "up", skills / ".up.old")  # same as the live folder
+    assert killed("rmtree-old", 3, "update", "-p", "work")
+
+    _recovered(run)
+    ok(run("update", "-p", "work"))
+
+    assert (skills / "up" / "SKILL.md").read_text() == "# up v2\n"
+    assert sorted(p.name for p in skills.iterdir()) == ["up"]
+
+
+def test_update_puts_back_an_old_copy_whose_skill_folder_is_gone(
+    run, at_v1_with_v2_upstream, isolated_homes
+):
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    (skills / "up").rename(skills / ".up.old")
+
+    ok(run("update", "-p", "work"))
+
+    assert (skills / "up" / "SKILL.md").read_text() == "# up v2\n"
+    assert not (skills / ".up.old").exists()
+
+
+# --- review 4 ------------------------------------------------------------------
+
+
+def test_recovery_keeps_a_dropping_folder_no_update_recorded(
+    run, at_v1_with_v2_upstream, isolated_homes, monkeypatch
+):
+    from respec import sources
+
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    foreign = skills / ".notes.dropping"
+    foreign.mkdir()
+    (foreign / "keep.md").write_text("only copy\n")
+    _crash(
+        monkeypatch,
+        1,  # update:begin
+        lambda: sources.update(isolated_homes.respec_home, isolated_homes.home, "work"),
+    )
+
+    warning = _recovered(run)
+
+    assert (foreign / "keep.md").read_text() == "only copy\n"
+    assert str(foreign) in warning["message"]
+
+
+def test_update_puts_back_an_old_copy_also_when_up_to_date(
+    run, at_v1_with_v2_upstream, isolated_homes
+):
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    ok(run("update", "-p", "work"))  # now at v2, up to date
+    (skills / "up").rename(skills / ".up.old")
+
+    ok(run("update", "-p", "work"))
+
+    assert (skills / "up" / "SKILL.md").read_text() == "# up v2\n"
+    assert not (skills / ".up.old").exists()
+
+
+# --- review 5 ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("with_old", [True, False])
+def test_update_refuses_clearly_while_a_unique_dropping_folder_is_there(
+    run, at_v1_with_v2_upstream, isolated_homes, with_old
+):
+    import shutil
+
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    dropping = skills / ".up.dropping"
+    dropping.mkdir()
+    (dropping / "only.md").write_text("only copy\n")
+    if with_old:
+        shutil.copytree(skills / "up", skills / ".up.old")
+
+    result = run("update", "-p", "work", "--json")
+
+    rows = {row["skill"]: row for row in json.loads(result.stdout)["skills"]}
+    assert rows["up"]["result"] == "error"
+    assert str(dropping) in rows["up"]["error"]
+    assert "Errno" not in rows["up"]["error"]
+    assert (dropping / "only.md").read_text() == "only copy\n"

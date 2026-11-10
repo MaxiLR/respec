@@ -14,7 +14,8 @@ respec disable my-skill [-p work] # stop linking it; files and metadata stay
 respec enable my-skill [-p work]
 respec remove my-skill [-p work]  # drop it from profile.yaml and delete its folder
 respec adopt [--add|--remove <entry>] [--all add|remove]
-respec restore [<backup>] [--list] [--unknown add|remove] [--overwrite]
+respec restore [<backup>] [--list] [--unknown add|remove] [--overwrite] [--release-only]
+respec recover [--rollback]       # finish (or roll back) an interrupted change
 respec add owner/repo[#path] [--ref main] [-p work]  # fetch skill(s) from git
 respec update --check [-p work]   # which sourced skills have newer commits
 respec update [my-skill] [-p work] [--yes]  # apply; --yes overwrites local edits
@@ -132,6 +133,95 @@ until `--overwrite` backs them up and replaces them. Hidden entries the backup
 does not hold stay in place and are reported. A restore that fails
 part way can be run again to finish.
 
+### Interrupted changes
+
+Every change of several steps is recorded in a journal in `state.json` before
+it changes anything, together with the one step in flight: a switch or
+refresh (also an edit of the active profile), a restore, adopt, a layer
+repair, linking outside a switch, `update`, `add` from git and `profile
+install`. If respec is killed or crashes part way, the journal stays behind:
+
+- `respec status` (and every other command that only reads) reports it.
+- The next command that changes skills first finishes the change or rolls it
+  back, and says which (`finished` or `rolled-back`):
+  - A switch that had not yet removed any skill is rolled back (the previous
+    profile stays active). One that had is finished, or, if the new profile
+    can no longer be activated, rolled back to the previous one.
+  - A restore is finished.
+  - An adopt keeps every choice it completed; the entry in flight is finished
+    once its copy was whole and otherwise left as it was (then it reports
+    `rolled-back`).
+  - An edit of the active profile, a layer repair, a local `add` and a
+    `remove` are finished when `profile.yaml` was already saved, and rolled
+    back when it was not; the links then match `profile.yaml` either way. A
+    local `add` that is rolled back drops its copy (the source folder is never
+    touched); a finished `remove` deletes the skill folder it was removing.
+  - An `update` or git `add` is rolled back until `profile.yaml` records the
+    new skills and finished after. A rollback only touches what that run
+    made: the skills it swapped (when the folders are still the ones it
+    recorded) and the skill folders it created. A folder that was there before
+    is never removed.
+  - A half-copied `profile install` is removed.
+- `respec recover` does the same on its own; `respec recover --rollback`
+  undoes the change instead where that is still possible (a switch activates
+  the previous profile again; a restore that already removed skills, and the
+  choices adopt completed, cannot be undone).
+- While a restore waits, `respec restore` finishes that same restore and
+  refuses another backup.
+- In the TUI, Sync shows the interrupted change with Finish and Roll back;
+  until it is resolved, Sync offers nothing else and the TUI refuses every
+  change to skill folders.
+
+Nothing is lost on the way: an entry a step left half made (a copy cut short,
+or a staging folder of an adopt overwrite) is moved to a fresh backup run and
+reported under `set_aside`, unless it is verifiably what that step was making,
+in which case it is recorded. An `update` that already saved `profile.yaml`
+removes its own `.<skill>.old` (the previous files), also when the
+interruption had deleted it part way. A `.<skill>.old` that no journaled
+`update` made is never used to replace a skill: like adopt's staging folders,
+`update` puts it back when the skill folder is gone, removes it when its
+content is verifiably in the skill folder or a backup run (renamed to
+`.<skill>.dropping` first, so a delete cut short is finished by the next
+update), and otherwise keeps it and refuses that skill until it is moved out
+of the way. The same goes for a `.<skill>.dropping` folder (a redundant
+`.old` being removed) that no journaled update recorded. A journal that
+respec does not recognise, or that is malformed, is only dropped by
+`respec recover --rollback`. `state.json` and `profile.yaml` are written to a
+temporary file, flushed and renamed, so a kill never leaves either half
+written. Each `profile.yaml` write and the journal's boundaries (a change
+beginning, changing phase and ending) are also flushed to the drive itself
+(`F_FULLFSYNC` on macOS); the per-skill records in between are not, which
+keeps a switch fast.
+
+After a power loss:
+
+- `state.json` may have lost the per-skill records written since the last
+  boundary. The journal is still there and the next command recovers it as
+  above; links respec made but no longer records show up as unknown entries
+  (`respec status`), to resolve with `respec adopt` or `respec use <profile>
+--unknown remove`, which back them up first.
+- If `state.json` cannot be read at all, every command stops and names
+  `respec recover`. That moves the damaged file to a new backup run and
+  rebuilds the record from disk: respec owns again the target folders that
+  hold its links and records those links as its own; no profile is active,
+  and everything else in those folders is an unknown entry. Nothing is
+  deleted. Each folder's takeover (its backup run, or that the folder did not
+  exist, and which folders respec created) is found again in
+  `~/.respec/takeovers.json`, a log every takeover appends to and every
+  restore marks as released; it is written apart from `state.json` and
+  flushed to disk. A folder with no unreleased record there (taken over by an
+  older respec, or the log is lost too) is marked `takeover_unknown`: a bare
+  `respec restore` then refuses and changes nothing. Either name the run to
+  put back, `respec restore <backup>` (`respec restore --list` marks takeover
+  runs), or run `respec restore --release-only`, which lets go of every folder
+  without putting anything back: it removes only the records it can verify as
+  respec's (a link into its folders, or a copy with the recorded digest),
+  lists the rest under `kept`, removes only folders respec recorded creating,
+  and keeps every backup run. It reports this as an `interrupted-operation`
+  warning with `operation` `state` and `outcome` `rebuilt`.
+- A `state.json` written by a newer respec is never rebuilt: every command
+  says so and changes nothing.
+
 ### TUI
 
 `respec` without a command (or `respec tui`) opens a terminal UI: profiles on
@@ -218,9 +308,22 @@ Every `--json` output that is an object uses one vocabulary:
   way there, including ones outside the folders respec owns.
 - `backups`: the folders `use` took over, with their takeover backups.
 - `warnings`: always present, empty when there is nothing to warn about. Each
-  warning is an object with a `type` and a `message`; the one type is
-  `layer-conflict` (an exclusive layer has several enabled skills), which also
-  gives `profile`, `layer`, `skills` and `fix`.
+  warning is an object with a `type` and a `message`. The types:
+  - `layer-conflict`: an exclusive layer has several enabled skills; also
+    gives `profile`, `layer`, `skills` and `fix`.
+  - `unreadable-manifest`: a backup run's `manifest.json` could not be read
+    during a restore, so every entry of that run was put back as the user's;
+    gives its `path`.
+  - `interrupted-operation`: a change that was cut short (see
+    [Interrupted changes](#interrupted-changes)); also gives `operation`
+    (`use`, `restore`, `adopt`, `links`, `update`, `add`, `install`, or `state`
+    for a rebuilt `state.json`),
+    `outcome` (`finished` or `rolled-back` when this command recovered it,
+    `rebuilt` when `respec recover` rebuilt an unreadable `state.json`,
+    `pending` when it still waits), `set_aside` (paths moved to a backup
+    run) and `profile` when it concerns one. `respec recover --json` gives
+    `active_profile`, `recovered` (whether there was anything to recover)
+    and this warning.
 - `error`: present only when the command failed. `use`, `adopt` and
   `restore` then print every other key of their success output too, filled
   with what was done before the failure. Other commands print their error on
