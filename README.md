@@ -3,6 +3,8 @@
 > Switchable profiles of global agent skills for Claude Code, the `.agents`
 > standard and oh-my-pi.
 
+![The respec terminal UI: switching to another profile, turning a skill off in the editor, and running Sync](docs/assets/tui-demo.svg)
+
 Coding agents load global skills from folders in your home directory, and some
 read each other's folders. A set of skills meant for one kind of work leaks
 into every other session, and there is no clean way to swap sets or to go back.
