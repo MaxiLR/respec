@@ -88,7 +88,7 @@ def run():
     return invoke
 
 
-# The JSON fields the README documents as nullable: no active or previous
+# The JSON fields docs/reference.md documents as nullable: no active or previous
 # profile, a folder that is its own (not ``same_as`` another), and a restored
 # folder that did not exist at takeover (a value under ``restored``).
 NULLABLE_KEYS = frozenset({"active_profile", "previous_profile", "same_as"})

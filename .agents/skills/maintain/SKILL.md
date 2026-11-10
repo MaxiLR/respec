@@ -42,7 +42,11 @@ skills are current.
 
 ## 2. The other documents
 
-- `README.md`: usage list, the section for the area you changed, the TUI keys.
+- `README.md`: the overview: features, quick start, the command table and the
+  TUI keys. Keep it short.
+- `docs/reference.md`: the full behavior of every command, the `--json`
+  vocabulary and the environment variables. Detail goes here, not in the
+  README.
 - `.agents/skills/install/SKILL.md`: when installing, running or the project
   layout changes (`pyproject.toml` name or entry point, `uv` usage).
 - This file: when the list of documents to check changes.
@@ -66,7 +70,7 @@ on the user's machine.
 ```sh
 uv run pytest
 uv run black --check src tests
-npx prettier --check README.md "src/respec/shipped/**/*.md" ".agents/skills/**/*.md"
+npx prettier --check README.md "docs/**/*.md" "src/respec/shipped/**/*.md" ".agents/skills/**/*.md"
 ```
 
 Behavior changes need a test that fails first. In your report, say which
