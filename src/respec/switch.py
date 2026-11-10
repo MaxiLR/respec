@@ -110,10 +110,13 @@ def backups_dir(respec_home: Path) -> Path:
     return respec_home / "backups"
 
 
-def new_backup_run(respec_home: Path, moment: datetime) -> Path:
-    """Create a fresh backup run folder; never reuse one from the same second."""
+def new_backup_run(
+    respec_home: Path, moment: datetime, parent: Path | None = None
+) -> Path:
+    """Create a fresh backup run folder (in ``parent``, by default the backups
+    folder); never reuse one from the same second."""
     stamp = moment.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    parent = backups_dir(respec_home)
+    parent = backups_dir(respec_home) if parent is None else parent
     parent.mkdir(parents=True, exist_ok=True)
     suffix = 1
     while True:

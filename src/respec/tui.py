@@ -44,6 +44,7 @@ from respec import (
     lock,
     messages,
     profiles,
+    removal,
     sources,
     switch,
     sync,
@@ -117,6 +118,7 @@ Screen {
 #profile-actions { height: auto; margin: 1 0; }
 #profile-actions Button { width: 1fr; }
 #profile-actions #edit { margin-right: 1; }
+#remove { width: 100%; margin: 0 0 1 0; }
 
 #status {
     width: 1fr;
@@ -571,6 +573,46 @@ class NewProfileDialog(ModalScreen[profiles.Profile | None]):
     @on(Button.Pressed, "#new-cancel")
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class RemoveProfileDialog(ModalScreen[bool]):
+    """Ask before removing a profile; its folder moves to a backup."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, respec_home: Path, name: str) -> None:
+        super().__init__()
+        self.respec_home = respec_home
+        self.profile_name = name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog") as dialog:
+            dialog.border_title = "Remove profile"
+            yield Static(
+                Text.assemble("Remove profile ", (self.profile_name, "bold"), "?"),
+                id="remove-question",
+            )
+            yield Static(
+                "Nothing is deleted: its folder (profile.yaml and its skills) "
+                f"moves to a backup in {removal.removed_dir(self.respec_home)}. "
+                "Moving that folder back to "
+                f"{profiles.profiles_dir(self.respec_home)} restores the profile.",
+                id="dialog-intro",
+            )
+            with Horizontal(id="dialog-actions"):
+                yield Button("Cancel", id="remove-cancel")
+                yield Button("Remove", id="remove-confirm", variant="error")
+
+    def on_mount(self) -> None:
+        self.query_one("#remove-cancel", Button).focus()
+
+    @on(Button.Pressed, "#remove-confirm")
+    def _confirm(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#remove-cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
 
 class SkillSwitch(Switch):
@@ -1415,6 +1457,7 @@ class RespecApp(App[None]):
         Binding("s", "sync", "Sync"),
         Binding("e", "edit", "Edit profile"),
         Binding("n", "new_profile", "New profile"),
+        Binding("d", "remove_profile", "Remove profile"),
         Binding("a", "adopt", "Resolve unknown"),
         Binding("r", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
@@ -1430,7 +1473,9 @@ class RespecApp(App[None]):
         self.waiting_shown = False
 
     # Actions of the profile list; elsewhere their keys do nothing.
-    LIST_ACTIONS = frozenset({"edit", "new_profile", "adopt", "refresh"})
+    LIST_ACTIONS = frozenset(
+        {"edit", "new_profile", "remove_profile", "adopt", "refresh"}
+    )
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
         if action in self.LIST_ACTIONS:
@@ -1462,6 +1507,7 @@ class RespecApp(App[None]):
                 with Horizontal(id="profile-actions"):
                     yield Button("Edit", id="edit")
                     yield Button("New profile", id="new")
+                yield Button("Remove", id="remove")
             with VerticalScroll(id="status") as status:
                 status.border_title = "Target folders"
         yield Static("", id="feedback")
@@ -1551,6 +1597,7 @@ class RespecApp(App[None]):
 
     def _update_activate(self) -> None:
         self.query_one("#edit", Button).disabled = self.selected is None
+        self.query_one("#remove", Button).disabled = self.selected is None
         button = self.query_one("#activate", Button)
         button.disabled = self.selected is None or self.selected == self.active
         button.label = (
@@ -1607,6 +1654,32 @@ class RespecApp(App[None]):
             self.call_later(self.refresh_view)
 
         self.push_screen(NewProfileDialog(self.respec_home), created)
+
+    @on(Button.Pressed, "#remove")
+    def action_remove_profile(self) -> None:
+        """Ask, then move the selected profile to a backup (as ``respec
+        profile remove``, with the same refusals)."""
+        name = self.selected
+        if name is None:
+            self.show_feedback("Select a profile to remove first.", ok=False)
+            return
+
+        def confirmed(sure: bool | None) -> None:
+            if not sure:
+                return
+            try:
+                removed = _changing(
+                    self.respec_home,
+                    lambda: removal.remove_profile(self.respec_home, name),
+                )
+            except FAILURES as problem:
+                self.show_feedback(f"error: {_one_line(problem)}", ok=False)
+                return
+            self.selected = None
+            self.show_feedback(removed.describe(), ok=True)
+            self.call_later(self.refresh_view)
+
+        self.push_screen(RemoveProfileDialog(self.respec_home, name), confirmed)
 
     @on(Button.Pressed, "#sync")
     def action_sync(self) -> None:

@@ -27,14 +27,16 @@ every path it creates, and hand edits make its record disagree with disk.
   can be `null` (meaning none).
 - Exit code 0 means done; 1 means refused or failed. `use`, `adopt`,
   `restore` (also `--release-only`) and `recover` then print their usual
-  JSON keys plus `error`; other commands, and a refused combination of
+  JSON keys plus `error` (`profile remove` prints `name` and `error`); other
+  commands, and a refused combination of
   options, print the reason on stderr. A refused command changes nothing unless its
   output reports what it already did.
 - Only one respec changes things at a time. A change started while another
   respec (a command, a prompt waiting for an answer, or the TUI) is changing
   things waits up to a second, then exits 1 with `another respec is running`
   and changes nothing; with `--json`, `use`, `adopt`, `restore` and `recover`
-  print their usual keys plus `error`, every other command prints only
+  print their usual keys plus `error`, `profile remove` prints `name`,
+  `error` and `warnings`, every other command prints only
   `error` and `warnings`. Retry once the other run has finished. Commands that
   only read never wait.
 - Commands that change a profile take `-p <profile>`; without it they change
@@ -66,6 +68,12 @@ Every enabled skill of a profile goes to all of that profile's targets.
 - `respec profile install <owner/repo[#path]> [--name <name>] [--ref <ref>]`:
   copy a whole profile folder (with `profile.yaml`) from a git repository
   once. It is then owned locally; respec does not track it upstream.
+- `respec profile remove <name>`: remove a profile that is not active. Nothing
+  is deleted: its folder (`profile.yaml` and its skills) moves to
+  `~/.respec/removed-profiles/<timestamp>/<name>/`, reported as `backup`; move
+  it back to `~/.respec/profiles/<name>/` to restore it. Refused for the active
+  profile (`respec use <other>` first, or `respec restore`) and while an
+  interrupted change waits (`respec recover` first).
 - `respec use <profile> [--unknown add|remove]`: activate a profile.
 - `respec status`: active profile, its targets, and the managed skills in
   each folder respec owns (each marked by `origin`: `profile`, `shipped` or
