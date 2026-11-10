@@ -14,7 +14,7 @@ import typer
 
 from respec import adopt as adopt_entries
 from respec import global_skills, items, journal, layers, lock, messages, paths
-from respec import profiles
+from respec import profiles, removal
 from respec import sources
 from respec import switch, takeovers, targets, trees, unknown
 from respec import restore as restore_backups
@@ -1689,3 +1689,34 @@ def profile_install(
             f"Installed profile {installed.name!r} at {installed.path} "
             f"({messages.plural(len(installed.skills), 'skill')})"
         )
+
+
+@profile_app.command("remove")
+def profile_remove(
+    ctx: typer.Context,
+    name: Annotated[str, typer.Argument(help="Profile name.")],
+    as_json: JsonOption = False,
+) -> None:
+    """Remove a profile that is not active. Nothing is deleted: its folder
+    (profile.yaml and its skills) moves to a backup under
+    ~/.respec/removed-profiles/, and moving it back restores the profile."""
+    homes = _homes(ctx)
+    _hold_lock(homes, as_json, {"name": name})
+    try:
+        removed = removal.remove_profile(homes.respec_home, name, homes.user_home)
+    except RespecError as error:
+        if as_json:
+            _failure.append(str(error))
+            _print_json({"name": name, "error": str(error)})
+            raise typer.Exit(code=1)
+        _fail(error)
+    if as_json:
+        _print_json(
+            {
+                "name": removed.name,
+                "path": str(removed.path),
+                "backup": str(removed.backup),
+            }
+        )
+    else:
+        typer.echo(removed.describe())

@@ -568,3 +568,121 @@ def test_failed_switch_in_the_tui_names_the_folder_it_took_over(
     drive(isolated_homes, scenario)
 
     assert status_json(run)["active_profile"] == "alpha"
+
+
+# --- removing a profile ----------------------------------------------------
+
+
+def removed_backups(respec_home, name):
+    root = respec_home / "removed-profiles"
+    return sorted(root.glob(f"*/{name}")) if root.is_dir() else []
+
+
+async def select(app, pilot, name):
+    await pilot.click(f"#profile-{name}")
+    await pilot.pause()
+    assert app.selected == name
+
+
+def test_remove_by_click_asks_first_then_moves_the_profile_to_a_backup(
+    isolated_homes, respec_home, run, two_profiles
+):
+    async def scenario(app, pilot):
+        await select(app, pilot, "beta")
+        await pilot.click("#remove")
+        await pilot.pause()
+        # Nothing happens before the confirmation.
+        assert (respec_home / "profiles" / "beta").is_dir()
+        assert "beta" in text_of(app.screen.query_one("#remove-question"))
+        await pilot.click("#remove-confirm")
+        await pilot.pause()
+        assert not app.query("#profile-beta")
+        feedback = text_of(app.query_one("#feedback"))
+        assert "Removed profile 'beta'" in feedback
+        [backup] = removed_backups(respec_home, "beta")
+        assert str(backup) in feedback
+
+    drive(isolated_homes, scenario)
+
+    assert not (respec_home / "profiles" / "beta").exists()
+    [backup] = removed_backups(respec_home, "beta")
+    assert (backup / "skills" / "b1" / "SKILL.md").is_file()
+    listed = json.loads(ok(run("profile", "list", "--json")).stdout)
+    assert [p["name"] for p in listed["profiles"]] == ["alpha"]
+
+
+def test_remove_by_key_can_be_cancelled(isolated_homes, respec_home, two_profiles):
+    async def scenario(app, pilot):
+        await select(app, pilot, "beta")
+        await pilot.press("d")
+        await pilot.pause()
+        assert app.screen.query("#remove-question")
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.query("#profile-beta")
+
+    drive(isolated_homes, scenario)
+
+    assert (respec_home / "profiles" / "beta").is_dir()
+    assert removed_backups(respec_home, "beta") == []
+
+
+def test_removing_the_active_profile_is_refused(
+    isolated_homes, respec_home, two_profiles
+):
+    async def scenario(app, pilot):
+        await select(app, pilot, "alpha")
+        assert app.query_one("#remove").disabled
+        await pilot.press("d")
+        await pilot.pause()
+        # Refused before any confirmation is asked for.
+        assert not app.screen.query("#remove-question")
+        feedback = text_of(app.query_one("#feedback"))
+        assert "active" in feedback and "Activate another profile" in feedback
+        assert app.query("#profile-alpha")
+        await select(app, pilot, "beta")
+        assert not app.query_one("#remove").disabled
+
+    drive(isolated_homes, scenario)
+
+    assert (respec_home / "profiles" / "alpha" / "profile.yaml").is_file()
+    assert removed_backups(respec_home, "alpha") == []
+
+
+def test_removing_while_another_respec_runs_is_refused(
+    isolated_homes, respec_home, two_profiles, holder
+):
+    other = holder("links:begin", "disable", "a1")
+
+    async def scenario(app, pilot):
+        await select(app, pilot, "beta")
+        await pilot.press("d")
+        await pilot.pause()
+        await pilot.click("#remove-confirm")
+        await pilot.pause()
+        assert "another respec is running" in text_of(app.query_one("#feedback"))
+
+    drive(isolated_homes, scenario)
+
+    assert (respec_home / "profiles" / "beta").is_dir()
+    code, out, err = other.finish()
+    assert code == 0, out + err
+
+
+def test_removing_while_a_change_is_interrupted_is_refused(
+    isolated_homes, respec_home, two_profiles, killed
+):
+    assert killed("use:begin", 1, "use", "beta")
+
+    async def scenario(app, pilot):
+        await select(app, pilot, "beta")
+        await pilot.press("d")
+        await pilot.pause()
+        await pilot.click("#remove-confirm")
+        await pilot.pause()
+        assert "respec recover" in text_of(app.query_one("#feedback"))
+
+    drive(isolated_homes, scenario)
+
+    assert (respec_home / "profiles" / "beta").is_dir()
+    assert removed_backups(respec_home, "beta") == []

@@ -214,6 +214,7 @@ def test_no_undocumented_nulls_in_any_local_command(
         ("update",),
         ("update", "--check"),
         ("restore", "--list"),
+        ("profile", "remove", "third"),
     ]
     for command in commands:
         assert_no_nulls(payload(run(*command, "--json")))
@@ -230,9 +231,21 @@ def test_no_undocumented_nulls_in_failures_or_restore(
     assert_no_nulls(payload(run("restore", "--unknown", "remove", "--json")))
 
 
+def test_profile_remove_success_and_failure_shapes(run, work, assert_no_nulls):
+    removed = assert_no_nulls(payload(run("profile", "remove", "other", "--json")))
+    assert set(removed) == {"name", "path", "backup", "warnings"}
+    assert removed["name"] == "other"
+
+    for name in ("work", "nosuch", "../x"):  # active, unknown, invalid
+        data = assert_no_nulls(payload(run("profile", "remove", name, "--json"), 1))
+        assert set(data) == {"name", "error", "warnings"}, name
+        assert data["name"] == name and data["error"], name
+
+
 # What a command changing things prints with --json while another respec holds
 # the lock: use, adopt, restore and recover give their usual keys (empty, as
-# nothing was done) plus error; every other command gives error and warnings.
+# nothing was done) plus error; profile remove gives name, error and warnings;
+# every other command gives error and warnings.
 BUSY_SHAPES = [
     (("add", "/nowhere"), {"error", "warnings"}),
     (("remove", "tdd"), {"error", "warnings"}),
@@ -251,6 +264,7 @@ BUSY_SHAPES = [
     (("layer", "repair", "x"), {"error", "warnings"}),
     (("profile", "new", "n", "-t", "agents"), {"error", "warnings"}),
     (("profile", "install", "acme/x"), {"error", "warnings"}),
+    (("profile", "remove", "other"), {"name", "error", "warnings"}),
     (
         ("use", "other"),
         {
@@ -288,5 +302,5 @@ def test_a_change_refused_while_another_respec_runs_prints_the_documented_json(
         assert set(data) == keys | {"error"}, args
         assert "another respec is running" in data["error"], args
         assert data["warnings"] == [], args
-        for key in keys - {"error", "warnings", "active_profile", "recovered"}:
+        for key in keys - {"error", "warnings", "active_profile", "recovered", "name"}:
             assert not data[key], (args, key)

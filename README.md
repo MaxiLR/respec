@@ -20,6 +20,7 @@ respec add owner/repo[#path] [--ref main] [-p work]  # fetch skill(s) from git
 respec update --check [-p work]   # which sourced skills have newer commits
 respec update [my-skill] [-p work] [--yes]  # apply; --yes overwrites local edits
 respec profile install owner/repo[#path] [--name mine]  # copy a whole profile once
+respec profile remove old         # move a profile that is not active to a backup
 ```
 
 `add`, `remove`, `enable` and `disable` change the active profile unless `-p`
@@ -47,6 +48,21 @@ paths and other git transports are refused. Skills installed by
 overwriting.
 `profile install` copies a repository's `profile.yaml` and listed `skills/`
 once; the profile is then owned locally and its skills keep their own sources.
+
+`profile remove <name>` deletes nothing: it moves the profile's folder
+(`profile.yaml` and its skills) in one rename to
+`~/.respec/removed-profiles/<timestamp>/<name>/` and prints that path (`backup`
+with `--json`). To get the profile back, move that folder to
+`~/.respec/profiles/<name>/`; `restore` never does this, and nothing prunes
+`removed-profiles/`. It refuses the active profile (switch first with
+`respec use <other>`, or undo respec with `respec restore`), a profile whose
+skills are still linked into a target folder (possible after `respec recover`
+rebuilt `state.json`), an unknown or invalid name, and an interrupted change
+that still waits (run `respec recover` first); each refusal changes nothing.
+Profile names are case-sensitive in every command, also on a case-insensitive
+file system: `WORK` does not name the profile `work`. A kill leaves the profile
+either in place or complete in its backup; the empty timestamp folder a kill
+can leave is removed by the next `profile remove`.
 
 `respec use` links every enabled skill of the profile into each of its targets'
 folders (symlinks, or copies where symlinking fails) and records every created
@@ -235,7 +251,8 @@ After a power loss:
 Only one respec changes things at a time. Every command that changes skills,
 profiles, layers, takeovers or backups (`use`, `add`, `remove`, `enable`,
 `disable`, `update`, the `layer` changes, `adopt`, `restore`, `recover`,
-`profile new` and `profile install`), and every change made in the TUI, holds
+`profile new`, `profile install` and `profile remove`), and every change made
+in the TUI, holds
 a lock on `~/.respec/.lock` while it runs, including while it waits for an
 answer at a prompt (the answer decides part of a change that has already
 started, so the lock cannot be let go in between). Another one, in another
@@ -245,6 +262,7 @@ it then prints on stdout:
 
 - `use`, `adopt`, `restore` (also `--release-only`) and `recover`: their usual
   keys, empty or as on disk (nothing was done), plus `error`;
+- `profile remove`: `name`, `error` and `warnings`;
 - every other command: only `error` and `warnings`.
 
 Commands that only read (`status`, `profile list` and `show`, `layer list` and
@@ -274,6 +292,8 @@ in the background with a **Cancel** button (or `Esc`). Every
 change goes through the same code as `respec enable`, `respec layer use` and
 `respec add`, so an active profile is re-applied at once and a refused change
 leaves the profile as it was. **New profile** (`n`) asks for a name and targets.
+**Remove** (`d`) asks for confirmation, then moves the selected profile to a
+backup as `respec profile remove` does, with the same refusals.
 
 **⟳ Sync** (`s`) is a manual check of the setup and every profile; nothing is
 watched in the background. It lists unknown entries and edited or replaced
@@ -366,7 +386,9 @@ Every `--json` output that is an object uses one vocabulary:
 - `error`: present only when the command failed. `use`, `adopt`, `restore`
   (also `--release-only`, which adds `kept`) and `recover` then print every
   other key of their success output too, filled with what was done before the
-  failure (`recover` gives `active_profile` and `recovered: false`). Other
+  failure (`recover` gives `active_profile` and `recovered: false`).
+  `profile remove` gives `name`, `path` and `backup` on success and `name`
+  with `error` on failure, on stdout either way. Other
   commands print their error on stderr only, with one exception: refused
   because another respec is running, they print `error` and `warnings` on
   stdout (see [Running two at once](#running-two-at-once)). A refused

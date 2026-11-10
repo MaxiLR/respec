@@ -568,15 +568,35 @@ def parse_profile(name: str, folder: Path, data: Any) -> Profile:
 
 def load_profile(respec_home: Path, name: str) -> Profile:
     """Read and validate a profile; its layer conflicts become warnings."""
-    validate_name(name)
-    folder = profiles_dir(respec_home) / name
-    if not folder.is_dir():
-        raise RespecError(
-            f"profile {name!r} does not exist; create it with "
-            f"'respec profile new {name} --target <target>'"
-        )
+    folder = existing_folder(respec_home, name)
     _touched[(folder, name)] = None
     return _read_folder(name, folder)
+
+
+def existing_folder(respec_home: Path, name: str) -> Path:
+    """The folder of profile ``name``, which must be listed under exactly that
+    name: on a case-insensitive file system ``WORK`` would otherwise open the
+    folder of ``work`` under another name (and, for example, not count as the
+    active profile)."""
+    validate_name(name)
+    folder = profiles_dir(respec_home) / name
+    try:
+        listed = os.listdir(folder.parent)
+    except OSError:
+        listed = []
+    if name not in listed or not folder.is_dir():
+        same = [
+            other
+            for other in listed
+            if other.casefold() == name.casefold() and (folder.parent / other).is_dir()
+        ]
+        hint = (
+            f" (names are case-sensitive; did you mean {same[0]!r}?)"
+            if same
+            else f"; create it with 'respec profile new {name} --target <target>'"
+        )
+        raise RespecError(f"profile {name!r} does not exist{hint}")
+    return folder
 
 
 def _read_folder(name: str, folder: Path) -> Profile:
