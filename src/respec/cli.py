@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Any, NoReturn, Optional
 
+import click
 import typer
 
 from respec import adopt as adopt_entries
@@ -92,14 +93,23 @@ def _fail(error: RespecError) -> NoReturn:
 
 
 def _print_json(data: Any) -> None:
-    """Print ``data``; an object always carries a ``warnings`` list.
+    """Print ``data``; an object always carries one ``warnings`` list.
 
-    ``warnings`` holds the layer conflicts of every profile the command read,
-    as the command left them (empty when there are none).
+    Every warning is an object with a ``type`` and a ``message``:
+
+    - ``layer-conflict``: an exclusive layer of a profile the command read has
+      several enabled skills, as the command left it (``profile``, ``layer``,
+      ``skills``, ``fix``);
+    - ``unknown-entry``: an entry respec did not place, or an edited or
+      replaced copy, in a folder it owns (``name``, ``path``, ``kind``,
+      ``targets``, ``replaced``), passed in by the command as ``warnings``.
     """
     if isinstance(data, dict):
-        warnings = [conflict.to_dict() for conflict in profiles.peek_warnings()]
-        data = {**data, "warnings": warnings}
+        layer_conflicts = [
+            {"type": "layer-conflict", **conflict.to_dict()}
+            for conflict in profiles.peek_warnings()
+        ]
+        data = {**data, "warnings": layer_conflicts + list(data.get("warnings", []))}
     typer.echo(json.dumps(data, indent=2))
 
 
@@ -245,37 +255,183 @@ def _interactive() -> bool:
 
 
 def _prompt_choice(entry: unknown.Unknown, profile: str | None) -> str:
-    """Ask what to do with one unknown entry."""
-    replaced = ", replaced a skill respec installed" if entry.replaced else ""
-    typer.echo(
-        f"Unknown entry {entry.path} ({entry.kind} in "
-        f"{', '.join(entry.targets)}{replaced})"
-    )
-    destination = f"profile {profile!r}" if profile else "profile (needs -p)"
+    """Ask what to do with one unknown entry; ``add`` goes to ``profile``."""
+    typer.echo(f"Unknown entry {switch.describe(entry)} in {', '.join(entry.targets)}")
+    available = adopt_entries.choices(profile)
+    if profile is None:
+        question = (
+            "  no active profile to add it to; remove: back up and remove [remove]"
+        )
+    else:
+        question = (
+            f"  add: add to profile {profile!r} / remove: back up and remove "
+            "[add/remove]"
+        )
     while True:
-        answer = typer.prompt(
-            f"  add: add to {destination} / backup: back up and remove / "
-            "keep: keep unmanaged [add/backup/keep]"
-        ).strip()
-        if answer in adopt_entries.CHOICES:
+        answer = typer.prompt(question).strip()
+        if answer in available:
             return answer
-        typer.echo(f"  please answer one of: {', '.join(adopt_entries.CHOICES)}")
+        typer.echo(
+            f"  please answer{' one of' if len(available) > 1 else ''}: "
+            f"{', '.join(available)}"
+        )
 
 
 def _report_resolution(resolution: adopt_entries.Resolution) -> None:
-    entry = resolution.entry
-    if resolution.choice == "add":
-        typer.echo(f"Added {entry.path} to profile {resolution.profile!r}")
-    elif resolution.choice == "backup":
-        typer.echo(f"Backed up {entry.path} to {resolution.backup} and removed it")
-    else:
-        typer.echo(f"Kept {entry.path} unmanaged")
+    typer.echo(resolution.describe())
+
+
+def _warn_unresolved(homes: Homes) -> list[dict[str, Any]]:
+    """Report unknown entries on stderr; return them as JSON warnings."""
+    try:
+        entries = adopt_entries.unresolved(homes.respec_home)
+    except RespecError:
+        return []
+    warnings: list[dict[str, Any]] = []
+    for entry in entries:
+        what = (
+            f"is an edited or replaced copy of skill {entry.name!r}"
+            if entry.replaced
+            else f"is a {entry.kind} respec did not place"
+        )
+        message = (
+            f"{entry.path} {what}; run 'respec adopt' to add it to the active "
+            "profile or remove it"
+        )
+        typer.echo(f"warning: {message}", err=True)
+        warnings.append(
+            {"type": "unknown-entry", **entry.to_dict(), "message": message}
+        )
+    return warnings
+
+
+# Ctrl-C or the end of input at a prompt (typer and click raise their own).
+PROMPT_ABORTED = (typer.Abort, click.exceptions.Abort)
 
 
 class UnknownChoice(str, Enum):
     add = "add"
-    backup = "backup"
-    keep = "keep"
+    remove = "remove"
+
+
+def _fail_after(
+    resolutions: list[adopt_entries.Resolution], error: RespecError, as_json: bool
+) -> NoReturn:
+    """Fail, still reporting every resolution that was already applied."""
+    if as_json:
+        _print_json(
+            {
+                "resolved": [resolution.to_dict() for resolution in resolutions],
+                "error": str(error),
+            }
+        )
+        raise typer.Exit(code=1)
+    for resolution in resolutions:
+        _report_resolution(resolution)
+    _fail(error)
+
+
+@dataclass
+class _SwitchRun:
+    """Everything one ``respec use`` did, reported the same way however it ends:
+    success, a refusal, a failed choice, an interrupted prompt or a link error.
+    """
+
+    homes: Homes
+    name: str
+    owned_before: set[str]
+    resolutions: list[adopt_entries.Resolution] = field(default_factory=list)
+    linked: list[str] = field(default_factory=list)
+    result: switch.SwitchResult | None = None
+    errors: list[str] = field(default_factory=list)
+    notices: list[str] = field(default_factory=list)
+    prompt_cut: bool = False
+
+    def interrupted(self, what: str) -> None:
+        self.prompt_cut = True
+        self.notices.append(f"interrupted; {what}")
+
+    def ask_about_takeover(self, decide: adopt_entries.Decide) -> None:
+        """Resolve entries already in folders this switch took over first."""
+        assert self.result is not None
+        try:
+            adopt_entries.resolve(
+                self.homes.respec_home,
+                adopt_entries.taken_over(self.homes.respec_home, self.backups()),
+                decide,
+                adopt_entries.takeover_profile(self.result),
+                done=self.resolutions,
+            )
+        except PROMPT_ABORTED:
+            self.interrupted("the remaining entries stay as they are")
+        except RespecError as error:
+            self.errors.append(str(error))
+
+    def link(self) -> None:
+        try:
+            self.linked += adopt_entries.link_added(
+                self.homes.respec_home, self.homes.user_home, self.resolutions
+            ).linked
+        except switch.LinkFailed as error:
+            self.linked += error.linked
+            self.errors.append(str(error))
+        except RespecError as error:
+            self.errors.append(str(error))
+
+    def backups(self) -> dict[str, str]:
+        """Folders taken over by this run (also when it failed), from state."""
+        try:
+            return switch.new_backups(self.homes.respec_home, self.owned_before)
+        except RespecError as error:
+            self.errors.append(str(error))
+            return dict(self.result.backups) if self.result else {}
+
+    def finish(self, as_json: bool) -> None:
+        """Report everything, then exit 1 unless the switch and its choices
+        all went through (an interrupted takeover prompt still exits 0)."""
+        if self.prompt_cut and not as_json:
+            typer.echo()  # end the interrupted prompt's line
+        backups = self.backups()
+        result = self.result
+        if not as_json:
+            for resolution in self.resolutions:
+                _report_resolution(resolution)
+            for path in self.linked:
+                typer.echo(f"  linked {path}")
+            for target, backup in backups.items():
+                typer.echo(f"Backed up {target} folder to {backup}")
+            if result is not None:
+                if result.removed:
+                    left = f" of profile {result.previous!r}" if result.previous else ""
+                    typer.echo(f"Removed {len(result.removed)} skills{left}")
+                typer.echo(
+                    f"Switched to profile {result.profile!r}: "
+                    f"installed {len(result.installed)} skills"
+                )
+        for error in self.errors:
+            _failure.append(error)
+            typer.echo(f"error: {error}", err=True)
+        for notice in self.notices:
+            typer.echo(f"warning: {notice}", err=True)
+        warnings = _warn_unresolved(self.homes)
+        if as_json:
+            data: dict[str, Any] = {
+                "active_profile": result.profile if result else None,
+                "previous_profile": result.previous if result else None,
+                "backups": backups,
+                "removed": [item.path for item in result.removed] if result else [],
+                "installed": (
+                    [vars(item) for item in result.installed] if result else []
+                ),
+                "resolved": [resolution.to_dict() for resolution in self.resolutions],
+                "linked": self.linked,
+                "warnings": warnings,
+            }
+            if self.errors:
+                data["error"] = "\n".join(self.errors)
+            _print_json(data)
+        if self.errors or result is None:
+            raise typer.Exit(code=1)
 
 
 @app.command("use")
@@ -287,9 +443,12 @@ def use(
         typer.Option(
             "--unknown",
             help=(
-                "What to do with every unknown entry in owned folders: add "
-                "(to this profile), backup (and remove) or keep (unmanaged). "
-                "Without it, a terminal asks per entry; other runs stop."
+                "What to do with unknown entries where this switch installs or "
+                "removes a skill: add (to the profile active now) or remove "
+                "(after a backup). Without it, a terminal asks per entry; "
+                "other runs stop. On a terminal it also applies to entries "
+                "already in a folder this switch takes over for the first "
+                "time. Unknown entries elsewhere only warn."
             ),
             show_default=False,
         ),
@@ -298,54 +457,62 @@ def use(
 ) -> None:
     """Activate a profile: remove the previous profile's skills, install this one."""
     homes = _homes(ctx)
-    resolutions: list[adopt_entries.Resolution] = []
+    interactive = _interactive() and not as_json
+    try:
+        state = load_state(homes.respec_home)
+    except RespecError as error:
+        _fail(error)
+    previous = state.active_profile
+    run = _SwitchRun(homes, name, set(state.owned))
     decide: adopt_entries.Decide | None = None
     if on_unknown is not None:
+        if on_unknown.value not in adopt_entries.choices(previous):
+            _fail(
+                RespecError(
+                    "'--unknown add' adds to the profile active now, and no "
+                    "profile is active; use '--unknown remove' instead. On a "
+                    "terminal without '--unknown', entries found at the first "
+                    "takeover can be added to the profile being activated."
+                )
+            )
         policy = on_unknown.value
         decide = lambda entry: policy  # noqa: E731
-    elif _interactive() and not as_json:
-        decide = lambda entry: _prompt_choice(entry, name)  # noqa: E731
+    elif interactive:
+        decide = lambda entry: _prompt_choice(entry, previous)  # noqa: E731
 
     handler: switch.UnknownHandler | None = None
     if decide is not None:
         chosen = decide
 
         def handler(entries: list[unknown.Unknown]) -> None:
-            resolutions.extend(
-                adopt_entries.resolve(homes.respec_home, entries, chosen, name)
+            adopt_entries.resolve(
+                homes.respec_home, entries, chosen, previous, done=run.resolutions
             )
 
     try:
-        result = switch.use(
+        run.result = switch.use(
             homes.respec_home, homes.user_home, name, on_unknown=handler
         )
-    except RespecError as error:
-        for resolution in resolutions:
-            _report_resolution(resolution)
-        _fail(error)
-    if as_json:
-        _print_json(
-            {
-                "active_profile": result.profile,
-                "previous_profile": result.previous,
-                "backups": result.backups,
-                "removed": [item.path for item in result.removed],
-                "installed": [vars(item) for item in result.installed],
-                "unknown": [resolution.to_dict() for resolution in resolutions],
-            }
+    except PROMPT_ABORTED:
+        run.interrupted(f"the switch to profile {name!r} did not happen")
+    except switch.UnknownEntries as error:
+        run.errors.append(
+            f"{error}\nOr pass "
+            f"'--unknown {'|'.join(adopt_entries.choices(previous))}' "
+            "to 'respec use'."
         )
-        return
-    for resolution in resolutions:
-        _report_resolution(resolution)
-    for target, backup in result.backups.items():
-        typer.echo(f"Backed up {target} folder to {backup}")
-    if result.removed:
-        previous = f" of profile {result.previous!r}" if result.previous else ""
-        typer.echo(f"Removed {len(result.removed)} skills{previous}")
-    typer.echo(
-        f"Switched to profile {result.profile!r}: "
-        f"installed {len(result.installed)} skills"
-    )
+    except RespecError as error:
+        run.errors.append(str(error))
+    if run.result is not None and interactive:
+        takeover = adopt_entries.takeover_profile(run.result)
+        ask = decide if on_unknown is not None else None
+        if ask is None:
+            ask = lambda entry: _prompt_choice(entry, takeover)  # noqa: E731
+        run.ask_about_takeover(ask)
+    # Skills added to the profile active now (the one being left, when the
+    # switch did not happen; the new one, for takeover entries) get linked.
+    run.link()
+    run.finish(as_json)
 
 
 @app.command("status")
@@ -378,12 +545,10 @@ def status(ctx: typer.Context, as_json: JsonOption = False) -> None:
             any_unknown = True
             replaced = ", replaced a managed skill" if entry["replaced"] else ""
             typer.echo(f"  {entry['name']}  unknown {entry['kind']}{replaced}")
-        for entry in folder["unmanaged"]:
-            typer.echo(f"  {entry['name']}  unmanaged (kept)")
     if any_unknown:
         typer.echo(
             "Unknown entries were not placed by respec. Resolve them with "
-            "'respec adopt' (add to profile, back up and remove, or keep)."
+            "'respec adopt' (add to the active profile, or back up and remove)."
         )
 
 
@@ -399,9 +564,11 @@ ProfileOption = Annotated[
 SkillArgument = Annotated[str, typer.Argument(help="Skill name.")]
 
 
-def _report_change(change: items.SkillChange, as_json: bool) -> None:
+def _report_change(
+    change: items.SkillChange, as_json: bool, warnings: list[dict[str, Any]]
+) -> None:
     if as_json:
-        _print_json(change.to_dict())
+        _print_json({**change.to_dict(), "warnings": warnings})
         return
     messages = {
         "add": f"Added {change.skill!r} to profile {change.profile!r}",
@@ -456,15 +623,18 @@ def add(
             change = items.add(homes.respec_home, homes.user_home, local, profile)
     except RespecError as error:
         _fail(error)
+    warnings = _warn_unresolved(homes)
     if from_git:
-        _report_sourced(sourced, as_json)
+        _report_sourced(sourced, as_json, warnings)
     else:
-        _report_change(change, as_json)
+        _report_change(change, as_json, warnings)
 
 
-def _report_sourced(change: sources.SourceChange, as_json: bool) -> None:
+def _report_sourced(
+    change: sources.SourceChange, as_json: bool, warnings: list[dict[str, Any]]
+) -> None:
     if as_json:
-        _print_json(change.to_dict())
+        _print_json({**change.to_dict(), "warnings": warnings})
         return
     for skill in change.skills:
         origin = change.sources[skill]
@@ -490,7 +660,7 @@ def remove(
         change = items.remove(homes.respec_home, homes.user_home, skill, profile)
     except RespecError as error:
         _fail(error)
-    _report_change(change, as_json)
+    _report_change(change, as_json, _warn_unresolved(homes))
 
 
 def _set_enabled(
@@ -503,7 +673,7 @@ def _set_enabled(
         )
     except RespecError as error:
         _fail(error)
-    _report_change(change, as_json)
+    _report_change(change, as_json, _warn_unresolved(homes))
 
 
 @app.command("enable")
@@ -535,9 +705,11 @@ app.add_typer(layer_app, name="layer")
 LayerArgument = Annotated[str, typer.Argument(help="Layer name.")]
 
 
-def _report_layer_change(change: layers.LayerChange, as_json: bool) -> None:
+def _report_layer_change(
+    change: layers.LayerChange, as_json: bool, warnings: list[dict[str, Any]]
+) -> None:
     if as_json:
-        _print_json(change.to_dict())
+        _print_json({**change.to_dict(), "warnings": warnings})
         return
     where = f"layer {change.layer!r} of profile {change.profile!r}"
     messages = {
@@ -649,7 +821,7 @@ def layer_add(
         change = layers.add(homes.respec_home, name, exclusive, description, profile)
     except RespecError as error:
         _fail(error)
-    _report_layer_change(change, as_json)
+    _report_layer_change(change, as_json, _warn_unresolved(homes))
 
 
 @layer_app.command("rm")
@@ -665,7 +837,7 @@ def layer_rm(
         change = layers.remove(homes.respec_home, name, profile)
     except RespecError as error:
         _fail(error)
-    _report_layer_change(change, as_json)
+    _report_layer_change(change, as_json, _warn_unresolved(homes))
 
 
 def _layer_skill_command(ctx, function, name, skill, profile, as_json) -> None:
@@ -674,7 +846,7 @@ def _layer_skill_command(ctx, function, name, skill, profile, as_json) -> None:
         change = function(homes.respec_home, homes.user_home, name, skill, profile)
     except RespecError as error:
         _fail(error)
-    _report_layer_change(change, as_json)
+    _report_layer_change(change, as_json, _warn_unresolved(homes))
 
 
 @layer_app.command("use")
@@ -719,7 +891,7 @@ def _layer_flag_command(ctx, function, name, value, profile, as_json) -> None:
         change = function(homes.respec_home, homes.user_home, name, value, profile)
     except RespecError as error:
         _fail(error)
-    _report_layer_change(change, as_json)
+    _report_layer_change(change, as_json, _warn_unresolved(homes))
 
 
 @layer_app.command("enable")
@@ -808,7 +980,7 @@ def layer_repair(
         )
     except RespecError as error:
         _fail(error)
-    _report_layer_change(change, as_json)
+    _report_layer_change(change, as_json, _warn_unresolved(homes))
 
 
 def _selector_matches(selector: str, entry: unknown.Unknown) -> bool:
@@ -825,53 +997,39 @@ def adopt(
     add_entries: Annotated[
         list[str],
         typer.Option(
-            "--add", help="Add this entry (name or path) to the profile. Repeatable."
+            "--add",
+            help="Add this entry (name or path) to the active profile. Repeatable.",
         ),
     ] = [],
-    backup_entries: Annotated[
+    remove_entries: Annotated[
         list[str],
         typer.Option(
-            "--backup", help="Back up and remove this entry (name or path). Repeatable."
-        ),
-    ] = [],
-    keep_entries: Annotated[
-        list[str],
-        typer.Option(
-            "--keep", help="Keep this entry (name or path) unmanaged. Repeatable."
+            "--remove",
+            help="Back up and remove this entry (name or path). Repeatable.",
         ),
     ] = [],
     all_choice: Annotated[
         Optional[UnknownChoice],
         typer.Option(
             "--all",
-            help="Choice for every entry not named by --add, --backup or --keep.",
-            show_default=False,
-        ),
-    ] = None,
-    profile: Annotated[
-        Optional[str],
-        typer.Option(
-            "--profile",
-            "-p",
-            help="Profile that --add copies into (default: the active profile).",
+            help="Choice for every entry not named by --add or --remove.",
             show_default=False,
         ),
     ] = None,
     as_json: JsonOption = False,
 ) -> None:
-    """Resolve unknown entries in folders respec owns.
+    """Resolve unknown entries in folders respec owns: add or remove each.
 
-    Without choices, a terminal asks per entry; other runs only list them.
+    Add copies an entry into the active profile (an edited copy of one of its
+    skills replaces the profile's copy). Remove backs it up first. Without
+    choices, a terminal asks per entry; other runs only list them.
     """
     homes = _homes(ctx)
+    done: list[adopt_entries.Resolution] = []
     try:
-        entries = adopt_entries.find(homes.respec_home)
+        entries = adopt_entries.unresolved(homes.respec_home)
         chosen: dict[str, str] = {}
-        for choice, selectors in (
-            ("add", add_entries),
-            ("backup", backup_entries),
-            ("keep", keep_entries),
-        ):
+        for choice, selectors in (("add", add_entries), ("remove", remove_entries)):
             for selector in selectors:
                 matches = [e for e in entries if _selector_matches(selector, e)]
                 if not matches:
@@ -881,20 +1039,30 @@ def adopt(
                         raise RespecError(f"{entry.path} was given two choices")
                     chosen[entry.path] = choice
         prompt = _interactive() and not as_json
-        label = profile or load_state(homes.respec_home).active_profile
+        active = load_state(homes.respec_home).active_profile
 
         def decide(entry: unknown.Unknown) -> str | None:
             if entry.path in chosen:
                 return chosen[entry.path]
             if all_choice is not None:
                 return all_choice.value
-            return _prompt_choice(entry, label) if prompt else None
+            return _prompt_choice(entry, active) if prompt else None
 
         result = adopt_entries.adopt(
-            homes.respec_home, homes.user_home, decide, profile
+            homes.respec_home, homes.user_home, decide, done=done
         )
+    except PROMPT_ABORTED:
+        typer.echo()  # end the interrupted prompt's line
+        for resolution in done:
+            _report_resolution(resolution)
+        typer.echo(
+            "warning: interrupted; the remaining entries stay as they are. "
+            "Run 'respec adopt' again to resolve them.",
+            err=True,
+        )
+        return
     except RespecError as error:
-        _fail(error)
+        _fail_after(done, error, as_json)
     if as_json:
         _print_json(
             {
@@ -911,8 +1079,8 @@ def adopt(
     if result.unknown:
         typer.echo("Unknown entries left as they are:")
         for entry in result.unknown:
-            typer.echo(f"  {entry.path}  ({entry.kind})")
-        typer.echo("Choose with --add, --backup or --keep <name>, or --all <choice>.")
+            typer.echo(f"  {switch.describe(entry)}")
+        typer.echo("Choose with --add or --remove <name>, or --all add|remove.")
     elif not result.resolved:
         typer.echo("No unknown entries.")
 
@@ -936,7 +1104,7 @@ def restore(
             "--unknown",
             help=(
                 "What to do with every unknown entry the backup would overwrite: "
-                "add (to the profile), backup (and remove) or keep (unmanaged)."
+                "add (to the active profile) or remove (after a backup)."
             ),
             show_default=False,
         ),
@@ -948,15 +1116,6 @@ def restore(
             help="Back up entries the backup would overwrite, then replace them.",
         ),
     ] = False,
-    profile: Annotated[
-        Optional[str],
-        typer.Option(
-            "--profile",
-            "-p",
-            help="Profile that 'add' copies into (default: the active profile).",
-            show_default=False,
-        ),
-    ] = None,
     as_json: JsonOption = False,
 ) -> None:
     """Put a backup back and release every folder respec owns."""
@@ -977,46 +1136,42 @@ def restore(
         return
     interactive = _interactive() and not as_json
     resolutions: list[adopt_entries.Resolution] = []
+    try:
+        profile = load_state(homes.respec_home).active_profile
+    except RespecError as error:
+        _fail(error)
     decide: adopt_entries.Decide | None = None
     if on_unknown is not None:
         policy = on_unknown.value
         decide = lambda entry: policy  # noqa: E731
     elif interactive and not overwrite:
-        label = profile or load_state(homes.respec_home).active_profile
-        decide = lambda entry: _prompt_choice(entry, label)  # noqa: E731
+        decide = lambda entry: _prompt_choice(entry, profile)  # noqa: E731
 
     handler: switch.UnknownHandler | None = None
     if decide is not None:
         chosen = decide
 
         def handler(entries: list[unknown.Unknown]) -> None:
-            resolutions.extend(
-                adopt_entries.resolve(homes.respec_home, entries, chosen, profile)
+            adopt_entries.resolve(
+                homes.respec_home, entries, chosen, profile, done=resolutions
             )
 
-    def attempt(confirmed: bool) -> restore_backups.RestoreResult:
-        return restore_backups.restore(
+    try:
+        result = restore_backups.restore(
             homes.respec_home,
             homes.user_home,
             backup,
             on_unknown=handler,
-            overwrite=confirmed,
+            overwrite=overwrite,
         )
-
-    try:
-        try:
-            result = attempt(overwrite)
-        except restore_backups.RestoreBlocked as blocked:
-            if not interactive:
-                raise
-            typer.echo(str(blocked))
-            if not typer.confirm("Back these up and overwrite them?"):
-                raise
-            result = attempt(True)
+    except PROMPT_ABORTED:
+        _fail_after(
+            resolutions,
+            RespecError("interrupted; nothing was restored"),
+            as_json,
+        )
     except RespecError as error:
-        for resolution in resolutions:
-            _report_resolution(resolution)
-        _fail(error)
+        _fail_after(resolutions, error, as_json)
     if as_json:
         _print_json(
             {
@@ -1041,7 +1196,7 @@ def restore(
     for path in result.skipped:
         typer.echo(f"Skipped {path}: respec's own skill, not restored")
     for path in result.left:
-        typer.echo(f"Left {path} in place: kept or hidden, not in the backup")
+        typer.echo(f"Left {path} in place: hidden, not in the backup")
     typer.echo("respec released its folders; no profile is active.")
 
 
@@ -1086,8 +1241,9 @@ def update(
     except RespecError as error:
         _fail(error)
     failed = any(row["result"] == "error" for row in result.skills)
+    warnings = _warn_unresolved(homes)
     if as_json:
-        _print_json(result.to_dict())
+        _print_json({**result.to_dict(), "warnings": warnings})
     else:
         if not result.skills:
             typer.echo(f"Profile {result.profile!r} has no skills with a source.")

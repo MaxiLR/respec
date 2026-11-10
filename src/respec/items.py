@@ -127,7 +127,15 @@ def _refresh(
         return
     change.active = True
     try:
-        result = switch.use(respec_home, user_home, change.profile)
+        result = switch.use(respec_home, user_home, change.profile, action="refresh")
+    except switch.UnknownEntries as error:
+        undo()
+        raise switch.UnknownEntries(
+            change.profile,
+            error.entries,
+            lead=f"cannot refresh profile {change.profile!r}",
+            note=f"Profile {change.profile!r} was left unchanged.",
+        ) from None
     except switch.SwitchBlocked as error:
         undo()
         raise switch.SwitchBlocked(

@@ -248,19 +248,22 @@ def drop_skill(folder, name):
     return folder / name
 
 
-def test_unknown_entry_opens_dialog_and_backup_choice_switches(
+def test_unknown_entry_in_the_way_opens_dialog_with_two_choices_and_remove_switches(
     isolated_homes, respec_home, two_profiles, dirs, run
 ):
-    foreign = drop_skill(dirs["claude-code"], "stray")
+    foreign = drop_skill(dirs["oh-my-pi"], "b1")
 
     async def scenario(app, pilot):
         await pilot.click("#profile-beta")
         await pilot.click("#activate")
         await pilot.pause()
         dialog = app.screen
-        assert "stray" in text_of(dialog.query_one("#unknown-0 .unknown-path"))
+        assert "b1" in text_of(dialog.query_one("#unknown-0 .unknown-path"))
+        buttons = [b.id for b in dialog.query("RadioButton")]
+        assert buttons == ["unknown-0-add", "unknown-0-remove"]
+        assert "alpha" in str(dialog.query_one("#unknown-0-add").label)
         assert dialog.query_one("#apply").disabled
-        await pilot.click("#unknown-0-backup")
+        await pilot.click("#unknown-0-remove")
         await pilot.pause()
         assert not dialog.query_one("#apply").disabled
         await pilot.click("#apply")
@@ -270,15 +273,32 @@ def test_unknown_entry_opens_dialog_and_backup_choice_switches(
     drive(isolated_homes, scenario)
 
     assert status_json(run)["active_profile"] == "beta"
-    assert not foreign.exists()
-    backups = list((respec_home / "backups").glob("*/claude-code/stray/SKILL.md"))
-    assert [path.read_text() for path in backups] == ["foreign\n"]
+    assert foreign.is_symlink()
+    backups = list((respec_home / "backups").glob("*/oh-my-pi/b1/SKILL.md"))
+    assert "foreign\n" in [path.read_text() for path in backups]
+
+
+def test_unknown_entry_elsewhere_does_not_open_the_dialog(
+    isolated_homes, two_profiles, dirs, run
+):
+    foreign = drop_skill(dirs["claude-code"], "stray")
+
+    async def scenario(app, pilot):
+        await pilot.click("#profile-beta")
+        await pilot.click("#activate")
+        await pilot.pause()
+        assert not app.screen.query("RadioButton")
+
+    drive(isolated_homes, scenario)
+
+    assert status_json(run)["active_profile"] == "beta"
+    assert (foreign / "SKILL.md").read_text() == "foreign\n"
 
 
 def test_cancelling_the_unknown_dialog_leaves_everything(
     isolated_homes, two_profiles, dirs, run
 ):
-    foreign = drop_skill(dirs["claude-code"], "stray")
+    foreign = drop_skill(dirs["oh-my-pi"], "b1")
 
     async def scenario(app, pilot):
         await pilot.click("#profile-beta")
@@ -296,10 +316,10 @@ def test_cancelling_the_unknown_dialog_leaves_everything(
     assert (dirs["claude-code"] / "a1").is_symlink()
 
 
-def test_add_choice_adds_entry_to_the_profile_being_activated(
+def test_add_choice_adds_entry_to_the_profile_being_left(
     isolated_homes, respec_home, two_profiles, dirs, run
 ):
-    drop_skill(dirs["agents"], "stray")
+    drop_skill(dirs["oh-my-pi"], "b1")
 
     async def scenario(app, pilot):
         app.query_one("#profiles").focus()
@@ -312,47 +332,95 @@ def test_add_choice_adds_entry_to_the_profile_being_activated(
     drive(isolated_homes, scenario)
 
     assert status_json(run)["active_profile"] == "beta"
-    added = respec_home / "profiles" / "beta" / "skills" / "stray" / "SKILL.md"
+    added = respec_home / "profiles" / "alpha" / "skills" / "b1" / "SKILL.md"
     assert added.read_text() == "foreign\n"
-    assert (dirs["oh-my-pi"] / "stray").is_symlink()
-    assert not (dirs["agents"] / "stray").exists()
+    link = dirs["oh-my-pi"] / "b1"
+    assert link.is_symlink()
+    assert (link / "SKILL.md").read_text() == "# b1 from beta\n"
 
 
-def test_status_panel_flags_unknown_and_adopt_key_keeps_it(
-    isolated_homes, two_profiles, dirs, run
+def test_without_an_active_profile_the_dialog_offers_only_remove(
+    isolated_homes, respec_home, two_profiles, dirs, run
 ):
+    state_path = respec_home / "state.json"
+    state = json.loads(state_path.read_text())
+    state["active_profile"] = None
+    state_path.write_text(json.dumps(state))
     drop_skill(dirs["claude-code"], "stray")
+
+    async def scenario(app, pilot):
+        await pilot.press("a")
+        await pilot.pause()
+        buttons = [b.id for b in app.screen.query("RadioButton")]
+        assert buttons == ["unknown-0-remove"]
+
+    drive(isolated_homes, scenario)
+
+
+def test_status_panel_flags_unknown_and_adopt_key_removes_it(
+    isolated_homes, respec_home, two_profiles, dirs, run
+):
+    stray = drop_skill(dirs["claude-code"], "stray")
 
     async def scenario(app, pilot):
         assert "unknown" in text_of(app.query_one("#folder-claude-code"))
         await pilot.press("a")
         await pilot.pause()
-        await pilot.click("#unknown-0-keep")
+        assert not app.screen.query("#unknown-0-keep")
+        await pilot.click("#unknown-0-remove")
         await pilot.click("#apply")
         await pilot.pause()
         panel = text_of(app.query_one("#folder-claude-code"))
-        assert "kept" in panel and "unknown" not in panel
+        assert "stray" not in panel and "unknown" not in panel
 
     drive(isolated_homes, scenario)
 
     report = status_json(run)
     claude = next(f for f in report["folders"] if f["target"] == "claude-code")
     assert claude["unknown"] == []
-    assert [entry["name"] for entry in claude["unmanaged"]] == ["stray"]
-    assert (dirs["claude-code"] / "stray").is_dir()
+    assert not stray.exists()
+    backups = list((respec_home / "backups").glob("*/claude-code/stray/SKILL.md"))
+    assert [path.read_text() for path in backups] == ["foreign\n"]
 
 
-def test_entry_appearing_after_the_dialog_opened_blocks_the_switch(
-    isolated_homes, two_profiles, dirs, run
+def test_first_takeover_asks_about_existing_entries_right_away(
+    isolated_homes, respec_home, two_profiles, dirs, run
 ):
-    first = drop_skill(dirs["claude-code"], "stray")
+    old = drop_skill(dirs["oh-my-pi"], "old")
 
     async def scenario(app, pilot):
         await pilot.click("#profile-beta")
         await pilot.click("#activate")
         await pilot.pause()
-        await pilot.click("#unknown-0-backup")
-        late = drop_skill(dirs["agents"], "late")
+        dialog = app.screen
+        assert str(old) in text_of(dialog.query_one("#unknown-0 .unknown-path"))
+        assert "alpha" in str(dialog.query_one("#unknown-0-add").label)
+        await pilot.click("#unknown-0-add")
+        await pilot.click("#apply")
+        await pilot.pause()
+
+    drive(isolated_homes, scenario)
+
+    assert status_json(run)["active_profile"] == "beta"
+    added = respec_home / "profiles" / "alpha" / "skills" / "old" / "SKILL.md"
+    assert added.read_text() == "foreign\n"
+    assert not old.exists()
+    takeover = list((respec_home / "backups").glob("*/oh-my-pi/old/SKILL.md"))
+    assert [path.read_text() for path in takeover] == ["foreign\n"]
+
+
+def test_entry_appearing_after_the_dialog_opened_blocks_the_switch(
+    isolated_homes, respec_home, two_profiles, dirs, run
+):
+    make_profile(respec_home, "gamma", ["claude-code", "agents"], ["g1", "g2"])
+    first = drop_skill(dirs["claude-code"], "g1")
+
+    async def scenario(app, pilot):
+        await pilot.click("#profile-gamma")
+        await pilot.click("#activate")
+        await pilot.pause()
+        await pilot.click("#unknown-0-remove")
+        late = drop_skill(dirs["agents"], "g2")
         await pilot.click("#apply")
         await pilot.pause()
         # Asked again, now about every entry, before anything changed.
@@ -364,29 +432,140 @@ def test_entry_appearing_after_the_dialog_opened_blocks_the_switch(
 
     assert status_json(run)["active_profile"] == "alpha"
     assert (first / "SKILL.md").read_text() == "foreign\n"
-    assert (dirs["agents"] / "late" / "SKILL.md").read_text() == "foreign\n"
+    assert (dirs["agents"] / "g2" / "SKILL.md").read_text() == "foreign\n"
 
 
 def test_failed_switch_after_choices_reports_what_was_resolved(
     isolated_homes, respec_home, two_profiles, dirs, run
 ):
-    drop_skill(dirs["claude-code"], "stray")
-    # beta's enabled skill has no folder: the switch fails after the choices.
-    (respec_home / "profiles" / "beta" / "skills" / "b1" / "SKILL.md").unlink()
-    (respec_home / "profiles" / "beta" / "skills" / "b1").rmdir()
+    make_profile(respec_home, "gamma", ["claude-code"], ["g1", "g2"])
+    drop_skill(dirs["claude-code"], "g1")
+    # A loose file cannot be added as a skill: the second choice fails.
+    (dirs["claude-code"] / "g2").write_text("loose\n")
+
+    async def scenario(app, pilot):
+        await pilot.click("#profile-gamma")
+        await pilot.click("#activate")
+        await pilot.pause()
+        await pilot.click("#unknown-0-remove")
+        await pilot.click("#unknown-1-add")
+        await pilot.click("#apply")
+        await pilot.pause()
+        feedback = text_of(app.query_one("#feedback"))
+        assert "error" in feedback.lower()
+        assert "Backed up" in feedback and "g1" in feedback
+
+    drive(isolated_homes, scenario)
+
+    assert status_json(run)["active_profile"] == "alpha"
+    assert not (dirs["claude-code"] / "g1").exists()
+    assert (dirs["claude-code"] / "g2").read_text() == "loose\n"
+
+
+def test_failed_takeover_choice_in_the_tui_reports_what_was_resolved(
+    isolated_homes, respec_home, two_profiles, dirs, run
+):
+    aa = drop_skill(dirs["oh-my-pi"], "aa")
+    (dirs["oh-my-pi"] / "zz").mkdir()  # no SKILL.md: adding it fails
 
     async def scenario(app, pilot):
         await pilot.click("#profile-beta")
         await pilot.click("#activate")
         await pilot.pause()
-        await pilot.click("#unknown-0-backup")
+        await pilot.click("#unknown-0-remove")
+        await pilot.click("#unknown-1-add")
         await pilot.click("#apply")
         await pilot.pause()
         feedback = text_of(app.query_one("#feedback"))
         assert "error" in feedback.lower()
-        assert "Backed up" in feedback and "stray" in feedback
+        assert "Backed up" in feedback and str(aa) in feedback
+
+    drive(isolated_homes, scenario)
+
+    assert status_json(run)["active_profile"] == "beta"
+    assert not aa.exists()
+
+
+def test_very_first_takeover_in_the_tui_adds_to_the_profile_being_activated(
+    isolated_homes, respec_home, dirs, run
+):
+    make_profile(respec_home, "beta", ["oh-my-pi"], ["b1"])
+    old = drop_skill(dirs["oh-my-pi"], "old")
+
+    async def scenario(app, pilot):
+        await pilot.click("#profile-beta")
+        await pilot.click("#activate")
+        await pilot.pause()
+        assert "beta" in str(app.screen.query_one("#unknown-0-add").label)
+        await pilot.click("#unknown-0-add")
+        await pilot.click("#apply")
+        await pilot.pause()
+
+    drive(isolated_homes, scenario)
+
+    added = respec_home / "profiles" / "beta" / "skills" / "old" / "SKILL.md"
+    assert added.read_text() == "foreign\n"
+    assert old.is_symlink()
+
+
+def test_tui_names_what_it_resolved_and_where_backups_went(
+    isolated_homes, respec_home, two_profiles, dirs, run
+):
+    stray = drop_skill(dirs["claude-code"], "stray")
+
+    async def scenario(app, pilot):
+        await pilot.press("a")
+        await pilot.pause()
+        await pilot.click("#unknown-0-remove")
+        await pilot.click("#apply")
+        await pilot.pause()
+        feedback = text_of(app.query_one("#feedback"))
+        assert f"Backed up {stray}" in feedback
+
+    drive(isolated_homes, scenario)
+
+
+def test_tui_says_an_overwriting_add_replaced_the_profile_copy(
+    isolated_homes, respec_home, two_profiles, dirs, run
+):
+    link = dirs["claude-code"] / "a1"
+    link.unlink()
+    drop_skill(dirs["claude-code"], "a1")
+
+    async def scenario(app, pilot):
+        await pilot.press("a")
+        await pilot.pause()
+        await pilot.click("#unknown-0-add")
+        await pilot.click("#apply")
+        await pilot.pause()
+        feedback = text_of(app.query_one("#feedback"))
+        assert "Replaced" in feedback and "backed up" in feedback
+
+    drive(isolated_homes, scenario)
+
+    copy = respec_home / "profiles" / "alpha" / "skills" / "a1" / "SKILL.md"
+    assert copy.read_text() == "foreign\n"
+
+
+def test_failed_switch_in_the_tui_names_the_folder_it_took_over(
+    isolated_homes, respec_home, two_profiles, dirs, run
+):
+    make_profile(respec_home, "gamma", ["oh-my-pi"], ["g1", "g2"])
+    drop_skill(dirs["oh-my-pi"], "g1")
+    (dirs["oh-my-pi"] / "g2").write_text("loose\n")  # adding a file fails
+
+    async def scenario(app, pilot):
+        await pilot.click("#profile-gamma")
+        await pilot.click("#activate")
+        await pilot.pause()
+        await pilot.click("#unknown-0-remove")
+        await pilot.click("#unknown-1-add")
+        await pilot.click("#apply")
+        await pilot.pause()
+        feedback = text_of(app.query_one("#feedback"))
+        assert "error" in feedback.lower()
+        assert "Backed up oh-my-pi folder to" in feedback
 
     drive(isolated_homes, scenario)
 
     assert status_json(run)["active_profile"] == "alpha"
-    assert not (dirs["claude-code"] / "stray").exists()

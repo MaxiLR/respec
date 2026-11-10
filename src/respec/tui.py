@@ -186,7 +186,7 @@ def _folder_text(folder: dict[str, Any]) -> Text:
             Text.assemble(("● ", SUCCESS), skill["name"], (f"  {skill['mode']}", MUTED))
         )
     for entry in folder["unknown"]:
-        replaced = ", replaced a managed skill" if entry["replaced"] else ""
+        replaced = ", edited or replaced copy" if entry["replaced"] else ""
         lines.append(
             Text.assemble(
                 ("▲ ", WARNING),
@@ -194,24 +194,20 @@ def _folder_text(folder: dict[str, Any]) -> Text:
                 (f"  unknown {entry['kind']}{replaced}", WARNING),
             )
         )
-    for entry in folder["unmanaged"]:
-        lines.append(
-            Text.assemble(("○ ", MUTED), entry["name"], ("  kept unmanaged", MUTED))
-        )
     if not lines:
         lines.append(Text("no managed skills", style=MUTED))
     text.append(Text("\n").join(lines))
     return text
 
 
-def _resolution_text(resolution: adopt.Resolution) -> str:
-    """What happened to one unknown entry (the CLI's wording)."""
-    entry = resolution.entry
-    if resolution.choice == "add":
-        return f"Added {entry.path} to profile {resolution.profile}"
-    if resolution.choice == "backup":
-        return f"Backed up {entry.path} to {resolution.backup} and removed it"
-    return f"Kept {entry.path} unmanaged"
+def _backup_lines(backups: dict[str, str]) -> list[str]:
+    """Folders respec took over, with their backups (the CLI's wording)."""
+    return [f"Backed up {target} folder to {path}" for target, path in backups.items()]
+
+
+def _resolved_text(lead: str, resolved: Sequence[adopt.Resolution]) -> str:
+    """``lead``, then what happened to each entry (the CLI's wording)."""
+    return "\n".join([lead, *(resolution.describe() for resolution in resolved)])
 
 
 class ProfileList(ListView):
@@ -244,10 +240,11 @@ class ProfileItem(ListItem):
 
 
 class AdoptDialog(ModalScreen[dict[str, str] | None]):
-    """Ask, per unknown entry: add to profile, back up and remove, or keep.
+    """Ask, per unknown entry: add to the active profile, or back up and remove.
 
-    Dismisses with ``{path: choice}`` (choices from :data:`respec.adopt.CHOICES`)
-    or ``None`` when cancelled.
+    Without a profile to add to, only remove is offered. Dismisses with
+    ``{path: choice}`` (choices from :func:`respec.adopt.choices`) or ``None``
+    when cancelled.
     """
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
@@ -262,16 +259,19 @@ class AdoptDialog(ModalScreen[dict[str, str] | None]):
         self.choices: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
-        add_label = (
-            f"Add to profile {self.profile}" if self.profile else "Add (no profile)"
-        )
+        labels = {
+            "add": f"Add to profile {self.profile}",
+            "remove": "Back up and remove",
+        }
         with Vertical(id="dialog") as dialog:
             dialog.border_title = "Unknown entries"
             yield Static(self.reason, id="dialog-intro")
             with VerticalScroll(id="entries"):
                 for index, entry in enumerate(self.entries):
                     replaced = (
-                        ", replaced a skill respec installed" if entry.replaced else ""
+                        ", an edited or replaced copy of a skill respec installed"
+                        if entry.replaced
+                        else ""
                     )
                     with Vertical(id=f"unknown-{index}", classes="unknown"):
                         yield Static(entry.path, classes="unknown-path")
@@ -280,17 +280,10 @@ class AdoptDialog(ModalScreen[dict[str, str] | None]):
                             classes="unknown-meta",
                         )
                         with RadioSet(id=f"unknown-{index}-choice"):
-                            yield RadioButton(
-                                add_label,
-                                id=f"unknown-{index}-add",
-                                disabled=self.profile is None,
-                            )
-                            yield RadioButton(
-                                "Back up and remove", id=f"unknown-{index}-backup"
-                            )
-                            yield RadioButton(
-                                "Keep unmanaged", id=f"unknown-{index}-keep"
-                            )
+                            for choice in adopt.choices(self.profile):
+                                yield RadioButton(
+                                    labels[choice], id=f"unknown-{index}-{choice}"
+                                )
             with Horizontal(id="dialog-actions"):
                 yield Button("Cancel", id="cancel")
                 yield Button("Apply", id="apply", variant="primary", disabled=True)
@@ -447,14 +440,36 @@ class RespecApp(App[None]):
     async def action_refresh(self) -> None:
         await self.refresh_view()
 
-    def activate(self, name: str, choices: dict[str, str] | None = None) -> None:
-        """Switch to ``name``; unknown entries open the adopt dialog first.
+    def _active_now(self) -> str | None:
+        """The active profile on disk: where ``add`` goes."""
+        try:
+            return load_state(self.respec_home).active_profile
+        except RespecError:
+            return None
+
+    def activate(
+        self,
+        name: str,
+        choices: dict[str, str] | None = None,
+        owned_before: set[str] | None = None,
+    ) -> None:
+        """Switch to ``name``; unknown entries in the way open the adopt dialog.
 
         With ``choices`` (``{path: choice}`` from the dialog) the switch resolves
-        unknown entries through :func:`respec.adopt.resolve`. An entry without a
-        choice (for example one that appeared after the dialog opened) blocks
-        the switch before anything is resolved, and the dialog opens again.
+        them through :func:`respec.adopt.resolve`; ``add`` goes to the profile
+        active now, the one being left. An entry without a choice (for example
+        one that appeared after the dialog opened) blocks the switch before
+        anything is resolved, and the dialog opens again. Entries that were
+        already in a folder the switch took over are asked about right after.
         """
+        previous = self._active_now()
+        if owned_before is None:
+            # Kept across a re-asked dialog, so every takeover is reported.
+            try:
+                owned_before = set(load_state(self.respec_home).owned)
+            except RespecError as error:
+                self._failed(error)
+                return
         resolved: list[adopt.Resolution] = []
         handler: switch.UnknownHandler | None = None
         if choices is not None:
@@ -463,10 +478,12 @@ class RespecApp(App[None]):
             def handler(entries: list[unknown.Unknown]) -> None:
                 if any(entry.path not in decided for entry in entries):
                     raise switch.UnknownEntries(name, entries)
-                resolved.extend(
-                    adopt.resolve(
-                        self.respec_home, entries, lambda e: decided[e.path], name
-                    )
+                adopt.resolve(
+                    self.respec_home,
+                    entries,
+                    lambda e: decided[e.path],
+                    previous,
+                    done=resolved,
                 )
 
         try:
@@ -474,15 +491,30 @@ class RespecApp(App[None]):
                 self.respec_home, self.user_home, name, on_unknown=handler
             )
         except switch.UnknownEntries as blocked:
-            self._ask_then_activate(name, blocked.entries, again=choices is not None)
+            self._ask_then_activate(
+                name, blocked.entries, previous, owned_before, again=choices is not None
+            )
             return
         except RespecError as error:
-            self._failed(error, resolved)
+            self._failed(error, resolved, self._new_backups(owned_before))
             return
-        self._switched(result, resolved)
+        backups = self._new_backups(owned_before)
+        self._switched(result, resolved, backups)
+        self._ask_about_takeover(result, backups)
+
+    def _new_backups(self, owned_before: set[str]) -> dict[str, str]:
+        try:
+            return switch.new_backups(self.respec_home, owned_before)
+        except RespecError:
+            return {}
 
     def _ask_then_activate(
-        self, name: str, entries: list[unknown.Unknown], again: bool
+        self,
+        name: str,
+        entries: list[unknown.Unknown],
+        previous: str | None,
+        owned_before: set[str],
+        again: bool,
     ) -> None:
         def chosen(choices: dict[str, str] | None) -> None:
             if choices is None:
@@ -490,34 +522,87 @@ class RespecApp(App[None]):
                     f"Switch to {name} cancelled; nothing changed.", ok=False
                 )
                 return
-            self.activate(name, choices)
+            self.activate(name, choices, owned_before)
 
         reason = (
-            f"Before switching to {name}: these entries in folders respec owns "
-            "were not placed by respec. Choose for each."
+            f"Before switching to {name}: these entries were not placed by "
+            "respec and sit where it would install or remove a skill. "
+            "Choose for each."
         )
         if again:
             reason = "The unknown entries changed; nothing was done yet. " + reason
-        self.push_screen(AdoptDialog(entries, profile=name, reason=reason), chosen)
+        self.push_screen(AdoptDialog(entries, profile=previous, reason=reason), chosen)
+
+    def _ask_about_takeover(
+        self, result: switch.SwitchResult, backups: dict[str, str]
+    ) -> None:
+        """Ask about entries already in folders this switch took over."""
+        try:
+            entries = adopt.taken_over(self.respec_home, backups)
+        except RespecError as error:
+            self._failed(error)
+            return
+        if not entries:
+            return
+        profile = adopt.takeover_profile(result)
+
+        def chosen(choices: dict[str, str] | None) -> None:
+            if choices is None:
+                self.show_feedback(
+                    "Left them as they are; press a to resolve them later.", ok=False
+                )
+                return
+            resolved: list[adopt.Resolution] = []
+            try:
+                adopt.resolve(
+                    self.respec_home,
+                    entries,
+                    lambda e: choices.get(e.path),
+                    profile,
+                    done=resolved,
+                )
+                adopt.link_added(self.respec_home, self.user_home, resolved)
+            except RespecError as error:
+                self._failed(error, resolved)
+                return
+            self.show_feedback(
+                _resolved_text(f"Resolved {len(resolved)} unknown entries:", resolved),
+                ok=True,
+            )
+            self.call_later(self.refresh_view)
+
+        folders = ", ".join(backups)
+        reason = (
+            f"respec took over {folders} and backed it up. These entries were "
+            "already there. Choose for each."
+        )
+        self.push_screen(AdoptDialog(entries, profile=profile, reason=reason), chosen)
 
     def _switched(
-        self, result: switch.SwitchResult, resolved: list[adopt.Resolution]
+        self,
+        result: switch.SwitchResult,
+        resolved: list[adopt.Resolution],
+        backups: dict[str, str],
     ) -> None:
         parts = [f"Switched to {result.profile}: installed {len(result.installed)}"]
         if result.removed:
             parts.append(f"removed {len(result.removed)}")
-        if result.backups:
-            parts.append(f"backed up {', '.join(result.backups)}")
-        if resolved:
-            parts.append(f"resolved {len(resolved)} unknown")
         self.selected = result.profile
-        self.show_feedback(", ".join(parts), ok=True)
+        lines = [
+            *(resolution.describe() for resolution in resolved),
+            *_backup_lines(backups),
+        ]
+        self.show_feedback("\n".join([", ".join(parts), *lines]), ok=True)
         self.call_later(self.refresh_view)
 
     def _failed(
-        self, error: RespecError, resolved: Sequence[adopt.Resolution] = ()
+        self,
+        error: RespecError,
+        resolved: Sequence[adopt.Resolution] = (),
+        backups: dict[str, str] | None = None,
     ) -> None:
-        done = [_resolution_text(resolution) for resolution in resolved]
+        done = [resolution.describe() for resolution in resolved]
+        done += _backup_lines(backups or {})
         detail = " ".join(line.strip() for line in str(error).splitlines())
         self.show_feedback("\n".join([*done, f"error: {detail}"]), ok=False)
         self.call_later(self.refresh_view)
@@ -525,7 +610,7 @@ class RespecApp(App[None]):
     def action_adopt(self) -> None:
         """Resolve unknown entries outside a switch (``respec adopt``)."""
         try:
-            entries = adopt.find(self.respec_home)
+            entries = adopt.unresolved(self.respec_home)
             active = load_state(self.respec_home).active_profile
         except RespecError as error:
             self._failed(error)
@@ -538,15 +623,23 @@ class RespecApp(App[None]):
             if choices is None:
                 self.show_feedback("Nothing resolved.", ok=False)
                 return
+            done: list[adopt.Resolution] = []
             try:
                 result = adopt.adopt(
-                    self.respec_home, self.user_home, lambda e: choices.get(e.path)
+                    self.respec_home,
+                    self.user_home,
+                    lambda e: choices.get(e.path),
+                    done=done,
                 )
             except RespecError as error:
-                self._failed(error)
+                self._failed(error, done)
                 return
             self.show_feedback(
-                f"Resolved {len(result.resolved)} unknown entries", ok=True
+                _resolved_text(
+                    f"Resolved {len(result.resolved)} unknown entries:",
+                    result.resolved,
+                ),
+                ok=True,
             )
             self.call_later(self.refresh_view)
 
@@ -556,7 +649,7 @@ class RespecApp(App[None]):
                 profile=active,
                 reason=(
                     "These entries in folders respec owns were not placed by "
-                    "respec. Choose for each."
+                    "respec, or are edited copies. Choose for each."
                 ),
             ),
             chosen,

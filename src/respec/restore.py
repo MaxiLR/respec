@@ -3,7 +3,7 @@ ownership of every folder respec took over.
 
 A backup is a run folder ``<respec home>/backups/<run>/`` holding one folder
 per target. Takeover backups are written by the first ``respec use`` of a
-target; ``respec adopt``/``--unknown backup`` runs hold single entries.
+target; ``respec adopt``/``--unknown remove`` runs hold single entries.
 
 Without ``<backup>``, each owned folder gets the backup taken when respec first
 took it over (the earliest takeover of all targets sharing that real folder);
@@ -20,10 +20,10 @@ Order of a restore:
    installed there. Skipped entries are reported.
 1. Conflicts: an entry in a folder being restored that respec does not manage
    and that differs from (or is absent from) the backup would be overwritten.
-   Unknown entries go to ``on_unknown`` (the adopt flow: add, backup, keep);
-   entries kept unmanaged (and hidden ones) stay, and are reported, unless the
-   backup holds the same name. Entries count as identical only with the same
-   bytes, link targets and permissions. Whatever
+   Unknown entries go to ``on_unknown`` (the adopt flow: add or remove);
+   hidden entries stay, and are reported, unless the backup holds the same
+   name. Entries count as identical only with the same bytes, link targets and
+   permissions. Whatever
    still conflicts refuses the restore with :class:`RestoreBlocked`, unless
    ``overwrite`` confirms it: then each is backed up to a fresh run first.
 2. Apply (:func:`_apply`): back up confirmed conflicts, deactivate, remove
@@ -79,7 +79,7 @@ class RestoreResult:
     set_aside: list[adopt.Resolution] = field(default_factory=list)
     released: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)  # backup paths left out
-    left: list[str] = field(default_factory=list)  # kept/hidden, not in backup
+    left: list[str] = field(default_factory=list)  # hidden, not in the backup
 
 
 class RestoreBlocked(RespecError):
@@ -91,7 +91,7 @@ class RestoreBlocked(RespecError):
         super().__init__(
             "cannot restore: these entries are not managed by respec and would "
             f"be overwritten by the backup:\n{lines}\n"
-            "Resolve them with 'respec adopt' or '--unknown add|backup|keep', "
+            "Resolve them with 'respec adopt' or '--unknown add|remove', "
             "or pass '--overwrite' to back them up and replace them."
         )
 
@@ -263,18 +263,16 @@ def _plan(
 
 def _conflicts(
     respec_home: Path, state: State, plans: list[FolderPlan]
-) -> tuple[list[unknown.Unknown], list[unknown.Unknown], list[str]]:
-    """(unknown entries, kept entries) the restore would overwrite, and the
-    kept or hidden entries it leaves in place because the backup lacks them."""
+) -> tuple[list[unknown.Unknown], list[str]]:
+    """Unknown entries the restore would overwrite, and the hidden entries it
+    leaves in place because the backup lacks them."""
     managed = {
         unknown.real(item.path)
         for item in state.installed
         if unknown.is_managed(respec_home, item)
     }
     recorded = {unknown.real(item.path) for item in state.installed}
-    kept = {unknown.real(path) for path in state.unmanaged}
     found: list[unknown.Unknown] = []
-    kept_found: list[unknown.Unknown] = []
     left: list[str] = []
     for plan in plans:
         if not plan.folder.is_dir():
@@ -286,24 +284,18 @@ def _conflicts(
             backed_up = plan.source is not None and entry.name in plan.entries
             if backed_up and _same(entry, plan.source / entry.name):
                 continue
-            if (key in kept or entry.name.startswith(".")) and not backed_up:
+            if entry.name.startswith(".") and not backed_up:
                 left.append(str(entry))
                 continue
             conflict = unknown.Unknown(
                 name=entry.name,
                 path=str(entry),
-                kind=_kind(entry),
+                kind=unknown.kind_of(entry),
                 targets=plan.targets,
                 replaced=key in recorded,
             )
-            (kept_found if key in kept else found).append(conflict)
-    return found, kept_found, left
-
-
-def _kind(entry: Path) -> str:
-    if entry.is_symlink():
-        return "symlink"
-    return "folder" if entry.is_dir() else "file"
+            found.append(conflict)
+    return found, left
 
 
 def _put_back(source: Path, destination: Path) -> None:
@@ -346,7 +338,7 @@ def _apply(
     """Every change a restore makes to disk and ``state.json``, in order."""
     if overwritten:
         result.set_aside = adopt.resolve(
-            respec_home, overwritten, lambda entry: "backup", now=now
+            respec_home, overwritten, lambda entry: "remove", None, now=now
         )
     state = load_state(respec_home)
     state.active_profile = None
@@ -390,15 +382,14 @@ def restore(
         )
     run = _find_run(respec_home, backup) if backup is not None else None
     plans = _plan(respec_home, user_home, state, run)
-    found, kept, left = _conflicts(respec_home, state, plans)
+    found, left = _conflicts(respec_home, state, plans)
     if found and on_unknown is not None:
         on_unknown(found)
         state = load_state(respec_home)
         plans = _plan(respec_home, user_home, state, run)
-        found, kept, left = _conflicts(respec_home, state, plans)
-    blocking = found + kept
-    if blocking and not overwrite:
-        raise RestoreBlocked(blocking)
+        found, left = _conflicts(respec_home, state, plans)
+    if found and not overwrite:
+        raise RestoreBlocked(found)
     result = RestoreResult(backup=run.name if run is not None else None, left=left)
     result.skipped = [
         str(plan.source / name)
@@ -406,5 +397,5 @@ def restore(
         if plan.source is not None
         for name in plan.skipped
     ]
-    _apply(respec_home, plans, blocking, result, now)
+    _apply(respec_home, plans, found, result, now)
     return result

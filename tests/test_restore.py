@@ -103,7 +103,7 @@ def taken_over(run, respec_home, dirs, isolated_homes):
     make_profile(respec_home, "a", ["claude-code", "agents"], ["tdd", "lint"])
     make_profile(respec_home, "b", ["oh-my-pi", "claude-code"], ["review"])
     ok(run("use", "a"))
-    ok(run("use", "b", "--unknown", "keep"))
+    ok(run("use", "b"))
     assert (dirs["oh-my-pi"] / "review").is_symlink()
     return original
 
@@ -119,7 +119,7 @@ def test_restore_returns_every_folder_to_its_takeover_contents_and_releases(
     assert state["active_profile"] is None
     assert state["owned"] == {}
     assert state["installed"] == []
-    assert state["unmanaged"] == []
+    assert "unmanaged" not in state
     assert (
         ok(run("status", "--json")).stdout
         and json.loads(run("status", "--json").stdout)["folders"] == []
@@ -188,17 +188,17 @@ def test_restore_with_unknown_backup_moves_entry_aside_then_restores_exactly(
     (dirs["claude-code"] / "stray").mkdir()
     (dirs["claude-code"] / "stray" / "SKILL.md").write_text("dropped later\n")
 
-    ok(run("restore", "--unknown", "backup"))
+    ok(run("restore", "--unknown", "remove"))
 
     assert snapshot(dirs["claude-code"]) == taken_over["claude-code"]
     saved = list((respec_home / "backups").glob("*/claude-code/stray/SKILL.md"))
     assert [p.read_text() for p in saved] == ["dropped later\n"]
 
 
-def test_kept_entry_that_differs_from_backup_needs_overwrite(
+def test_pre_existing_entry_that_differs_from_backup_needs_overwrite(
     run, respec_home, dirs, taken_over
 ):
-    # "mine" was kept unmanaged during the switch; now someone edits it.
+    # "mine" was left in place during the switch; now someone edits it.
     (dirs["claude-code"] / "mine" / "SKILL.md").write_text("edited after\n")
 
     blocked = run("restore")
@@ -213,18 +213,18 @@ def test_kept_entry_that_differs_from_backup_needs_overwrite(
     assert contents == ["edited after\n", "my own skill\n"]
 
 
-def test_interactive_restore_asks_before_overwriting(
+def test_interactive_restore_asks_add_or_remove_before_overwriting(
     run, respec_home, dirs, taken_over, monkeypatch
 ):
     monkeypatch.setattr(cli, "_interactive", lambda: True)
     (dirs["claude-code"] / "mine" / "SKILL.md").write_text("edited after\n")
 
-    declined = run("restore", input="n\n")
-    assert declined.exit_code == 1
-    assert (dirs["claude-code"] / "mine" / "SKILL.md").read_text() == "edited after\n"
+    result = ok(run("restore", input="remove\n"))
 
-    ok(run("restore", input="y\n"))
+    assert "add to profile 'b'" in result.stdout and "keep" not in result.stdout
     assert snapshot(dirs["claude-code"]) == taken_over["claude-code"]
+    saved = list((respec_home / "backups").glob("*/claude-code/mine/SKILL.md"))
+    assert sorted(p.read_text() for p in saved) == ["edited after\n", "my own skill\n"]
 
 
 @pytest.fixture
@@ -262,7 +262,7 @@ def test_edited_copy_is_never_deleted_silently(run, respec_home, dirs, copy_inst
     assert str(dirs["claude-code"] / "tdd") in blocked.output
     assert edited.read_text() == "edited by hand\n"
 
-    ok(run("restore", "--unknown", "backup"))
+    ok(run("restore", "--unknown", "remove"))
 
     assert snapshot(dirs["claude-code"]) == copy_installed
     saved = list((respec_home / "backups").glob("*/claude-code/tdd/SKILL.md"))
@@ -281,7 +281,7 @@ def shared_folder(run, respec_home, dirs):
     make_profile(respec_home, "a", ["agents"], ["tdd"])
     make_profile(respec_home, "b", ["claude-code"], ["lint"])
     ok(run("use", "a"))
-    ok(run("use", "b", "--unknown", "keep"))
+    ok(run("use", "b"))
     runs = backup_runs(respec_home)
     assert len(runs) == 2
     later = respec_home / "backups" / runs[1] / "claude-code"
@@ -389,7 +389,7 @@ def test_restoring_a_backup_holding_respec_copies_does_not_recreate_them(
     with monkeypatch.context() as patch:
         patch.setattr(os, "symlink", refuse)
         ok(run("use", "a"))
-        ok(run("use", "b", "--unknown", "keep"))
+        ok(run("use", "b"))
     later = backup_runs(respec_home)[1]
     assert (respec_home / "backups" / later / "claude-code" / "tdd").is_dir()
 
@@ -433,7 +433,7 @@ def test_after_release_a_later_backup_still_leaves_respec_copies_out(
     with monkeypatch.context() as patch:
         patch.setattr(os, "symlink", refuse)
         ok(run("use", "a"))
-        ok(run("use", "b", "--unknown", "keep"))
+        ok(run("use", "b"))
     first, later = backup_runs(respec_home)
     ok(run("restore"))
     assert read_state(respec_home)["owned"] == {}
@@ -463,7 +463,9 @@ def test_named_pre_respec_run_from_an_earlier_ownership_cycle_restores_exactly(
     assert snapshot(dirs["claude-code"]) == original
 
 
-def test_kept_entry_with_changed_permissions_is_not_identical(run, dirs, taken_over):
+def test_pre_existing_entry_with_changed_permissions_is_not_identical(
+    run, dirs, taken_over
+):
     (dirs["claude-code"] / "tool" / "run.sh").chmod(0o600)
 
     blocked = run("restore")
@@ -489,25 +491,27 @@ def test_restore_puts_back_modes_binary_content_and_empty_folders(
     assert (tool / "empty").is_dir()
 
 
-def test_kept_and_hidden_leftovers_are_reported(run, respec_home, dirs, taken_over):
+def test_unknown_entries_are_removed_and_hidden_leftovers_reported(
+    run, respec_home, dirs, taken_over
+):
     (dirs["claude-code"] / "stray").mkdir()
     (dirs["claude-code"] / "stray" / "SKILL.md").write_text("dropped later\n")
     (dirs["claude-code"] / ".hidden").write_text("x\n")
 
-    out = json.loads(ok(run("restore", "--unknown", "keep", "--json")).stdout)
+    out = json.loads(ok(run("restore", "--unknown", "remove", "--json")).stdout)
 
-    assert sorted(out["left"]) == sorted(
-        [str(dirs["claude-code"] / ".hidden"), str(dirs["claude-code"] / "stray")]
-    )
-    assert (dirs["claude-code"] / "stray" / "SKILL.md").read_text() == "dropped later\n"
+    assert out["left"] == [str(dirs["claude-code"] / ".hidden")]
+    assert not os.path.lexists(dirs["claude-code"] / "stray")
+    saved = list((respec_home / "backups").glob("*/claude-code/stray/SKILL.md"))
+    assert [p.read_text() for p in saved] == ["dropped later\n"]
 
 
-def test_kept_leftover_is_named_in_human_output(run, dirs, taken_over):
-    (dirs["claude-code"] / "stray").mkdir()
+def test_hidden_leftover_is_named_in_human_output(run, dirs, taken_over):
+    (dirs["claude-code"] / ".hidden").write_text("x\n")
 
-    out = ok(run("restore", "--unknown", "keep")).stdout
+    out = ok(run("restore")).stdout
 
     assert any(
-        line.startswith("Left ") and "stray" in line and "not in the backup" in line
+        line.startswith("Left ") and ".hidden" in line and "not in the backup" in line
         for line in out.splitlines()
     )

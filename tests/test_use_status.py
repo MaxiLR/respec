@@ -152,9 +152,9 @@ def test_folder_is_backed_up_only_on_first_takeover(run, isolated_homes, dirs):
     make_profile(isolated_homes.respec_home, "a", ["claude-code"], {"tdd": True})
     make_profile(isolated_homes.respec_home, "b", ["claude-code"], {"lint": True})
 
-    # loose.txt stays in the owned folder; keep it unmanaged when asked.
+    # loose.txt stays in the owned folder; it only warns, never blocks.
     assert run("use", "a").exit_code == 0
-    assert run("use", "b", "--unknown", "keep").exit_code == 0
+    assert run("use", "b").exit_code == 0
     assert run("use", "a").exit_code == 0
 
     backups = isolated_homes.respec_home / "backups"
@@ -238,7 +238,7 @@ def test_switch_only_removes_recorded_paths_and_keeps_profile_folders(
     (dirs["claude-code"] / "foreign" / "SKILL.md").write_text("foreign\n")
     profile_a_before = tree(profile_a)
 
-    assert run("use", "b", "--unknown", "keep").exit_code == 0
+    assert run("use", "b").exit_code == 0
 
     assert sorted(p.name for p in dirs["claude-code"].iterdir()) == [
         "foreign",
@@ -308,7 +308,6 @@ def test_status_json_shows_profile_targets_and_items_per_folder(
                 "skills": [],
                 "same_as": None,
                 "unknown": [],
-                "unmanaged": [],
             },
             {
                 "target": "agents",
@@ -327,7 +326,6 @@ def test_status_json_shows_profile_targets_and_items_per_folder(
                 ],
                 "same_as": None,
                 "unknown": [],
-                "unmanaged": [],
             },
         ],
     }

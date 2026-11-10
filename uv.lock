@@ -446,6 +446,7 @@ name = "respec"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "click" },
     { name = "pyyaml" },
     { name = "textual" },
     { name = "typer" },
@@ -459,6 +460,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "click", specifier = ">=8.1" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "textual", specifier = ">=8.2,<9" },
     { name = "typer", specifier = ">=0.12" },

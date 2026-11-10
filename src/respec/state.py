@@ -18,9 +18,6 @@ Schema (version 1)::
         {"target": "agents", "name": "lint",
          "path": "/home/me/.agents/skills/lint", "mode": "copy",
          "digest": "sha256:..."}         # content fingerprint, copies only
-      ],
-      "unmanaged": [                       # foreign entries the user chose to keep
-        "/home/me/.claude/skills/their-skill"
       ]
     }
 
@@ -28,7 +25,11 @@ Schema (version 1)::
 ``symlink`` or ``copy``. ``digest`` fingerprints a copy's content as installed,
 so a copy that was later edited or replaced is not mistaken for respec's own; a
 copy recorded without one is never treated as respec's. Removal only ever touches paths listed in
-``installed``. ``unmanaged`` may be absent in files written before it existed.
+``installed``.
+
+Files written by earlier versions may hold an ``unmanaged`` list (entries the
+user once chose to keep). That choice no longer exists: the list is ignored on
+load, so those entries count as unknown again, and the next save drops it.
 """
 
 from __future__ import annotations
@@ -78,7 +79,6 @@ class State:
     active_profile: str | None = None
     owned: dict[str, Owned] = field(default_factory=dict)
     installed: list[Installed] = field(default_factory=list)
-    unmanaged: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -86,7 +86,6 @@ class State:
             "active_profile": self.active_profile,
             "owned": {name: vars(entry) for name, entry in self.owned.items()},
             "installed": [item.to_dict() for item in self.installed],
-            "unmanaged": list(self.unmanaged),
         }
 
 
@@ -116,17 +115,10 @@ def load_state(respec_home: Path) -> State:
     for item in installed:
         if item.mode not in MODES:
             raise _invalid(path, f"unknown install mode {item.mode!r}")
-    unmanaged = data.get("unmanaged", [])
-    if not isinstance(unmanaged, list) or not all(
-        isinstance(path, str) for path in unmanaged
-    ):
-        raise _invalid(path, "unmanaged must be a list of paths")
     active = data.get("active_profile")
     if active is not None and not isinstance(active, str):
         raise _invalid(path, "active_profile must be a string or null")
-    return State(
-        active_profile=active, owned=owned, installed=installed, unmanaged=unmanaged
-    )
+    return State(active_profile=active, owned=owned, installed=installed)
 
 
 def save_state(respec_home: Path, state: State) -> None:
