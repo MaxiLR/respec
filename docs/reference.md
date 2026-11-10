@@ -21,6 +21,7 @@ respec update --check [-p work]   # which sourced skills have an update; skills 
 respec update [my-skill] [-p work] [--yes]  # apply; --yes overwrites (or removes) locally edited copies
 respec profile install ./profile-folder [--name mine]    # copy a whole profile and remember its source
 respec profile install owner/repo[#path] [--name mine] [--ref main]  # the same from git
+respec profile diff mine          # how respec's copy differs from the profile's source; reads only
 respec profile remove old         # move a profile that is not active to a backup
 ```
 
@@ -58,7 +59,8 @@ for a folder source, and `error` when the check failed. A row of `update` has
 `skill`, the same source fields and `result`: `updated`, `up-to-date`,
 `skipped-local-edits`, `source-missing` or `error`. A profile that has a source
 of its own adds rows and results to both: see
-[A profile's source](#a-profiles-source).
+[A profile's source](#a-profiles-source) and
+[Comparing a profile with its source](#comparing-a-profile-with-its-source).
 
 ## Skills from git
 
@@ -155,6 +157,83 @@ skills have `error` (`update`: `result: error`), and the command fails.
 Adding and removing is journaled with the rest of the update: an interrupted
 `update` either finishes or is rolled back as a whole, and a rollback removes
 only the skill folders that run made.
+
+## Comparing a profile with its source
+
+`profile diff <name>` shows how respec's copy of a profile differs from the
+profile's source. It only reads: nothing changes in respec's data, in the
+target folders or in the source, and it never waits for another respec. It is
+made for carrying local work into the source by hand (or by an agent): respec
+itself never writes to the source, so saving a profile to its source means
+copying the listed folders and files there yourself, then running `update`.
+
+A skill has one of three origins, read from the sources `profile.yaml`
+records: it came from the profile's source (its source points into it), it was
+added here with a source of its own (git, or another folder), or it was made
+here and has no source.
+
+`--json` gives `profile`, `path` (the copy's folder) and `source`: the
+profile's `source` record, plus `latest` (the commit that was read) for git.
+When the source was read it also gives `matches` (whether the lists below are
+all empty) and:
+
+- `only_in_copy`: skills the source does not list and that did not come from
+  it. Each has `skill`, `path` (the absolute path of its folder in the copy)
+  and its own `source` when it has one. Copy the folder to
+  `skills/<skill>/` in the source and list the skill in the source's
+  `profile.yaml`, with that `source` (git only) if it should keep following
+  it.
+- `edited`: skills both have whose files differ in the copy. Each has
+  `skill`, `path` and `files`: the paths `added`, `changed` and `removed` in
+  the copy, relative to what was copied (an empty folder is listed as
+  `path/`). `changed_in_source: true` means the source changed too since the
+  skill was copied; `not_from_source: true` means the copy never came from
+  the source (a skill of the same name was added here). In both cases the
+  files are listed against what the source holds now.
+- `carried`: skills whose copy holds exactly what the source holds, which
+  `profile.yaml` does not record yet; `update` records it.
+- `changed_in_source`: skills whose files changed in the source since they
+  were copied, with no local edits; `update` brings them in.
+- `only_in_source`: skills the source lists and the copy lacks, with
+  `enabled`; `update` adds them. A skill that came from the source and was
+  removed here with `remove` is listed here and comes back on the next
+  `update`: to keep it out, disable it instead, or remove it in the source.
+- `gone_from_source`: skills that came from the source, which no longer lists
+  them, with `path` and `modified` (the copy was edited); `update` removes
+  them.
+- `local_state`: what the copy's `profile.yaml` says differently from the
+  source's. `enabled` lists the skills both have that are enabled on one side
+  only (`skill`, `copy`, `source`), `targets` (only when they differ) gives
+  both lists as `copy` and `source`, and `layers` lists each layer that
+  differs (`layer`, with its `copy` and `source` definitions, one of them left
+  out when only the other has it). This is local state: an update never
+  changes it, it does not count for `matches`, and it only belongs in the
+  source when you decide so.
+
+Skills are compared by their files, not by commits: a git source with new
+commits that did not touch a skill is not a difference. A skill that follows
+the same git source of its own in the copy and in the source's `profile.yaml`
+is not compared.
+
+The text output says the same, one section per list, and
+`Profile '<name>' matches its source <source>` when nothing differs. A profile
+without a source says so and succeeds (`--json`: `profile` and `path` only). A
+source folder that is gone or has no `profile.yaml` is reported and is not a
+failure: `source` has `source_missing: true` and `message`, with a
+`source-missing` warning (`profile`, `folder`). Anything else that keeps the
+source from being read gives `error` in `source` and the command fails.
+
+After a skill was carried into the source with identical files, `update`
+(with no skill named) **adopts** it without asking: nothing is copied, the
+skill's source now points into the profile's source with the digest of its
+files (replacing a source of its own, if it had one), whether it is enabled
+stays as it is, and its row has `result: adopted`. This covers a skill that
+was only in the copy, and a skill edited in the copy whose edits are now in
+the source. Files that differ are never adopted: an edited skill from the
+source is still only overwritten after confirmation or with `--yes`, and a
+skill that did not come from the source is left alone. The change is
+journaled with the rest of the update. `profile diff` then no longer lists
+the skill.
 
 ## Removing a profile
 
@@ -515,7 +594,8 @@ Every `--json` output that is an object uses one vocabulary:
     folder gone or without `SKILL.md` and left the skill as it was; also
     gives `profile`, `skill` and `folder`. For the profile's own source
     folder (gone, or without `profile.yaml`) it gives `profile` and `folder`
-    and no `skill`: nothing was added or removed.
+    and no `skill`: nothing was added or removed. `profile diff` gives that
+    second form when it could not compare.
 - `error`: present only when the command failed. `use`, `adopt`, `restore`
   (also `--release-only`, which adds `kept`) and `recover` then print every
   other key of their success output too, filled with what was done before the

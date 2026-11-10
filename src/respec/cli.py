@@ -177,7 +177,8 @@ def _print_json(data: Any) -> None:
       without ``SKILL.md`` and left the skill as it was (``profile``,
       ``skill``, ``folder``), or found the profile's own source folder gone
       or without ``profile.yaml`` and added and removed nothing (``profile``,
-      ``folder``; no ``skill``).
+      ``folder``; no ``skill``), as ``profile diff`` does when it could not
+      compare.
 
     Unknown entries are not warnings: commands list them under ``unresolved``.
     """
@@ -1657,6 +1658,8 @@ def _update_line(row: dict[str, Any]) -> str:
         return f"{name}  added {origin} ({state})"
     if outcome == "removed":
         return f"{name}  removed: gone from the source"
+    if outcome == "adopted":
+        return f"{name}  adopted: the copy already holds what the source holds"
     if outcome == "skipped-local-edits" and row.get("gone"):
         return (
             f"{name}  skipped: gone from the source, local edits kept "
@@ -1796,6 +1799,127 @@ def profile_install(
             f"({messages.plural(len(installed.skills), 'skill')}) "
             f"from {messages.source_label(origin)}"
         )
+
+
+@profile_app.command("diff")
+def profile_diff(
+    ctx: typer.Context,
+    name: Annotated[str, typer.Argument(help="Profile name.")],
+    as_json: JsonOption = False,
+) -> None:
+    """Show how respec's copy of a profile differs from the profile's source,
+    to carry the differences into the source by hand. Changes nothing."""
+    homes = _homes(ctx)
+    try:
+        report = sources.diff(homes.respec_home, name)
+    except RespecError as error:
+        _fail(error)
+    state: dict[str, Any] = report.get("source") or {}
+    if as_json:
+        _print_json({**report, "warnings": _source_missing(name, [], state)})
+    else:
+        for line in _diff_lines(report):
+            typer.echo(line)
+    if "error" in state:
+        raise typer.Exit(code=1)
+
+
+def _diff_lines(report: dict[str, Any]) -> list[str]:
+    """What ``profile diff`` found, for text output."""
+    profile = f"Profile {report['profile']!r}"
+    state = report.get("source")
+    if state is None:
+        return [f"{profile} has no source: there is nothing to compare."]
+    if "message" in state:
+        return [f"{profile}: {_missing_line(state['message'])}; nothing was compared."]
+    if "error" in state:
+        return [f"{profile}: error: {state['error']}; nothing was compared."]
+    where = messages.source_label(
+        profiles.Source(**{k: state.get(k) for k in ("folder", "repo", "path", "ref")})
+    )
+    verb = "matches" if report["matches"] else "differs from"
+    lines = [f"{profile} {verb} its source {where}"]
+
+    def section(key: str, title: str, detail: Any) -> None:
+        if report[key]:
+            lines.append(title)
+        for row in report[key]:
+            lines.extend(f"  {row['skill']}{line}" for line in detail(row)[:1])
+            lines.extend(f"    {line}" for line in detail(row)[1:])
+
+    def only_in_copy(row: dict[str, Any]) -> list[str]:
+        origin = ""
+        if "source" in row:
+            label = messages.source_label(profiles.Source(**row["source"]))
+            origin = f"  (source: {label})"
+        return [f"  {row['path']}{origin}"]
+
+    def edited(row: dict[str, Any]) -> list[str]:
+        note = ""
+        if row.get("changed_in_source"):
+            note = "  (also changed in the source)"
+        elif row.get("not_from_source"):
+            note = "  (not copied from the source, which has its own)"
+        files = [
+            f"{kind:<7}  {path}"
+            for kind in ("added", "changed", "removed")
+            for path in row["files"][kind]
+        ]
+        return [f"  {row['path']}{note}", *files]
+
+    section(
+        "only_in_copy",
+        "Only in the copy (copy the folder into the source, or record its "
+        "source there):",
+        only_in_copy,
+    )
+    section(
+        "edited",
+        "Edited in the copy (copy the listed files into the source):",
+        edited,
+    )
+    section(
+        "carried",
+        "Same in the source ('respec update' records it):",
+        lambda row: [""],
+    )
+    section(
+        "changed_in_source",
+        "Changed in the source ('respec update' brings it in):",
+        lambda row: [""],
+    )
+    section(
+        "only_in_source",
+        "Only in the source ('respec update' adds it):",
+        lambda row: [f"  ({'enabled' if row['enabled'] else 'disabled'})"],
+    )
+    section(
+        "gone_from_source",
+        "Gone from the source ('respec update' removes it):",
+        lambda row: [
+            f"  {row['path']}" + ("  (local edits)" if row["modified"] else "")
+        ],
+    )
+    local = report["local_state"]
+    kept: list[str] = []
+    for row in local["enabled"]:
+        here, there = (
+            "enabled" if row[side] else "disabled" for side in ("copy", "source")
+        )
+        kept.append(f"  {row['skill']}  {here} here, {there} in the source")
+    if "targets" in local:
+        here, there = (", ".join(local["targets"][s]) for s in ("copy", "source"))
+        kept.append(f"  targets  {here} here; {there} in the source")
+    for row in local["layers"]:
+        side = (
+            "differs from the source's"
+            if "copy" in row and "source" in row
+            else "only here" if "copy" in row else "only in the source"
+        )
+        kept.append(f"  layer {row['layer']}  {side}")
+    if kept:
+        lines.append("Local state (respec keeps it; an update never changes it):")
+    return lines + kept
 
 
 @profile_app.command("remove")

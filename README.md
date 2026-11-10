@@ -137,6 +137,7 @@ anything it did not record.
 | `respec profile new <name> -t <target>`    | Create an empty profile.                                        |
 | `respec profile list` / `show <name>`      | Inspect profiles.                                               |
 | `respec profile install <folder or repo>`  | Copy a whole profile and remember where it came from.           |
+| `respec profile diff <name>`               | Show how a profile differs from its source; changes nothing.    |
 | `respec profile remove <name>`             | Move a profile that is not active to a backup.                  |
 | `respec use <profile>`                     | Switch to a profile.                                            |
 | `respec status`                            | Show the active profile, its targets and the skills per folder. |

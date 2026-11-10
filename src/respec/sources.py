@@ -783,7 +783,9 @@ def update(
     """Apply newer upstream commits, or a source folder's newer files, to
     sourced items. With no item named, the profile is also put in line with
     the skills of its own source: new ones are added, in the state the source
-    gives them, and the ones that came from it and are gone are removed.
+    gives them, the ones that came from it and are gone are removed, and a
+    skill whose copy holds exactly the files the source now holds for it is
+    adopted: only its source is recorded, pointing into the profile's source.
 
     An item whose files were edited locally is replaced only when
     ``overwrite_edits(item)`` returns true, and removed only when
@@ -833,7 +835,19 @@ def _update(
     try:
         with contextlib.ExitStack() as stack:
             found, failure = _open_source(stack, profile, item)
+            # Skills someone carried into the profile's source: the copy
+            # already holds the same files, so only their source is recorded.
+            recorded: list[str] = []  # edited copies of skills from it
+            adopted = {  # skills that did not come from it
+                name: carried
+                for name in (found.profile.skills if found is not None else ())
+                if name in profile.skills
+                and not from_profile_source(profile, name)
+                and (carried := _carried(profile, found, name)) is not None
+            }
             for name in _sourced(profile, item):
+                if name in adopted:
+                    continue  # it follows the profile's source from now on
                 source = skills[name].source
                 assert source is not None
                 _put_back_old(profile, name)
@@ -865,9 +879,21 @@ def _update(
                 if latest == _recorded(source):
                     row["result"] = "up-to-date"
                     continue
-                if _modified(profile, name) and not overwrite_edits(name):
-                    row["result"] = "skipped-local-edits"
-                    continue
+                if _modified(profile, name):
+                    carried = (
+                        _carried(profile, found, name)
+                        if found is not None and from_profile_source(profile, name)
+                        else None
+                    )
+                    if carried is not None:
+                        # The edits are in the source now: nothing to overwrite.
+                        recorded.append(name)
+                        skills[name] = dataclasses.replace(skills[name], source=carried)
+                        row["result"] = "adopted"
+                        continue
+                    if not overwrite_edits(name):
+                        row["result"] = "skipped-local-edits"
+                        continue
                 try:
                     new_source = _replace(respec_home, profile, name, source, replaced)
                 except GitCancelled:
@@ -881,6 +907,13 @@ def _update(
                 skills[name] = dataclasses.replace(skills[name], source=new_source)
             for name in found.profile.skills if found is not None else ():
                 if name in profile.skills:
+                    if name in adopted:
+                        skills[name] = dataclasses.replace(
+                            skills[name], source=adopted[name]
+                        )
+                        row = _row(name, adopted[name])
+                        row["result"] = "adopted"
+                        result.skills.append(row)
                     continue
                 try:
                     entry = _add_new(respec_home, profile, found, name, added)
@@ -909,7 +942,14 @@ def _update(
                 **after.source.to_dict(),
                 **(_failure(failure) if failure is not None else {}),
             }
-        if not (replaced or removing or added or after.source != profile.source):
+        if not (
+            replaced
+            or removing
+            or added
+            or adopted
+            or recorded
+            or after.source != profile.source
+        ):
             return result
         profiles.save_profile(after)
         journal.checkpoint("profile-saved")
@@ -1125,13 +1165,35 @@ def _skill_source(source: profiles.Source, item: str) -> profiles.Source:
     )
 
 
+def _place(source: profiles.Source) -> profiles.Source:
+    """Where ``source`` is, without the state that was copied from it."""
+    return dataclasses.replace(source, commit=None, digest=None)
+
+
 def from_profile_source(profile: profiles.Profile, item: str) -> bool:
     """Whether the skill's recorded source points into the profile's source."""
     source = profile.skills[item].source
     if profile.source is None or source is None:
         return False
-    place = dataclasses.replace(source, commit=None, digest=None)
-    return place == _skill_source(profile.source, item)
+    return _place(source) == _skill_source(profile.source, item)
+
+
+def _carried(
+    profile: profiles.Profile, found: Reference, item: str
+) -> profiles.Source | None:
+    """The source to record for skill ``item`` when the profile's copy holds
+    exactly the files the profile's source holds for it now (someone carried
+    the copy into the source). None when the files differ, or when the source
+    gives the skill a git source of its own."""
+    with tempfile.TemporaryDirectory(prefix="respec-compare-") as scratch:
+        try:
+            source = found.take(item, Path(scratch) / item).source
+        except (RespecError, OSError, shutil.Error):
+            return None
+    if source is None or _place(source) != _skill_source(found.source, item):
+        return None
+    copy = profile.path / profiles.SKILLS_DIR / item
+    return source if source.digest == fetched_digest(copy) else None
 
 
 @dataclass(frozen=True)
@@ -1218,6 +1280,202 @@ def _read_reference(
             f"{items.SKILL_FILE}: {', '.join(missing)}"
         )
     return Reference(source=source, tree=tree, folder=folder, profile=profile)
+
+
+# --- profile diff ----------------------------------------------------------------
+
+
+def diff(respec_home: Path, name: str) -> dict[str, object]:
+    """How respec's copy of profile ``name`` differs from its source, for
+    whoever carries the differences into the source. Reads only.
+
+    Gives ``profile`` and ``path`` (the copy); with a source, ``source`` as
+    :func:`check` gives it; and when the source could be read, ``matches``
+    and the differences (see :func:`_differences`)."""
+    profile = profiles.load_profile(respec_home, name)
+    report: dict[str, object] = {"profile": profile.name, "path": str(profile.path)}
+    if profile.source is None:
+        return report
+    state: dict[str, object] = dict(profile.source.to_dict())
+    report["source"] = state
+    try:
+        with contextlib.ExitStack() as stack:
+            found = stack.enter_context(reference(profile.source, profile.name))
+            scratch = stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="respec-compare-")
+            )
+            differences = _differences(profile, found, Path(scratch))
+    except GitCancelled:
+        raise
+    except SourceMissing as error:
+        state.update(source_missing=True, message=str(error))
+        return report
+    except (RespecError, OSError, shutil.Error) as error:
+        state["error"] = str(error)
+        return report
+    if found.source.commit is not None:
+        state["latest"] = found.source.commit
+    report["matches"] = not any(
+        rows for key, rows in differences.items() if key != "local_state"
+    )
+    report.update(differences)
+    return report
+
+
+def _differences(
+    profile: profiles.Profile, found: Reference, scratch: Path
+) -> dict[str, object]:
+    """The skills of ``profile`` against the ones of its source ``found``:
+
+    - ``only_in_copy``: not in the source (``path``, and its own ``source``);
+    - ``edited``: the copy's files differ from the source's (``path`` and
+      ``files``: added, changed and removed in the copy), with
+      ``changed_in_source`` when the source changed too since it was copied
+      and ``not_from_source`` when the copy never came from the source;
+    - ``carried``: the copy holds what the source holds, which is not
+      recorded yet (:func:`update` records it);
+    - ``changed_in_source``: only the source changed since it was copied;
+    - ``only_in_source`` (with ``enabled``) and ``gone_from_source`` (with
+      ``path`` and ``modified``), as :func:`check` finds new and gone skills;
+    - ``local_state``: what ``profile.yaml`` says differently (``enabled``,
+      ``targets``, ``layers``), which an update never changes.
+    """
+    skills_dir = profile.path / profiles.SKILLS_DIR
+    only_in_copy: list[dict[str, object]] = []
+    edited: list[dict[str, object]] = []
+    carried: list[dict[str, object]] = []
+    changed: list[dict[str, object]] = []
+    gone: list[dict[str, object]] = []
+    for name, entry in profile.skills.items():
+        copy = skills_dir / name
+        mine = from_profile_source(profile, name)
+        theirs = found.profile.skills.get(name)
+        if theirs is None and mine:
+            gone.append(
+                {"skill": name, "path": str(copy), "modified": _modified(profile, name)}
+            )
+        elif theirs is None:
+            row: dict[str, object] = {"skill": name, "path": str(copy)}
+            if entry.source is not None:
+                row["source"] = entry.source.to_dict()
+            only_in_copy.append(row)
+        if theirs is None:
+            continue
+        if (
+            not mine
+            and entry.source is not None
+            and theirs.source is not None
+            and theirs.source.folder is None
+            and _place(entry.source) == _place(theirs.source)
+        ):
+            continue  # it follows the git source the profile's source names
+        original = scratch / name
+        taken = found.take(name, original).source
+        now, upstream = fetched_digest(copy), fetched_digest(original)
+        recorded = entry.source.digest if mine and entry.source else None
+        if now == upstream:
+            if (
+                now != recorded
+                and taken is not None
+                and _place(taken) == _skill_source(found.source, name)
+            ):
+                carried.append({"skill": name})
+        elif mine and now == recorded:
+            changed.append({"skill": name})
+        else:
+            row = {
+                "skill": name,
+                "path": str(copy),
+                "files": _file_changes(original, copy),
+            }
+            if mine and upstream != recorded:
+                row["changed_in_source"] = True
+            if not mine:
+                row["not_from_source"] = True
+            edited.append(row)
+    return {
+        "only_in_copy": only_in_copy,
+        "edited": edited,
+        "carried": carried,
+        "changed_in_source": changed,
+        "only_in_source": [
+            {"skill": name, "enabled": entry.enabled}
+            for name, entry in found.profile.skills.items()
+            if name not in profile.skills
+        ],
+        "gone_from_source": gone,
+        "local_state": _local_state(profile, found.profile),
+    }
+
+
+def _local_state(
+    profile: profiles.Profile, source: profiles.Profile
+) -> dict[str, object]:
+    """What the copy's ``profile.yaml`` says differently from the source's:
+    whether a skill both have is enabled, the targets and the layers."""
+    state: dict[str, object] = {
+        "enabled": [
+            {
+                "skill": name,
+                "copy": entry.enabled,
+                "source": source.skills[name].enabled,
+            }
+            for name, entry in profile.skills.items()
+            if name in source.skills and entry.enabled != source.skills[name].enabled
+        ]
+    }
+    if profile.targets != source.targets:
+        state["targets"] = {
+            "copy": list(profile.targets),
+            "source": list(source.targets),
+        }
+    layers: list[dict[str, object]] = []
+    for name in [
+        *profile.layers,
+        *(n for n in source.layers if n not in profile.layers),
+    ]:
+        sides = {
+            side: layer.to_dict()
+            for side, layer in (
+                ("copy", profile.layers.get(name)),
+                ("source", source.layers.get(name)),
+            )
+            if layer is not None
+        }
+        if sides.get("copy") != sides.get("source"):
+            layers.append({"layer": name, **sides})
+    state["layers"] = layers
+    return state
+
+
+def _file_changes(original: Path, copy: Path) -> dict[str, list[str]]:
+    """The files ``copy`` added, changed and removed relative to ``original``."""
+    before, after = _files(original), _files(copy)
+    return {
+        "added": sorted(after.keys() - before.keys()),
+        "changed": sorted(
+            path for path in before.keys() & after.keys() if before[path] != after[path]
+        ),
+        "removed": sorted(before.keys() - after.keys()),
+    }
+
+
+def _files(folder: Path) -> dict[str, tuple[object, ...]]:
+    """What :func:`fetched_digest` hashes, per entry: every file and symlink
+    by its relative path, and every empty folder as ``path/``."""
+    found: dict[str, tuple[object, ...]] = {}
+    for root, dirs, files in os.walk(folder):
+        for name in dirs + files:
+            entry = Path(root) / name
+            relative = entry.relative_to(folder).as_posix()
+            if entry.is_symlink():
+                found[relative] = ("l", os.readlink(entry))
+            elif not entry.is_dir():
+                content = hashlib.sha256(entry.read_bytes()).digest()
+                found[relative] = ("f", os.access(entry, os.X_OK), content)
+            elif not any(entry.iterdir()):
+                found[f"{relative}/"] = ("d",)
+    return found
 
 
 # --- profile install -----------------------------------------------------------
