@@ -4,6 +4,9 @@ Each profile folder holds ``profile.yaml`` and a ``skills/`` directory. The
 schema of ``profile.yaml``::
 
     targets: [claude-code, agents]   # at least one known target, no repeats
+    source:                          # optional; where 'profile install' got
+      folder: /abs/profile           # the profile: a folder (absolute path),
+                                     # or repo, path, ref and commit as below
     skills:                          # optional; mapping of skill name to entry
       my-skill:
         enabled: true                # required boolean
@@ -57,7 +60,7 @@ SKILLS_DIR = "skills"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 NAME_RULE = "use letters, digits, '.', '_' or '-', starting with a letter or digit"
 
-TOP_LEVEL_KEYS = ("targets", "skills", "layers")
+TOP_LEVEL_KEYS = ("targets", "source", "skills", "layers")
 SKILL_KEYS = ("enabled", "source")
 SOURCE_KEYS = ("repo", "path", "ref", "commit", "digest", "folder")
 GIT_SOURCE_KEYS = ("repo", "path", "ref", "commit")
@@ -155,16 +158,18 @@ class Profile:
     targets: list[str]
     skills: dict[str, SkillEntry] = field(default_factory=dict)
     layers: dict[str, Layer] = field(default_factory=builtin_layers)
+    # Where the profile was installed from; respec only ever reads it.
+    source: Source | None = None
     # The exact text this profile was loaded from, for byte-exact rollback.
     # ``init=False``: ``dataclasses.replace`` never copies it, so an edited
     # copy of a loaded profile cannot roll back to the original's bytes.
     loaded_text: str | None = field(default=None, init=False, compare=False, repr=False)
 
     def to_yaml_data(self) -> dict[str, Any]:
-        data: dict[str, Any] = {
-            "targets": list(self.targets),
-            "skills": {name: entry.to_dict() for name, entry in self.skills.items()},
-        }
+        data: dict[str, Any] = {"targets": list(self.targets)}
+        if self.source is not None:
+            data["source"] = self.source.to_dict()
+        data["skills"] = {name: entry.to_dict() for name, entry in self.skills.items()}
         layers = {
             name: layer.to_dict()
             for name, layer in self.layers.items()
@@ -579,8 +584,16 @@ def parse_profile(name: str, folder: Path, data: Any) -> Profile:
         raw_skills if isinstance(raw_skills, dict) else {},
         problems,
     )
+    source = None
+    if data.get("source") is not None:
+        source = _parse_source("source", data["source"], problems)
     profile = Profile(
-        name=name, path=folder, targets=targets, skills=skills, layers=layers
+        name=name,
+        path=folder,
+        targets=targets,
+        skills=skills,
+        layers=layers,
+        source=source,
     )
     if problems:
         raise ProfileError(file, problems)

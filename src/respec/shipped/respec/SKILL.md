@@ -65,9 +65,14 @@ Every enabled skill of a profile goes to all of that profile's targets.
   profile.
 - `respec profile list`: profiles with their targets and skill counts.
 - `respec profile show <name>`: targets (with folders) and skills.
-- `respec profile install <owner/repo[#path]> [--name <name>] [--ref <ref>]`:
-  copy a whole profile folder (with `profile.yaml`) from a git repository
-  once. It is then owned locally; respec does not track it upstream.
+- `respec profile install <source> [--name <name>] [--ref <ref>]`: copy a
+  whole profile folder (with `profile.yaml` and `skills/`). `<source>` is a
+  local folder (an existing local folder wins), `owner/repo[#path]` or a git
+  URL `[#path]`; `--ref` is for git only. The profile remembers that source
+  (`source` in `profile.yaml` and in the `--json` output, next to `name` and
+  `path`), and every installed skill gets a source pointing into it, with a
+  digest, unless it carries a git source of its own. respec only ever reads
+  the source and never writes to it; `respec update` brings its changes in.
 - `respec profile remove <name>`: remove a profile that is not active. Nothing
   is deleted: its folder (`profile.yaml` and its skills) moves to
   `~/.respec/removed-profiles/<timestamp>/<name>/`, reported as `backup`; move
@@ -102,11 +107,34 @@ Every enabled skill of a profile goes to all of that profile's targets.
   files differ from what was copied. Reads only. Each row gives `skill`,
   `update_available` and `modified` (the profile's copy was edited), with
   `current` and `latest` commits for git or `folder` for a source folder.
+  With no skill named and a profile that has a source, it also compares the
+  skill lists: a skill that came from the profile's source and is no longer
+  listed there has `gone: true`, and a skill listed there that the profile
+  lacks gets a row with `new: true` and `enabled` (its starting state). The
+  output then has a top-level `source` (the profile's source; `latest` for
+  git).
 - `respec update [<skill>] [-p <profile>] [--yes]`: apply them (a source
   folder is copied again). A skill with local edits is only overwritten after
   confirmation or with `--yes`; with `--json` it is skipped. Each row's
   `result` is `updated`, `up-to-date`, `skipped-local-edits`, `source-missing`
   or `error`. Skills without a source never change.
+- `respec update` with no skill named also follows the profile's own source:
+  it adds the skills that are new there (`result` `added`, with `enabled`:
+  the state the source's `profile.yaml` gives, as a starting state only) and
+  removes the skills that came from it and are gone (`result` `removed`, with
+  `gone: true`; the folder is deleted as `respec remove` does). A gone skill
+  with local edits is removed only after confirmation or with `--yes`; with
+  `--json` it is skipped (`skipped-local-edits` with `gone: true`). Skills
+  added by hand, with their own source or without one are never removed, a
+  new skill named like a shipped or global skill is refused (`error`), and an
+  update never changes whether an existing skill is enabled, nor layers or
+  targets.
+- A profile source that cannot be read changes nothing: no skill is added or
+  removed and its skills stay as they are. A folder that is gone or has no
+  `profile.yaml` gives a `source-missing` warning without `skill`, and the
+  top-level `source` has `source_missing: true` (`--check`) or `result`
+  `source-missing`; any other problem gives `error` there and the command
+  fails.
 - A source folder that is gone or no longer holds `SKILL.md` changes nothing
   and is not a failure: the skill keeps its files, the other skills still
   update, and the output gives a `source-missing` warning (`profile`, `skill`,
@@ -211,6 +239,8 @@ reading.
 
 ```yaml
 targets: [claude-code, agents] # at least one known target
+source: # optional: where `profile install` got the profile
+  folder: /absolute/path/to/profile # or repo, path, ref, commit as below
 skills:
   my-skill:
     enabled: true

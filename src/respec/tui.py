@@ -280,6 +280,8 @@ def _skill_text(
         text.append(f"  check failed: {update.error.splitlines()[0]}", style=DANGER)
     elif update.source_missing:
         text.append(f"  {update.message}", style=DANGER)
+    elif update.gone:
+        text.append("  gone from the source", style=WARNING)
     elif update.folder and update.update_available:
         text.append("  ⬆ update available", style=WARNING)
     elif update.update_available:

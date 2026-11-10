@@ -175,7 +175,9 @@ def _print_json(data: Any) -> None:
       waits and the entry its step in flight was changing exists);
     - ``source-missing``: ``update`` found a skill's source folder gone or
       without ``SKILL.md`` and left the skill as it was (``profile``,
-      ``skill``, ``folder``).
+      ``skill``, ``folder``), or found the profile's own source folder gone
+      or without ``profile.yaml`` and added and removed nothing (``profile``,
+      ``folder``; no ``skill``).
 
     Unknown entries are not warnings: commands list them under ``unresolved``.
     """
@@ -1582,7 +1584,9 @@ def update(
     as_json: JsonOption = False,
 ) -> None:
     """Check for or apply updates of sourced skills: newer upstream commits,
-    or changed files in a source folder."""
+    or changed files in a source folder. With no skill named, also add the
+    skills that are new in the profile's own source and remove the ones that
+    came from it and are gone."""
     homes = _homes(ctx)
     if check_only:
         _update_check(homes, profile, skill, as_json)
@@ -1599,29 +1603,43 @@ def update(
             default=False,
         )
 
+    def confirm_removal(name: str) -> bool:
+        if yes:
+            return True
+        if as_json:
+            return False
+        return typer.confirm(
+            f"{name!r} is gone from the source and has local edits that "
+            "removing it would delete. Remove it?",
+            default=False,
+        )
+
     try:
         result = sources.update(
-            homes.respec_home, homes.user_home, profile, skill, confirm
+            homes.respec_home, homes.user_home, profile, skill, confirm, confirm_removal
         )
     except RespecError as error:
         _fail(error)
-    failed = any(row["result"] == "error" for row in result.skills)
+    state = result.source or {}
+    failed = any(row.get("result") == "error" for row in [state, *result.skills])
     unresolved = _unresolved(homes)
     if as_json:
         _print_json(
             {
                 **result.to_dict(),
                 "unresolved": unresolved,
-                "warnings": _source_missing(result.profile, result.skills),
+                "warnings": _source_missing(result.profile, result.skills, state),
             }
         )
     else:
-        if not result.skills:
+        if "result" in state:
+            typer.echo(_profile_source_line(result.profile, state))
+        elif not result.skills:
             typer.echo(f"Profile {result.profile!r} has no skills with a source.")
         for row in result.skills:
             typer.echo(_update_line(row))
-        for path in result.linked:
-            typer.echo(f"  linked {path}")
+        for line in messages.link_lines(result):
+            typer.echo(line)
     if failed:
         raise typer.Exit(code=1)
 
@@ -1629,6 +1647,21 @@ def update(
 def _update_line(row: dict[str, Any]) -> str:
     name = row["skill"]
     outcome = row["result"]
+    if outcome == "added":
+        state = "enabled" if row["enabled"] else "disabled"
+        origin = (
+            f"from {row['folder']}"
+            if "folder" in row
+            else f"at {messages.short(row['current'])}"
+        )
+        return f"{name}  added {origin} ({state})"
+    if outcome == "removed":
+        return f"{name}  removed: gone from the source"
+    if outcome == "skipped-local-edits" and row.get("gone"):
+        return (
+            f"{name}  skipped: gone from the source, local edits kept "
+            "(use --yes to remove)"
+        )
     if outcome == "updated" and "folder" in row:
         return f"{name}  updated from {row['folder']}"
     if outcome == "updated":
@@ -1648,34 +1681,51 @@ def _missing_line(message: str) -> str:
     return "source missing: " + message.removeprefix("source folder ")
 
 
-def _source_missing(profile: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """A ``source-missing`` warning per row whose source folder is gone."""
-    return [
-        {
-            "type": "source-missing",
-            "profile": profile,
-            "skill": row["skill"],
-            "folder": row["folder"],
-            "message": row["message"],
-        }
+def _profile_source_line(profile: str, state: dict[str, Any]) -> str:
+    """What is wrong with the profile's own source, for text output."""
+    problem = (
+        _missing_line(state["message"])
+        if "message" in state
+        else f"error: {state['error']}"
+    )
+    return (
+        f"Profile {profile!r}: {problem}; no skill was added or removed, and "
+        "the skills from that source were left as they are."
+    )
+
+
+def _source_missing(
+    profile: str, rows: list[dict[str, Any]], state: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """A ``source-missing`` warning for the profile's own source (``state``)
+    and per row whose source folder is gone."""
+    found: list[dict[str, Any]] = []
+    if state and state.get("message"):
+        found.append({"folder": state["folder"], "message": state["message"]})
+    found += [
+        {"skill": row["skill"], "folder": row["folder"], "message": row["message"]}
         for row in rows
         if row.get("message")
     ]
+    return [{"type": "source-missing", "profile": profile, **entry} for entry in found]
 
 
 def _update_check(
     homes: Homes, profile: str | None, skill: str | None, as_json: bool
 ) -> None:
     try:
-        name, rows = sources.check(homes.respec_home, profile, skill)
+        name, rows, origin = sources.check(homes.respec_home, profile, skill)
     except RespecError as error:
         _fail(error)
     if as_json:
         skills = [row.to_dict() for row in rows]
-        warnings = _source_missing(name, skills)
-        _print_json({"profile": name, "skills": skills, "warnings": warnings})
+        warnings = _source_missing(name, skills, origin)
+        payload = {"profile": name, "source": origin, "skills": skills}
+        _print_json({**payload, "warnings": warnings})
     else:
-        if not rows:
+        if origin and ("message" in origin or "error" in origin):
+            typer.echo(_profile_source_line(name, origin))
+        elif not rows:
             typer.echo(f"Profile {name!r} has no skills with a source.")
         for row in rows:
             edits = "  (local edits)" if row.modified else ""
@@ -1683,6 +1733,12 @@ def _update_check(
                 state = f"error: {row.error}"
             elif row.source_missing:
                 state = _missing_line(row.message or "")
+            elif row.gone:
+                state = "gone from the source"
+            elif row.new:
+                state = (
+                    f"new in the source ({'enabled' if row.enabled else 'disabled'})"
+                )
             elif row.folder and row.update_available:
                 state = f"update available from {row.folder}"
             elif row.update_available:
@@ -1693,7 +1749,7 @@ def _update_check(
             else:
                 state = "up to date"
             typer.echo(f"{row.skill}  {state}{edits}")
-    if any(row.error for row in rows):
+    if any(row.error for row in rows) or (origin and "error" in origin):
         raise typer.Exit(code=1)
 
 
@@ -1703,9 +1759,10 @@ def profile_install(
     source: Annotated[
         str,
         typer.Argument(
-            help="'owner/repo[#path]' or a git URL[#path] of a profile folder "
-            "(with profile.yaml).",
-            metavar="REPO",
+            help="A profile folder (with profile.yaml and skills/): a local "
+            "folder, 'owner/repo[#path]' or a git URL[#path]. An existing "
+            "local folder wins.",
+            metavar="SOURCE",
         ),
     ],
     name: Annotated[
@@ -1715,19 +1772,29 @@ def profile_install(
     ref: RefOption = None,
     as_json: JsonOption = False,
 ) -> None:
-    """Copy a whole profile from a repository once; it is then owned locally."""
+    """Copy a whole profile from a local folder or a repository and remember
+    that source: 'respec update' refreshes the profile's skills from it."""
     homes = _homes(ctx)
     _hold_lock(homes, as_json)
     try:
         installed = sources.install_profile(homes.respec_home, source, name, ref)
     except RespecError as error:
         _fail(error)
+    origin = installed.source
+    assert origin is not None
     if as_json:
-        _print_json({"name": installed.name, "path": str(installed.path)})
+        _print_json(
+            {
+                "name": installed.name,
+                "path": str(installed.path),
+                "source": origin.to_dict(),
+            }
+        )
     else:
         typer.echo(
             f"Installed profile {installed.name!r} at {installed.path} "
-            f"({messages.plural(len(installed.skills), 'skill')})"
+            f"({messages.plural(len(installed.skills), 'skill')}) "
+            f"from {messages.source_label(origin)}"
         )
 
 

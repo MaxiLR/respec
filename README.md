@@ -136,7 +136,7 @@ anything it did not record.
 | `respec` / `respec tui`                    | Open the terminal UI.                                           |
 | `respec profile new <name> -t <target>`    | Create an empty profile.                                        |
 | `respec profile list` / `show <name>`      | Inspect profiles.                                               |
-| `respec profile install owner/repo[#path]` | Copy a whole profile from a repository once.                    |
+| `respec profile install <folder or repo>`  | Copy a whole profile and remember where it came from.           |
 | `respec profile remove <name>`             | Move a profile that is not active to a backup.                  |
 | `respec use <profile>`                     | Switch to a profile.                                            |
 | `respec status`                            | Show the active profile, its targets and the skills per folder. |

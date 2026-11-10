@@ -17,9 +17,10 @@ respec adopt [--add|--remove <entry>] [--all add|remove]
 respec restore [<backup>] [--list] [--unknown add|remove] [--overwrite] [--release-only]
 respec recover [--rollback]       # finish (or roll back) an interrupted change
 respec add owner/repo[#path] [--ref main] [-p work]  # fetch skill(s) from git
-respec update --check [-p work]   # which sourced skills have newer commits
-respec update [my-skill] [-p work] [--yes]  # apply; --yes overwrites local edits
-respec profile install owner/repo[#path] [--name mine]  # copy a whole profile once
+respec update --check [-p work]   # which sourced skills have an update; skills new in or gone from the profile's source
+respec update [my-skill] [-p work] [--yes]  # apply; --yes overwrites (or removes) locally edited copies
+respec profile install ./profile-folder [--name mine]    # copy a whole profile and remember its source
+respec profile install owner/repo[#path] [--name mine] [--ref main]  # the same from git
 respec profile remove old         # move a profile that is not active to a backup
 ```
 
@@ -55,7 +56,9 @@ In `--json`, a row of `update --check` has `skill`, `update_available` and
 `modified`, plus `current` and `latest` (commits) for a git source or `folder`
 for a folder source, and `error` when the check failed. A row of `update` has
 `skill`, the same source fields and `result`: `updated`, `up-to-date`,
-`skipped-local-edits`, `source-missing` or `error`.
+`skipped-local-edits`, `source-missing` or `error`. A profile that has a source
+of its own adds rows and results to both: see
+[A profile's source](#a-profiles-source).
 
 ## Skills from git
 
@@ -75,11 +78,83 @@ stops after `RESPEC_GIT_TIMEOUT` seconds (default 120); http transfers slower
 than 1 KB/s for 30 seconds, and ssh connections not made within 15 seconds,
 fail sooner. A source `repo`
 must be `owner/repo`, `user@host:path` or an https, http, ssh or git URL; local
-paths and other git transports are refused. Skills installed by
-`profile install` have no recorded digest, so their first `update` asks before
-overwriting.
-`profile install` copies a repository's `profile.yaml` and listed `skills/`
-once; the profile is then owned locally and its skills keep their own sources.
+paths and other git transports are refused.
+
+## A profile's source
+
+`profile install <source>` copies a whole profile: a folder holding
+`profile.yaml` and `skills/<skill>/SKILL.md` for every skill that file lists.
+The source is a local folder, `owner/repo[#path]` or a git URL with an
+optional `#path`; an existing local folder wins, and `--ref` only applies to
+git. The profile is named after the folder (or the repository) unless `--name`
+is given. respec only ever reads the source: it is never written, moved or
+deleted, and changes only flow from the source to respec's copy.
+
+The profile remembers where it came from: `profile.yaml` gets a top-level
+`source`, either `folder` (the absolute, resolved path) or `repo`, `path`,
+`ref` and `commit` (`path` and `ref` only when given). `--json` gives `name`,
+`path` and that `source`. Each installed skill gets a source that points into
+the profile's source, with a digest of the copied files: `folder`
+(`<profile folder>/skills/<skill>`) and `digest`, or `repo`, `path`
+(`[<profile path>/]skills/<skill>`), `ref`, `commit` and `digest`. So
+`update --check` and `update` cover these skills like any other sourced skill,
+and nothing is asked unless the copy was edited. A skill whose entry in the
+source's `profile.yaml` carries its own git source keeps that one, and updates
+from there (without a recorded digest its first `update` asks before
+overwriting). A `folder` source written in the source's own `profile.yaml`
+(for a skill or for the profile) is never trusted, as it would make a later
+update copy from whatever local path it names: it is ignored and the skill
+gets a source inside the profile's source.
+
+With no skill named, `update --check` and `update` also compare the profile's
+skills with the ones its source lists now:
+
+- A skill the source lists and the profile does not have is **new**.
+  `update --check` reports it (`new in the source`; a row with `skill`,
+  `new: true` and `enabled`). `update` copies it into the profile, enabled or
+  disabled as the source's `profile.yaml` says (`result: added`, with
+  `enabled` and its `folder` or, for git, its commit as `current`). That is
+  only its starting state: afterwards only respec's copy tracks whether it is
+  enabled. A name that a shipped or global skill has is refused as `add` does
+  (`result: error`; the other skills are still handled, and the command
+  fails).
+- A skill whose recorded source points into the profile's source and that the
+  source no longer lists is **gone**. `update --check` reports it as
+  `gone from the source` (its row has `gone: true` and `modified`). `update`
+  removes it as `remove` does: it leaves `profile.yaml` and its layers, its
+  links go and its folder is deleted (`result: removed`, with `gone: true`).
+  A copy that was edited in the profile is not deleted silently: `update`
+  asks first, `--json` skips it (`result: skipped-local-edits`, with
+  `gone: true`) and `--yes` removes it. Skills you added yourself, skills
+  with a source of their own and skills without a source are never removed
+  this way.
+- An update never changes whether an existing skill is enabled, and never
+  changes the profile's layers or targets, whatever the source's
+  `profile.yaml` says. A removed skill only leaves the layer that listed it.
+
+`--json` of both commands then has a top-level `source`: the profile's
+`source` record, as saved after an `update` (for git, `commit` is the commit
+the skill list was last read at), plus `latest` in `update --check` for git.
+Naming a skill (`update <skill>`) only checks or updates that skill: nothing is
+added or removed and `source` is left out. A profile without a `source` in its
+`profile.yaml` behaves as before.
+
+A profile source that cannot be read is reported and changes nothing: no skill
+is added or removed, and the skills that come from it are left as they are
+(skills from other sources still update). A folder that is gone or no longer
+holds `profile.yaml` is reported like a missing skill folder and is not a
+failure: the text output says `source missing`, `--json` gives a
+`source-missing` warning without `skill`, and `source` has
+`source_missing: true` (`update --check`) or `result: source-missing`
+(`update`) with the `message`; the rows of its skills say the same, each
+with its own warning. Anything
+else (a repository that cannot be fetched, a `profile.yaml` that is not valid,
+a listed skill without its folder) is an error: `source` and the rows of its
+skills have `error` (`update`: `result: error`), and the command fails.
+
+Adding and removing is journaled with the rest of the update: an interrupted
+`update` either finishes or is rolled back as a whole, and a rollback removes
+only the skill folders that run made.
 
 ## Removing a profile
 
@@ -215,7 +290,9 @@ install`. If respec is killed or crashes part way, the journal stays behind:
     local `add` that is rolled back drops its copy (the source folder is never
     touched); a finished `remove` deletes the skill folder it was removing.
   - An `update` or git `add` is rolled back until `profile.yaml` records the
-    new skills and finished after. A rollback only touches what that run
+    new skills and finished after (a finished `update` also deletes the
+    folders of the skills it removed because they are gone from the profile's
+    source). A rollback only touches what that run
     made: the skills it swapped (when the folders are still the ones it
     recorded) and the skill folders it created. A folder that was there before
     is never removed.
@@ -336,7 +413,7 @@ until its first or last entry, where the next press moves on.
 toggle per skill and, in an active exclusive layer, a choice of one skill (or
 none). **Add folder** (`a`) and **Add from git** (`g`) add skills, and
 **Check updates** (`u`) marks sourced skills that have a newer commit or a
-changed source folder. Git runs
+changed source folder, or that are gone from the profile's source. Git runs
 in the background with a **Cancel** button (or `Esc`). Every
 change goes through the same code as `respec enable`, `respec layer use` and
 `respec add`, so an active profile is re-applied at once and a refused change
@@ -436,7 +513,9 @@ Every `--json` output that is an object uses one vocabulary:
     and this warning.
   - `source-missing`: `update` or `update --check` found a skill's source
     folder gone or without `SKILL.md` and left the skill as it was; also
-    gives `profile`, `skill` and `folder`.
+    gives `profile`, `skill` and `folder`. For the profile's own source
+    folder (gone, or without `profile.yaml`) it gives `profile` and `folder`
+    and no `skill`: nothing was added or removed.
 - `error`: present only when the command failed. `use`, `adopt`, `restore`
   (also `--release-only`, which adds `kept`) and `recover` then print every
   other key of their success output too, filled with what was done before the
