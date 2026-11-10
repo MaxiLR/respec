@@ -139,6 +139,22 @@ choices (add to the active profile, or back up and remove); so do entries found
 in a folder the switch took over for the first time. `a` resolves unknown
 entries outside a switch, `r` refreshes and `q` quits.
 
+**Edit** (`e`) opens the selected profile: its skills grouped by layer, with a
+toggle per skill and, in an active exclusive layer, a choice of one skill (or
+none). **Add folder** (`a`) and **Add from git** (`g`) add skills, and
+**Check updates** (`u`) marks sourced skills that have a newer commit. Every
+change goes through the same code as `respec enable`, `respec layer use` and
+`respec add`, so an active profile is re-applied at once and a refused change
+leaves the profile as it was. **New profile** (`n`) asks for a name and targets.
+
+**⟳ Sync** (`s`) is a manual check of the setup and every profile; nothing is
+watched in the background. It lists unknown entries and edited or replaced
+copies (add to the active profile, or back up and remove, as `respec adopt`),
+exclusive layers with several enabled skills (keep one, as `respec layer
+repair`), and links respec placed that are missing, broken or out of line with
+the active profile (re-apply it). Each fix is listed with its backups; with
+nothing found it says everything is in sync.
+
 ### Layers
 
 ```sh

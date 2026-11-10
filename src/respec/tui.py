@@ -1,13 +1,16 @@
-"""Textual TUI: profile list, switching, status per target folder, adopt dialog.
+"""Textual TUI: profiles, switching, status, profile editing and the Sync check.
 
 A thin layer over the same core functions the CLI uses: profiles are read with
 :mod:`respec.profiles`, switching and status come from :mod:`respec.switch`,
-and unknown entries are resolved through :mod:`respec.adopt`. The TUI only
-collects choices and renders results.
+unknown entries are resolved through :mod:`respec.adopt`, profiles are edited
+through :mod:`respec.items`, :mod:`respec.layers` and :mod:`respec.sources`
+(with their safety checks and rollback), and the Sync check comes from
+:mod:`respec.sync`. The TUI only collects choices and renders results.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -17,18 +20,31 @@ from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
+    Checkbox,
     Footer,
+    Input,
     ListItem,
     ListView,
     RadioButton,
     RadioSet,
     Static,
+    Switch,
 )
 
-from respec import adopt, profiles, switch, unknown
+from respec import (
+    adopt,
+    items,
+    layers,
+    profiles,
+    sources,
+    switch,
+    sync,
+    targets,
+    unknown,
+)
 from respec.errors import RespecError
 from respec.state import load_state
 
@@ -51,6 +67,9 @@ SECONDARY = COLORS["text-secondary"]
 MUTED = COLORS["text-muted"]
 SUCCESS = COLORS["success"]
 WARNING = COLORS["warning"]
+DANGER = COLORS["danger"]
+ACCENT = COLORS["accent"]
+SYNC_ICON = "⟳"
 
 CSS = "".join(f"${name}: {value};\n" for name, value in COLORS.items()) + """
 
@@ -66,6 +85,7 @@ Screen {
 }
 #title { width: auto; text-style: bold; color: $text-primary; }
 #active { width: 1fr; content-align-horizontal: right; color: $text-secondary; }
+#topbar Button { height: 1; min-width: 8; margin-left: 2; }
 
 #body { height: 1fr; padding: 1 1 0 1; }
 
@@ -88,7 +108,10 @@ Screen {
 .profile-name { color: $text-primary; }
 .profile-meta { color: $text-muted; }
 #profiles-empty { color: $text-secondary; padding: 1 0; }
-#activate { width: 100%; margin: 1 0; }
+#activate { width: 100%; margin: 1 0 0 0; }
+#profile-actions { height: auto; margin: 1 0; }
+#profile-actions Button { width: 1fr; }
+#profile-actions #edit { margin-right: 1; }
 
 #status {
     width: 1fr;
@@ -119,7 +142,10 @@ Button:focus { text-style: bold; background: $surface-high; color: $accent; }
 Button.-primary { background: $accent; color: $page; }
 Button:disabled { background: $surface-base; color: $text-muted; }
 
-AdoptDialog { align: center middle; background: $page 70%; }
+AdoptDialog, AddDialog, NewProfileDialog, SyncScreen {
+    align: center middle;
+    background: $page 70%;
+}
 #dialog {
     width: 96;
     max-height: 90%;
@@ -143,12 +169,150 @@ AdoptDialog { align: center middle; background: $page 70%; }
 .unknown RadioButton { background: $surface-base; margin-right: 2; }
 #dialog-actions { height: auto; align-horizontal: right; }
 #dialog-actions Button { margin-left: 1; }
+.field-label { color: $text-secondary; margin-top: 1; }
+Input { background: $surface-raised; border: tall $surface-high; }
+Input:focus { border: tall $accent; }
+Checkbox { background: $surface-base; border: none; }
+.dialog-error { color: $danger; height: auto; }
+
+#editor-bar { height: 1; padding: 0 2; background: $surface-base; }
+#editor-title { width: 1fr; }
+#editor-skills {
+    height: 1fr;
+    margin: 1 1 0 1;
+    padding: 0 1;
+    background: $surface-base;
+    border: round $surface-high;
+    border-title-color: $text-secondary;
+}
+.group { height: auto; margin-bottom: 1; }
+.group-title { color: $text-primary; }
+.group-note { color: $warning; }
+.group RadioSet { width: 100%; background: $surface-base; border: none; }
+.group RadioButton { background: $surface-base; }
+.skill-row { height: auto; }
+.skill-row Switch { background: $surface-base; border: none; }
+.skill-meta { width: 1fr; padding: 0 1; content-align-vertical: middle; }
+#editor-empty { color: $text-secondary; padding: 1 0; }
+#editor-actions { height: auto; padding: 1 1 0 1; }
+#editor-actions Button { margin-right: 1; }
+#editor-log { height: auto; max-height: 8; padding: 0 2; }
+#editor-feedback { color: $text-secondary; }
+#editor-feedback.-success { color: $success; }
+#editor-feedback.-error { color: $danger; }
+
+#sync-summary { margin-bottom: 1; }
+#sync-summary.-success { color: $success; }
+#sync-summary.-warning { color: $warning; }
+SyncScreen #dialog { height: 90%; }
+#sync-body { height: 1fr; }
+#sync-log {
+    height: auto;
+    padding: 0 1;
+    margin-bottom: 1;
+    background: $surface-raised;
+    color: $text-secondary;
+}
+.section { height: auto; margin-bottom: 1; }
+.section-title { text-style: bold; color: $text-primary; }
+.section-intro { color: $text-muted; }
+.conflict { height: auto; margin-bottom: 1; }
+.conflict RadioSet {
+    width: 100%;
+    layout: horizontal;
+    background: $surface-base;
+    border: none;
+}
+.conflict RadioButton { background: $surface-base; margin-right: 2; }
+.section Button { margin-top: 1; }
 """
 
 
+def _escape(name: str) -> str:
+    """``name`` usable in a DOM id: '.' escaped without collisions."""
+    return name.replace("_", "__").replace(".", "_-")
+
+
 def _dom_id(prefix: str, name: str) -> str:
-    """A DOM id for a name that may hold '.' (escaped without collisions)."""
-    return f"{prefix}-" + name.replace("_", "__").replace(".", "_-")
+    """A DOM id for a name that may hold '.'."""
+    return f"{prefix}-{_escape(name)}"
+
+
+def _choice_id(layer: str, skill: str) -> str:
+    """The DOM id of ``skill``'s button in exclusive layer ``layer``."""
+    return f"{_dom_id('choose', layer)}--{_escape(skill)}"
+
+
+def _plural(count: int, one: str, many: str) -> str:
+    return f"{count} {one if count == 1 else many}"
+
+
+def _one_line(error: Exception) -> str:
+    return " ".join(line.strip() for line in str(error).splitlines())
+
+
+def _link_lines(change: Any) -> list[str]:
+    """The links a change added or removed (the CLI's wording)."""
+    return [
+        *(f"  linked {path}" for path in change.linked),
+        *(f"  unlinked {path}" for path in change.unlinked),
+    ]
+
+
+def _skill_change_lines(change: items.SkillChange) -> list[str]:
+    where = f"{change.skill!r} {{}} profile {change.profile!r}"
+    lead = {
+        "add": "Added " + where.format("to"),
+        "enable": "Enabled " + where.format("in"),
+        "disable": "Disabled " + where.format("in"),
+    }[change.action]
+    return [lead, *_link_lines(change)]
+
+
+def _layer_change_lines(change: layers.LayerChange) -> list[str]:
+    where = f"layer {change.layer!r} of profile {change.profile!r}"
+    lead = {
+        "use": f"Using {change.skill!r} in {where}",
+        "disable": f"Disabled the skills of {where}",
+        "repair": f"Repaired {where}: kept {change.skill!r}",
+        "nothing": f"Nothing to repair in {where}: at most one skill is enabled",
+        "additive": f"Nothing to repair in {where}: it is additive",
+    }[change.action]
+    if change.disabled:
+        lead += ", disabled " + ", ".join(repr(skill) for skill in change.disabled)
+    return [lead, *_link_lines(change)]
+
+
+def _source_label(source: profiles.Source) -> str:
+    where = f"{source.repo}#{source.path}" if source.path else source.repo
+    return f"{where}@{source.ref}" if source.ref else where
+
+
+def _short(commit: str | None) -> str:
+    return commit[:12] if commit else "unknown"
+
+
+def _skill_text(
+    name: str, entry: profiles.SkillEntry, update: sources.Row | None
+) -> Text:
+    """A skill's name, where it came from and, once checked, its update state."""
+    text = Text(name, style="bold")
+    if entry.source is not None:
+        text.append(f"  from {_source_label(entry.source)}", style=MUTED)
+    if update is None:
+        return text
+    if update.error:
+        text.append(f"  check failed: {update.error.splitlines()[0]}", style=DANGER)
+    elif update.update_available:
+        text.append(
+            f"  ⬆ update available {_short(update.current)} → {_short(update.latest)}",
+            style=WARNING,
+        )
+    else:
+        text.append("  ✓ up to date", style=SUCCESS)
+    if update.modified:
+        text.append("  local edits", style=MUTED)
+    return text
 
 
 def _profile_rows(respec_home: Path) -> list[tuple[str, str]]:
@@ -210,6 +374,15 @@ def _resolved_text(lead: str, resolved: Sequence[adopt.Resolution]) -> str:
     return "\n".join([lead, *(resolution.describe() for resolution in resolved)])
 
 
+def _unknown_meta(entry: unknown.Unknown) -> str:
+    replaced = (
+        ", an edited or replaced copy of a skill respec installed"
+        if entry.replaced
+        else ""
+    )
+    return f"{entry.kind} in {', '.join(entry.targets)}{replaced}"
+
+
 class ProfileList(ListView):
     """Profile list: a click or the arrow keys select, Enter activates."""
 
@@ -268,17 +441,9 @@ class AdoptDialog(ModalScreen[dict[str, str] | None]):
             yield Static(self.reason, id="dialog-intro")
             with VerticalScroll(id="entries"):
                 for index, entry in enumerate(self.entries):
-                    replaced = (
-                        ", an edited or replaced copy of a skill respec installed"
-                        if entry.replaced
-                        else ""
-                    )
                     with Vertical(id=f"unknown-{index}", classes="unknown"):
                         yield Static(entry.path, classes="unknown-path")
-                        yield Static(
-                            f"{entry.kind} in {', '.join(entry.targets)}{replaced}",
-                            classes="unknown-meta",
-                        )
+                        yield Static(_unknown_meta(entry), classes="unknown-meta")
                         with RadioSet(id=f"unknown-{index}-choice"):
                             for choice in adopt.choices(self.profile):
                                 yield RadioButton(
@@ -306,6 +471,750 @@ class AdoptDialog(ModalScreen[dict[str, str] | None]):
         self.dismiss(None)
 
 
+class AddDialog(ModalScreen[tuple[str, str | None] | None]):
+    """Ask for a local skill folder, or for a git source and an optional ref.
+
+    Dismisses with ``(text, ref)`` or ``None`` when cancelled.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, profile: str, git: bool) -> None:
+        super().__init__()
+        self.profile = profile
+        self.git = git
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog") as dialog:
+            if self.git:
+                dialog.border_title = "Add from a git source"
+                intro = (
+                    f"Fetch skills into profile {self.profile} from 'owner/repo', "
+                    "'owner/repo#path' or a git URL. The source is recorded, so "
+                    "updates can be checked later."
+                )
+                placeholder = "owner/repo#path/to/skill"
+            else:
+                dialog.border_title = "Add a skill folder"
+                intro = (
+                    f"Copy a local skill folder (one with SKILL.md) into profile "
+                    f"{self.profile}. It is enabled right away."
+                )
+                placeholder = "~/path/to/skill"
+            yield Static(intro, id="dialog-intro")
+            yield Input(placeholder=placeholder, id="add-input")
+            if self.git:
+                yield Static("Ref (optional)", classes="field-label")
+                yield Input(placeholder="branch, tag or commit", id="add-ref")
+            with Horizontal(id="dialog-actions"):
+                yield Button("Cancel", id="add-cancel")
+                yield Button("Add", id="add-confirm", variant="primary")
+
+    @on(Input.Submitted)
+    @on(Button.Pressed, "#add-confirm")
+    def _confirm(self) -> None:
+        text = self.query_one("#add-input", Input).value.strip()
+        if not text:
+            self.query_one("#add-input", Input).focus()
+            return
+        ref = None
+        if self.git:
+            ref = self.query_one("#add-ref", Input).value.strip() or None
+        self.dismiss((text, ref))
+
+    @on(Button.Pressed, "#add-cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class NewProfileDialog(ModalScreen[profiles.Profile | None]):
+    """Name a new profile and choose its targets; creates it on confirm."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, respec_home: Path) -> None:
+        super().__init__()
+        self.respec_home = respec_home
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog") as dialog:
+            dialog.border_title = "New profile"
+            yield Static("Name", classes="field-label")
+            yield Input(placeholder="work", id="new-name")
+            yield Static(
+                "Targets (the folders this profile is applied to)",
+                classes="field-label",
+            )
+            for target in targets.registry().values():
+                yield Checkbox(
+                    f"{target.display_name}  {target.global_skills_dir}",
+                    id=_dom_id("new-target", target.name),
+                )
+            yield Static("", id="new-error", classes="dialog-error")
+            with Horizontal(id="dialog-actions"):
+                yield Button("Cancel", id="new-cancel")
+                yield Button("Create", id="create", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#new-name", Input).focus()
+
+    @on(Input.Submitted)
+    @on(Button.Pressed, "#create")
+    def _create(self) -> None:
+        name = self.query_one("#new-name", Input).value.strip()
+        chosen = [
+            target
+            for target in targets.registry()
+            if self.query_one(f"#{_dom_id('new-target', target)}", Checkbox).value
+        ]
+        error = self.query_one("#new-error", Static)
+        if not name:
+            error.update("Give the profile a name.")
+            return
+        if not chosen:
+            error.update("Choose at least one target folder.")
+            return
+        try:
+            profile = profiles.create_profile(self.respec_home, name, chosen)
+        except RespecError as problem:
+            error.update(f"error: {_one_line(problem)}")
+            return
+        self.dismiss(profile)
+
+    @on(Button.Pressed, "#new-cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SkillSwitch(Switch):
+    """Enable or disable one skill (Space, Enter or a click)."""
+
+    def __init__(self, skill: str, value: bool) -> None:
+        super().__init__(value=value, id=_dom_id("toggle", skill))
+        self.skill = skill
+
+
+class SkillChoice(RadioButton):
+    """One skill of an exclusive layer; ``skill`` is ``None`` for "None"."""
+
+    def __init__(self, label: Text | str, layer: str, skill: str | None, value: bool):
+        button_id = _choice_id(layer, skill) if skill else _dom_id("none", layer)
+        super().__init__(label, value=value, id=button_id)
+        self.skill = skill
+
+
+class LayerChoice(RadioSet):
+    """Exclusive selection inside one active exclusive layer."""
+
+    def __init__(self, layer: str, *buttons: SkillChoice) -> None:
+        super().__init__(*buttons, id=_dom_id("layer", layer))
+        self.layer_name = layer
+
+
+class ProfileScreen(Screen[None]):
+    """One profile: skills grouped by layer, toggles, adding, update checks.
+
+    Every change goes through :mod:`respec.items`, :mod:`respec.layers` or
+    :mod:`respec.sources`, exactly as the CLI does, so an active profile is
+    re-applied at once and a refused change leaves the profile as it was.
+    """
+
+    BINDINGS = [
+        Binding("escape", "back", "Back"),
+        Binding("a", "add_folder", "Add folder"),
+        Binding("g", "add_git", "Add from git"),
+        Binding("u", "check_updates", "Check updates"),
+    ]
+
+    def __init__(self, respec_home: Path, user_home: Path, profile: str) -> None:
+        super().__init__()
+        self.respec_home = respec_home
+        self.user_home = user_home
+        self.profile_name = profile
+        self.updates: dict[str, sources.Row] = {}
+        self._drawing = asyncio.Lock()
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="editor-bar"):
+            yield Static("", id="editor-title")
+        with VerticalScroll(id="editor-skills") as panel:
+            panel.border_title = "Skills"
+        with Horizontal(id="editor-actions"):
+            yield Button("Add folder", id="add-folder", variant="primary")
+            yield Button("Add from git", id="add-git")
+            yield Button("Check updates", id="check-updates")
+            yield Button("Back", id="back")
+        with VerticalScroll(id="editor-log"):
+            yield Static("", id="editor-feedback")
+        yield Footer()
+
+    async def on_screen_resume(self) -> None:
+        """Draw on opening, and again after Sync or a dialog closes."""
+        await self.render_profile()
+
+    # --- rendering ----------------------------------------------------------
+
+    def _load(self) -> profiles.Profile | None:
+        try:
+            return profiles.load_profile(self.respec_home, self.profile_name)
+        except RespecError as error:
+            self.show_feedback([f"error: {_one_line(error)}"], ok=False)
+            return None
+
+    async def render_profile(self) -> None:
+        """Re-read the profile from disk and redraw every group."""
+        async with self._drawing:  # one redraw at a time: ids stay unique
+            await self._render_profile()
+
+    async def _render_profile(self) -> None:
+        profile = self._load()
+        panel = self.query_one("#editor-skills", VerticalScroll)
+        focused = self.focused.id if self.focused is not None else None
+        await panel.remove_children()
+        if profile is None:
+            return
+        try:
+            active = load_state(self.respec_home).active_profile == profile.name
+        except RespecError:
+            active = False
+        title = Text.assemble(
+            ("Profile ", SECONDARY),
+            (profile.name, "bold"),
+            (f"  {', '.join(profile.targets)}", MUTED),
+        )
+        if active:
+            title.append("  ● active", style=SUCCESS)
+        self.query_one("#editor-title", Static).update(title)
+        groups = [
+            self._layer_group(profile, name, layer)
+            for name, layer in profile.layers.items()
+            if layer.items or not layer.builtin
+        ]
+        loose = [skill for skill in profile.skills if profile.layer_of(skill) is None]
+        if loose:
+            group = Vertical(id="ungrouped", classes="group")
+            group.compose_add_child(
+                Static(Text("Skills", style="bold"), classes="group-title")
+            )
+            for skill in loose:
+                group.compose_add_child(self._skill_row(profile, skill))
+            groups.append(group)
+        if not profile.skills:
+            groups.insert(
+                0,
+                Static(
+                    "No skills yet. Press a to add a skill folder, or g to add "
+                    "skills from a git source.",
+                    id="editor-empty",
+                ),
+            )
+        await panel.mount_all(groups)
+        if focused:
+            for widget in self.query(f"#{focused}"):
+                if widget.focusable:
+                    widget.focus()
+
+    def _skill_row(self, profile: profiles.Profile, skill: str) -> Horizontal:
+        entry = profile.skills[skill]
+        row = Horizontal(classes="skill-row")
+        row.compose_add_child(SkillSwitch(skill, entry.enabled))
+        row.compose_add_child(
+            Static(
+                _skill_text(skill, entry, self.updates.get(skill)),
+                id=_dom_id("skill", skill),
+                classes="skill-meta",
+            )
+        )
+        return row
+
+    def _layer_group(
+        self, profile: profiles.Profile, name: str, layer: profiles.Layer
+    ) -> Vertical:
+        title = Text(name, style="bold")
+        if not layer.exclusive:
+            title.append("  additive", style=SECONDARY)
+        elif layer.active:
+            title.append("  exclusive · one skill at a time", style=SECONDARY)
+        else:
+            title.append("  exclusive, off: its rules lapse", style=SECONDARY)
+        if layer.description:
+            title.append(f"  {layer.description}", style=MUTED)
+        group = Vertical(id=_dom_id("group", name), classes="group")
+        group.compose_add_child(Static(title, classes="group-title"))
+        members = [skill for skill in layer.items if skill in profile.skills]
+        if not members:
+            group.compose_add_child(
+                Static("no skills in this layer", classes="section-intro")
+            )
+            return group
+        if not (layer.exclusive and layer.active):
+            for skill in members:
+                group.compose_add_child(self._skill_row(profile, skill))
+            return group
+        on = profiles.enabled_members(profile, name)
+        if len(on) > 1:
+            group.compose_add_child(
+                Static(
+                    f"{len(on)} skills are enabled ({', '.join(on)}); choose one "
+                    "here, or repair the layer with Sync.",
+                    classes="group-note",
+                )
+            )
+        buttons = [
+            SkillChoice(
+                _skill_text(skill, profile.skills[skill], self.updates.get(skill)),
+                name,
+                skill,
+                value=on == [skill],
+            )
+            for skill in members
+        ]
+        buttons.append(SkillChoice("None", name, None, value=not on))
+        group.compose_add_child(LayerChoice(name, *buttons))
+        return group
+
+    def show_feedback(self, lines: Sequence[str], ok: bool) -> None:
+        feedback = self.query_one("#editor-feedback", Static)
+        feedback.update("\n".join(lines))
+        feedback.set_class(ok, "-success")
+        feedback.set_class(not ok, "-error")
+        self.query_one("#editor-log", VerticalScroll).scroll_home(animate=False)
+
+    def _failed(self, error: RespecError) -> None:
+        self.show_feedback(f"error: {str(error).strip()}".splitlines(), ok=False)
+
+    # --- actions ------------------------------------------------------------
+
+    @on(Switch.Changed)
+    async def _toggled(self, event: Switch.Changed) -> None:
+        switch_ = event.switch
+        if not isinstance(switch_, SkillSwitch):
+            return
+        profile = self._load()
+        if profile is None or switch_.skill not in profile.skills:
+            return
+        if profile.skills[switch_.skill].enabled == event.value:
+            return  # already so (for example the initial value)
+        try:
+            change = items.set_enabled(
+                self.respec_home,
+                self.user_home,
+                switch_.skill,
+                event.value,
+                self.profile_name,
+            )
+        except RespecError as error:
+            self._failed(error)
+        else:
+            self.show_feedback(_skill_change_lines(change), ok=True)
+        await self.render_profile()
+
+    @on(RadioSet.Changed)
+    async def _chosen(self, event: RadioSet.Changed) -> None:
+        radio = event.radio_set
+        if not isinstance(radio, LayerChoice) or not isinstance(
+            event.pressed, SkillChoice
+        ):
+            return
+        profile = self._load()
+        if profile is None or radio.layer_name not in profile.layers:
+            return
+        on = profiles.enabled_members(profile, radio.layer_name)
+        skill = event.pressed.skill
+        if (skill is None and not on) or (skill is not None and on == [skill]):
+            return  # already so
+        try:
+            if skill is None:
+                change = layers.set_enabled(
+                    self.respec_home,
+                    self.user_home,
+                    radio.layer_name,
+                    False,
+                    self.profile_name,
+                )
+            else:
+                change = layers.use(
+                    self.respec_home,
+                    self.user_home,
+                    radio.layer_name,
+                    skill,
+                    self.profile_name,
+                )
+        except RespecError as error:
+            self._failed(error)
+        else:
+            self.show_feedback(_layer_change_lines(change), ok=True)
+        await self.render_profile()
+
+    @on(Button.Pressed, "#add-folder")
+    def action_add_folder(self) -> None:
+        self._ask_to_add(git=False)
+
+    @on(Button.Pressed, "#add-git")
+    def action_add_git(self) -> None:
+        self._ask_to_add(git=True)
+
+    def _ask_to_add(self, git: bool) -> None:
+        async def chosen(answer: tuple[str, str | None] | None) -> None:
+            if answer is None:
+                return
+            text, ref = answer
+            try:
+                if git:
+                    change = sources.add(
+                        self.respec_home, self.user_home, text, self.profile_name, ref
+                    )
+                    lines = [
+                        f"Added {skill!r} to profile {change.profile!r} from "
+                        f"{_source_label(profiles.Source(**change.sources[skill]))} "
+                        f"at {change.sources[skill]['commit'][:12]}"
+                        for skill in change.skills
+                    ] + _link_lines(change)
+                else:
+                    added = items.add(
+                        self.respec_home,
+                        self.user_home,
+                        Path(text).expanduser(),
+                        self.profile_name,
+                    )
+                    lines = _skill_change_lines(added)
+            except RespecError as error:
+                self._failed(error)
+            else:
+                self.show_feedback(lines, ok=True)
+            await self.render_profile()
+
+        self.app.push_screen(AddDialog(self.profile_name, git), chosen)
+
+    @on(Button.Pressed, "#check-updates")
+    async def action_check_updates(self) -> None:
+        """Ask each skill's source for a newer commit (manual, never polled)."""
+        try:
+            _, rows = sources.check(self.respec_home, self.profile_name)
+        except RespecError as error:
+            self._failed(error)
+            return
+        self.updates = {row.skill: row for row in rows}
+        if not rows:
+            self.show_feedback(
+                [f"Profile {self.profile_name!r} has no skills with a source."],
+                ok=True,
+            )
+        else:
+            newer = [row.skill for row in rows if row.update_available]
+            failed = [row.skill for row in rows if row.error]
+            lines = [
+                f"Checked {_plural(len(rows), 'skill', 'skills')} with a source: "
+                + (
+                    f"updates available for {', '.join(newer)}"
+                    if newer
+                    else "no updates available"
+                )
+            ]
+            if failed:
+                lines.append(f"Could not check {', '.join(failed)}")
+            if newer:
+                lines.append("Apply them with 'respec update'.")
+            self.show_feedback(lines, ok=not failed)
+        await self.render_profile()
+
+    @on(Button.Pressed, "#back")
+    def action_back(self) -> None:
+        self.dismiss(None)
+
+
+class SyncScreen(ModalScreen[None]):
+    """A manual check of the setup and every profile, with the fixes.
+
+    Nothing is watched or polled: the check runs when the screen opens and
+    when "Check again" is pressed. Unknown entries are resolved through
+    :func:`respec.adopt.adopt` (which refuses to add into a profile with
+    layer conflicts and rolls back a failed run), conflicts through
+    :func:`respec.layers.repair`, and link problems by re-applying the
+    active profile. Every completed fix is listed in the log.
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("c", "recheck", "Check again"),
+    ]
+
+    def __init__(self, respec_home: Path, user_home: Path) -> None:
+        super().__init__()
+        self.respec_home = respec_home
+        self.user_home = user_home
+        self.report = sync.SyncReport()
+        self.choices: dict[str, str] = {}
+        self.log_lines: list[Text] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog") as dialog:
+            dialog.border_title = f"{SYNC_ICON} Sync"
+            yield Static("", id="sync-summary")
+            with VerticalScroll(id="sync-body"):
+                log = Static("", id="sync-log")
+                log.display = False
+                yield log
+                yield Vertical(id="sync-findings")
+            with Horizontal(id="dialog-actions"):
+                yield Button(f"{SYNC_ICON} Check again", id="sync-recheck")
+                yield Button("Close", id="sync-close", variant="primary")
+
+    async def on_mount(self) -> None:
+        await self.run_check()
+
+    # --- rendering ----------------------------------------------------------
+
+    async def run_check(self) -> None:
+        """Look at the setup and every profile now, and redraw the findings."""
+        self.choices = {}
+        try:
+            self.report = sync.check(self.respec_home, self.user_home)
+        except RespecError as error:
+            self.report = sync.SyncReport()
+            self._log(f"error: {_one_line(error)}", ok=False)
+            summary_text = "The check failed; see above."
+            self._summary(summary_text, clean=False)
+            await self.query_one("#sync-findings").remove_children()
+            return
+        report = self.report
+        if report.clean:
+            self._summary(
+                "All in sync: no unknown entries, layer conflicts or link problems.",
+                clean=True,
+            )
+        else:
+            found = []
+            if report.unknown:
+                found.append(
+                    _plural(len(report.unknown), "unknown entry", "unknown entries")
+                )
+            if report.conflicts:
+                found.append(
+                    _plural(len(report.conflicts), "layer conflict", "layer conflicts")
+                )
+            if report.links:
+                found.append(
+                    _plural(len(report.links), "link problem", "link problems")
+                )
+            if report.invalid:
+                found.append(
+                    _plural(len(report.invalid), "invalid profile", "invalid profiles")
+                )
+            self._summary("Found " + ", ".join(found) + ".", clean=False)
+        findings = self.query_one("#sync-findings", Vertical)
+        await findings.remove_children()
+        sections = []
+        if report.unknown:
+            sections.append(self._unknown_section(report))
+        if report.conflicts:
+            sections.append(self._conflict_section(report))
+        if report.links:
+            sections.append(self._link_section(report))
+        if report.invalid:
+            sections.append(self._invalid_section(report))
+        await findings.mount_all(sections)
+
+    def _summary(self, text: str, clean: bool) -> None:
+        summary = self.query_one("#sync-summary", Static)
+        summary.update(text)
+        summary.set_class(clean, "-success")
+        summary.set_class(not clean, "-warning")
+
+    def _section(self, title: str, intro: str, section_id: str) -> Vertical:
+        section = Vertical(id=section_id, classes="section")
+        section.compose_add_child(Static(title, classes="section-title"))
+        section.compose_add_child(Static(intro, classes="section-intro"))
+        return section
+
+    def _unknown_section(self, report: sync.SyncReport) -> Vertical:
+        profile = report.active_profile
+        section = self._section(
+            "Unknown entries",
+            "Not placed by respec, or edited copies of skills it installed. "
+            "Choose for each; entries left unchosen stay as they are.",
+            "sync-unknown",
+        )
+        labels = {"add": f"Add to profile {profile}", "remove": "Back up and remove"}
+        for index, entry in enumerate(report.unknown):
+            row = Vertical(id=f"sync-unknown-{index}", classes="unknown")
+            row.compose_add_child(Static(entry.path, classes="unknown-path"))
+            row.compose_add_child(Static(_unknown_meta(entry), classes="unknown-meta"))
+            row.compose_add_child(
+                RadioSet(
+                    *(
+                        RadioButton(labels[choice], id=f"sync-unknown-{index}-{choice}")
+                        for choice in adopt.choices(profile)
+                    ),
+                    id=f"sync-unknown-{index}-choice",
+                )
+            )
+            section.compose_add_child(row)
+        section.compose_add_child(
+            Button("Resolve chosen", id="sync-resolve", disabled=True)
+        )
+        return section
+
+    def _conflict_section(self, report: sync.SyncReport) -> Vertical:
+        section = self._section(
+            "Layer conflicts",
+            "Exclusive layers with more than one enabled skill. Choose the skill "
+            "to keep; the others are disabled ('respec layer repair').",
+            "sync-conflicts",
+        )
+        for index, conflict in enumerate(report.conflicts):
+            row = Vertical(id=f"sync-conflict-{index}", classes="conflict")
+            row.compose_add_child(
+                Static(
+                    f"Layer {conflict.layer!r} of profile {conflict.profile!r} has "
+                    f"{len(conflict.skills)} enabled skills: "
+                    f"{', '.join(conflict.skills)}. Keep:",
+                    classes="conflict-text",
+                )
+            )
+            row.compose_add_child(
+                RadioSet(
+                    *(
+                        RadioButton(
+                            skill,
+                            value=position == 0,
+                            id=f"sync-conflict-{index}-keep-{position}",
+                        )
+                        for position, skill in enumerate(conflict.skills)
+                    ),
+                    id=f"sync-conflict-{index}-keep",
+                )
+            )
+            row.compose_add_child(
+                Button(
+                    "Repair layer",
+                    id=f"sync-conflict-{index}-repair",
+                    classes="conflict-repair",
+                )
+            )
+            section.compose_add_child(row)
+        return section
+
+    def _link_section(self, report: sync.SyncReport) -> Vertical:
+        active = report.active_profile
+        hint = (
+            f"Re-applying profile {active} puts its links back in line with its "
+            "profile.yaml."
+            if active
+            else "No profile is active; activate one to put its links in place."
+        )
+        section = self._section("Links", hint, "sync-link-section")
+        section.compose_add_child(
+            Static(
+                "\n".join(problem.describe() for problem in report.links),
+                id="sync-links",
+            )
+        )
+        if active:
+            section.compose_add_child(
+                Button(f"Re-apply profile {active}", id="sync-relink")
+            )
+        return section
+
+    def _invalid_section(self, report: sync.SyncReport) -> Vertical:
+        section = self._section(
+            "Invalid profiles",
+            "These profile.yaml files do not load; fix them by hand "
+            "('respec profile show <name>' explains the problem).",
+            "sync-invalid-section",
+        )
+        section.compose_add_child(Static("\n".join(report.invalid), id="sync-invalid"))
+        return section
+
+    def _log(self, line: str, ok: bool) -> None:
+        self.log_lines.append(Text(line, style=SUCCESS if ok else DANGER))
+        log = self.query_one("#sync-log", Static)
+        log.update(Text("\n").join(self.log_lines))
+        log.display = True
+        self.query_one("#sync-body", VerticalScroll).scroll_home(animate=False)
+
+    def _log_error(self, error: RespecError) -> None:
+        self._log("error: " + str(error).strip(), ok=False)
+
+    # --- actions ------------------------------------------------------------
+
+    @on(RadioSet.Changed)
+    def _chosen(self, event: RadioSet.Changed) -> None:
+        radio_id = event.radio_set.id or ""
+        if not (radio_id.startswith("sync-unknown-") and radio_id.endswith("-choice")):
+            return
+        index = int(radio_id.split("-")[2])
+        choice = (event.pressed.id or "").rsplit("-", 1)[1]
+        self.choices[self.report.unknown[index].path] = choice
+        self.query_one("#sync-resolve", Button).disabled = False
+
+    @on(Button.Pressed, "#sync-resolve")
+    async def _resolve(self) -> None:
+        """Apply the chosen add or remove through ``respec adopt``'s full path."""
+        choices = dict(self.choices)
+        done: list[adopt.Resolution] = []
+        try:
+            adopt.adopt(
+                self.respec_home,
+                self.user_home,
+                lambda entry: choices.get(entry.path),
+                done=done,
+            )
+        except RespecError as error:
+            for resolution in done:
+                self._log(resolution.describe(), ok=True)
+            self._log_error(error)
+        else:
+            for resolution in done:
+                self._log(resolution.describe(), ok=True)
+        await self.run_check()
+
+    @on(Button.Pressed, ".conflict-repair")
+    async def _repair(self, event: Button.Pressed) -> None:
+        index = int((event.button.id or "").split("-")[2])
+        conflict = self.report.conflicts[index]
+        keep_set = self.query_one(f"#sync-conflict-{index}-keep", RadioSet)
+        keep = conflict.skills[
+            keep_set.pressed_index if keep_set.pressed_index >= 0 else 0
+        ]
+        try:
+            change = layers.repair(
+                self.respec_home,
+                self.user_home,
+                conflict.layer,
+                keep=keep,
+                profile_name=conflict.profile,
+            )
+        except RespecError as error:
+            self._log_error(error)
+        else:
+            for line in _layer_change_lines(change):
+                self._log(line, ok=True)
+        await self.run_check()
+
+    @on(Button.Pressed, "#sync-relink")
+    async def _relink(self) -> None:
+        try:
+            result = sync.reapply(self.respec_home, self.user_home)
+        except RespecError as error:
+            self._log_error(error)
+        else:
+            self._log(
+                f"Re-applied profile {result.profile!r}: "
+                f"{_plural(len(result.installed), 'link', 'links')} in place",
+                ok=True,
+            )
+        await self.run_check()
+
+    @on(Button.Pressed, "#sync-recheck")
+    async def action_recheck(self) -> None:
+        await self.run_check()
+
+    @on(Button.Pressed, "#sync-close")
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class RespecApp(App[None]):
     """Profiles on the left, the status of every owned folder on the right."""
 
@@ -313,6 +1222,9 @@ class RespecApp(App[None]):
     ENABLE_COMMAND_PALETTE = False
     CSS = CSS
     BINDINGS = [
+        Binding("s", "sync", "Sync"),
+        Binding("e", "edit", "Edit profile"),
+        Binding("n", "new_profile", "New profile"),
         Binding("a", "adopt", "Resolve unknown"),
         Binding("r", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
@@ -325,22 +1237,36 @@ class RespecApp(App[None]):
         self.selected: str | None = None
         self.active: str | None = None
 
+    # Actions of the profile list; elsewhere their keys do nothing.
+    LIST_ACTIONS = frozenset({"edit", "new_profile", "adopt", "refresh"})
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
+        if action in self.LIST_ACTIONS:
+            return len(self.screen_stack) == 1
+        if action == "sync":
+            return not isinstance(self.screen, ModalScreen)
+        return True
+
     # --- layout -----------------------------------------------------------
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="topbar"):
             yield Static("respec", id="title")
             yield Static("", id="active")
+            yield Button(f"{SYNC_ICON} Sync", id="sync")
         with Horizontal(id="body"):
             with Vertical(id="sidebar") as sidebar:
                 sidebar.border_title = "Profiles"
                 yield ProfileList(id="profiles")
                 yield Static(
-                    "No profiles yet. Create one with\n"
-                    "respec profile new <name> --target <target>",
+                    "No profiles yet. Create one with New profile (n),\n"
+                    "or respec profile new <name> --target <target>",
                     id="profiles-empty",
                 )
                 yield Button("Activate", id="activate", variant="primary")
+                with Horizontal(id="profile-actions"):
+                    yield Button("Edit", id="edit")
+                    yield Button("New profile", id="new")
             with VerticalScroll(id="status") as status:
                 status.border_title = "Target folders"
         yield Static("", id="feedback")
@@ -410,6 +1336,7 @@ class RespecApp(App[None]):
         )
 
     def _update_activate(self) -> None:
+        self.query_one("#edit", Button).disabled = self.selected is None
         button = self.query_one("#activate", Button)
         button.disabled = self.selected is None or self.selected == self.active
         button.label = (
@@ -439,6 +1366,42 @@ class RespecApp(App[None]):
 
     async def action_refresh(self) -> None:
         await self.refresh_view()
+
+    @on(Button.Pressed, "#edit")
+    def action_edit(self) -> None:
+        """Open the selected profile's skills, layers and sources."""
+        if self.selected is None:
+            self.show_feedback("Select a profile to edit first.", ok=False)
+            return
+
+        def closed(_: None) -> None:
+            self.call_later(self.refresh_view)
+
+        self.push_screen(
+            ProfileScreen(self.respec_home, self.user_home, self.selected), closed
+        )
+
+    @on(Button.Pressed, "#new")
+    def action_new_profile(self) -> None:
+        def created(profile: profiles.Profile | None) -> None:
+            if profile is None:
+                return
+            self.selected = profile.name
+            self.show_feedback(
+                f"Created profile {profile.name!r} at {profile.path}", ok=True
+            )
+            self.call_later(self.refresh_view)
+
+        self.push_screen(NewProfileDialog(self.respec_home), created)
+
+    @on(Button.Pressed, "#sync")
+    def action_sync(self) -> None:
+        """Check the setup and every profile now (manual; nothing is watched)."""
+
+        def closed(_: None) -> None:
+            self.call_later(self.refresh_view)
+
+        self.push_screen(SyncScreen(self.respec_home, self.user_home), closed)
 
     def _active_now(self) -> str | None:
         """The active profile on disk: where ``add`` goes."""
