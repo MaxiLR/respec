@@ -902,6 +902,7 @@ def test_a_journal_without_its_profile_can_be_discarded_with_rollback(
     data = payload(run("recover", "--rollback", "--json"))
 
     assert interrupted_warnings(data)[0]["outcome"] == "rolled-back"
+    assert "None" not in interrupted_warnings(data)[0]["message"]
     assert load_state(respec_home).journal is None
 
 
@@ -939,3 +940,56 @@ def test_local_add_killed_mid_copy_leaves_no_partial_copy(
     assert not (respec_home / "profiles" / "work" / "skills" / "fresh").exists()
     assert (source / "SKILL.md").read_text() == "fresh\n"
     assert run("add", str(source)).exit_code == 0
+
+
+# --- review 3 ------------------------------------------------------------------
+
+
+def full_flushes_of_a_switch(run, monkeypatch, tmp_path, count):
+    from respec import state as state_module
+
+    home, respec_home = fresh_homes(tmp_path, monkeypatch, f"flush-{count}")
+    skills = [f"s{number}" for number in range(count)]
+    targets = ["claude-code", "agents", "oh-my-pi"]
+    make_profile(respec_home, "a", targets, skills)
+    make_profile(respec_home, "b", targets, [f"t{number}" for number in range(count)])
+    assert run("use", "a").exit_code == 0
+    calls: list[int] = []
+    real = state_module._flush_to_disk
+
+    def counting(descriptor):
+        calls.append(descriptor)
+        real(descriptor)
+
+    monkeypatch.setattr(state_module, "_flush_to_disk", counting)
+    assert run("use", "b").exit_code == 0
+    monkeypatch.setattr(state_module, "_flush_to_disk", real)
+    return len(calls)
+
+
+def test_a_switch_flushes_to_disk_a_fixed_number_of_times(run, monkeypatch, tmp_path):
+    """Full flushes (F_FULLFSYNC on macOS) only at the journal's boundaries:
+    their number does not grow with the skills a switch changes."""
+    few = full_flushes_of_a_switch(run, monkeypatch, tmp_path, 2)
+    many = full_flushes_of_a_switch(run, monkeypatch, tmp_path, 20)
+
+    assert many == few
+    assert many <= 8, many
+
+
+def test_remove_from_another_profile_killed_names_no_active_links(
+    run, killed, isolated_homes
+):
+    respec_home = isolated_homes.respec_home
+    make_profile(respec_home, "work", ["claude-code"], ["tdd"])
+    make_profile(respec_home, "spare", ["claude-code"], ["lint", "docs"])
+    assert run("use", "work").exit_code == 0
+
+    assert killed("after-save-profile", 1, "remove", "lint", "-p", "spare")
+    data = payload(run("recover", "--json"))
+
+    (warning,) = interrupted_warnings(data)
+    assert warning["outcome"] == "finished"
+    assert "not the active profile" in warning["message"]
+    assert not (respec_home / "profiles" / "spare" / "skills" / "lint").exists()
+    assert_consistent(respec_home, {"work": ["tdd"]})

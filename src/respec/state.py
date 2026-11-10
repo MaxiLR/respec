@@ -162,14 +162,27 @@ def load_state(respec_home: Path) -> State:
     )
 
 
-def save_state(respec_home: Path, state: State) -> None:
-    """Write state atomically so a crash never leaves a truncated file."""
+def save_state(respec_home: Path, state: State, durable: bool = False) -> None:
+    """Write state atomically (a temporary file, then a rename), so a crash or
+    kill never leaves a truncated file.
+
+    ``durable`` also flushes the file and its folder to disk (``F_FULLFSYNC``
+    on macOS), so the write survives a power loss. That is slow, so only the
+    journal's boundaries ask for it (a change beginning, changing phase or
+    ending, see :mod:`respec.journal`); the per-item saves in between rely on
+    the rename alone, and recovery never needs more than the last of them.
+    """
     path = state_path(respec_home)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{STATE_FILE}.tmp")
-    write_durably(temporary, json.dumps(state.to_dict(), indent=2) + "\n")
+    text = json.dumps(state.to_dict(), indent=2) + "\n"
+    if durable:
+        write_durably(temporary, text)
+    else:
+        temporary.write_text(text, "utf-8")
     os.replace(temporary, path)
-    sync_folder(path.parent)
+    if durable:
+        sync_folder(path.parent)
 
 
 def write_durably(path: Path, text: str) -> None:

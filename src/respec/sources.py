@@ -708,6 +708,7 @@ def _update(
             if latest == source.commit:
                 row["result"] = "up-to-date"
                 continue
+            _put_back_old(profile, name)
             if _modified(profile, name) and not overwrite_edits(name):
                 row["result"] = "skipped-local-edits"
                 continue
@@ -753,6 +754,9 @@ def _replace(
     live = skills_dir / item
     incoming = skills_dir / f".{item}.incoming"
     old = skills_dir / f".{item}.old"
+    dropping = skills_dir / f".{item}.dropping"
+    if dropping.is_dir() and not dropping.is_symlink():
+        shutil.rmtree(dropping)  # a redundant .old whose delete was cut short
     if os.path.lexists(old):
         _settle_foreign_old(respec_home, profile, item, live, old)
     shutil.rmtree(incoming, ignore_errors=True)  # fetched files only
@@ -784,6 +788,15 @@ def _replace(
     return dataclasses.replace(source, commit=commit, digest=fetched_digest(live))
 
 
+def _put_back_old(profile: profiles.Profile, item: str) -> None:
+    """A ``.<skill>.old`` whose skill folder is gone is that folder: put it
+    back first, so the update compares and replaces the right files."""
+    skills_dir = profile.path / profiles.SKILLS_DIR
+    live, old = skills_dir / item, skills_dir / f".{item}.old"
+    if not os.path.lexists(live) and old.is_dir() and not old.is_symlink():
+        os.replace(old, live)
+
+
 def _settle_foreign_old(
     respec_home: Path, profile: profiles.Profile, item: str, live: Path, old: Path
 ) -> None:
@@ -801,7 +814,11 @@ def _settle_foreign_old(
         if trees.same_content(old, live) or adopt._backed_up(
             respec_home, profile.name, item, old
         ):
-            shutil.rmtree(old)
+            # Renamed before the delete: a kill part way leaves a .dropping
+            # folder, verified redundant already, which the next update removes.
+            dropping = old.with_name(f".{item}.dropping")
+            os.replace(old, dropping)
+            shutil.rmtree(dropping)
             return
     raise RespecError(
         f"{old} is left from an interrupted change and its content is neither "

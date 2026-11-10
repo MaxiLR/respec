@@ -179,12 +179,17 @@ in which case it is recorded. An `update` that already saved `profile.yaml`
 removes its own `.<skill>.old` (the previous files), also when the
 interruption had deleted it part way. A `.<skill>.old` that no journaled
 `update` made is never used to replace a skill: like adopt's staging folders,
-it is put back when the skill folder is gone, removed when its content is
-verifiably in the skill folder or a backup run, and otherwise kept, with
-`update` refusing that skill until it is moved out of the way. A journal that
+`update` puts it back when the skill folder is gone, removes it when its
+content is verifiably in the skill folder or a backup run (renamed to
+`.<skill>.dropping` first, so a delete cut short is finished by the next
+update), and otherwise keeps it and refuses that skill until it is moved out
+of the way. A journal that
 respec does not recognise, or that is malformed, is only dropped by
 `respec recover --rollback`. `state.json` and `profile.yaml` are written to a
-temporary file, flushed to disk (`F_FULLFSYNC` on macOS) and renamed.
+temporary file and renamed, so a kill never leaves either half written. Each
+`profile.yaml` write and the journal's boundaries (a change beginning, changing
+phase and ending) are also flushed to disk (`F_FULLFSYNC` on macOS); the
+per-skill records in between are not, which keeps a switch fast.
 
 ### TUI
 

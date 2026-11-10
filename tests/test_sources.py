@@ -1905,3 +1905,34 @@ def test_a_foreign_old_copy_that_is_verifiably_redundant_does_not_block_update(
 
     assert (skills / "up" / "SKILL.md").read_text() == "# up v2\n"
     assert not (skills / ".up.old").exists()
+
+
+# --- review 3 ------------------------------------------------------------------
+
+
+def test_update_killed_while_dropping_a_redundant_foreign_old_does_not_block(
+    run, killed, at_v1_with_v2_upstream, isolated_homes
+):
+    import shutil
+
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    shutil.copytree(skills / "up", skills / ".up.old")  # same as the live folder
+    assert killed("rmtree-old", 3, "update", "-p", "work")
+
+    _recovered(run)
+    ok(run("update", "-p", "work"))
+
+    assert (skills / "up" / "SKILL.md").read_text() == "# up v2\n"
+    assert sorted(p.name for p in skills.iterdir()) == ["up"]
+
+
+def test_update_puts_back_an_old_copy_whose_skill_folder_is_gone(
+    run, at_v1_with_v2_upstream, isolated_homes
+):
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    (skills / "up").rename(skills / ".up.old")
+
+    ok(run("update", "-p", "work"))
+
+    assert (skills / "up" / "SKILL.md").read_text() == "# up v2\n"
+    assert not (skills / ".up.old").exists()

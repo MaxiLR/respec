@@ -163,6 +163,11 @@ def describe(journal: dict[str, Any]) -> str:
     """The interrupted change in a few words: "the switch to profile 'work'"."""
     operation = journal.get("operation")
     profile = journal.get("profile")
+    if operation != "use" and profile is None:
+        return {
+            "restore": "the restore",
+            "adopt": "the resolution of unknown entries",
+        }.get(str(operation), f"an interrupted {operation!r} change")
     if operation == "use":
         if profile is None:
             return "the removal of respec's skills"
@@ -284,7 +289,7 @@ def begin(
         "started_at": _now(),
         **{key: value for key, value in fields.items() if value is not None},
     }
-    save_state(respec_home, current)
+    save_state(respec_home, current, durable=True)
     _ops().append(operation)
     try:
         checkpoint(f"{operation}:begin")
@@ -346,7 +351,7 @@ def _clear(respec_home: Path, existed: bool = True) -> None:
     if not existed and state.to_dict() == State().to_dict():
         state_path(respec_home).unlink()
     else:
-        save_state(respec_home, state)
+        save_state(respec_home, state, durable=True)
 
 
 def _journal_of(respec_home: Path, state: State | None) -> State | None:
@@ -407,7 +412,7 @@ def set_phase(
     assert target is not None
     record["phase"] = phase
     record.update({k: v for k, v in fields.items() if v is not None})
-    save_state(respec_home, target)
+    save_state(respec_home, target, durable=True)
     checkpoint(f"phase:{phase}")
 
 
@@ -834,8 +839,18 @@ def _recover_links(
         return FINISHED, f"Finished {what}: every choice made stays." + tail
     if unchanged:
         return ROLLED_BACK, (
-            f"Rolled back {what}: profile.yaml had not been changed yet, and the "
-            "links match it." + tail
+            f"Rolled back {what}: profile.yaml had not been changed yet"
+            + (
+                ", and the links match it."
+                if load_state(respec_home).active_profile == name
+                else "."
+            )
+            + tail
+        )
+    if load_state(respec_home).active_profile != name:
+        return FINISHED, (
+            f"Finished {what}: its profile.yaml is as saved; it is not the "
+            "active profile, so no links changed." + tail
         )
     return FINISHED, (
         f"Finished {what}: the links of the active profile match its "
@@ -883,13 +898,14 @@ def _recover_update(
         committed = journal["profile_digest"] != file_digest(yaml_file)
     else:
         committed = journal.get("phase") == "refresh"
-    swaps = {swap["skill"]: swap["live"] for swap in journal.get("swaps", [])}
+    swaps = {swap["skill"]: swap for swap in journal.get("swaps", [])}
     fetched = {entry["skill"]: entry["digest"] for entry in journal.get("fetched", [])}
     aside = _local.aside
     notes: list[str] = []
-    for skill, before in swaps.items():
+    for skill, swap in swaps.items():
+        before = swap["live"]
         live = skills_dir / skill
-        old = skills_dir / f".{skill}.old"
+        old = Path(swap.get("old", skills_dir / f".{skill}.old"))
         incoming = skills_dir / f".{skill}.incoming"
         ours = old.is_dir() and not old.is_symlink() and _digest_or_none(old) == before
         if committed and old.is_dir() and not old.is_symlink():
@@ -911,6 +927,9 @@ def _recover_update(
             os.replace(old, live)
         if os.path.lexists(incoming):
             _delete(incoming)  # fetched by this run (an older one was removed)
+    for dropping in skills_dir.glob(".*.dropping"):
+        if dropping.is_dir() and not dropping.is_symlink():
+            _delete(dropping)  # a .old verified redundant before its delete
     notes += _old_leftovers(skills_dir)
     _reapply(respec_home, user_home, name)
     tail = "".join(f"\n  {note}" for note in notes)
