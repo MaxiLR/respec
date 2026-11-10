@@ -1,5 +1,5 @@
-# Board lock
-.agents/board/.lock
+# Agent board (local planning records)
+.agents/board/
 
 # Python
 __pycache__/
