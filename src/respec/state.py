@@ -27,7 +27,10 @@ spans several steps while it runs: which operation, its plan and the one
 step in flight. A crash leaves it behind, and the next respec command finishes
 or rolls back that change (see :mod:`respec.journal`).
 
-``backup`` is null when the folder did not exist at takeover. ``created`` (left
+``backup`` is null when the folder did not exist at takeover. After
+``respec recover`` rebuilt an unreadable file, a folder whose takeover it
+could not find again is marked ``takeover_unknown`` (``backup`` and
+``created`` are then unknown, and a restore must name its backup run). ``created`` (left
 out when empty) lists the folders missing at takeover, deepest first, which
 respec then created; ``respec restore`` removes those that are empty again. ``mode`` is
 ``symlink`` or ``copy``. ``digest`` fingerprints a copy's content as installed,
@@ -68,6 +71,9 @@ class Owned:
     # Folders missing at takeover (the skills folder and missing parents,
     # deepest first): respec created them, so a restore may remove them again.
     created: tuple[str, ...] = ()
+    # Set when state.json was rebuilt and no record of this folder's takeover
+    # was found: ``backup`` and ``created`` are then unknown, not "none".
+    takeover_unknown: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -77,6 +83,8 @@ class Owned:
         }
         if self.created:
             data["created"] = list(self.created)
+        if self.takeover_unknown:
+            data["takeover_unknown"] = True
         return data
 
 
@@ -124,6 +132,10 @@ def state_path(respec_home: Path) -> Path:
     return respec_home / STATE_FILE
 
 
+class StateNewer(RespecError):
+    """``state.json`` comes from a newer respec; it is never rebuilt."""
+
+
 class StateInvalid(RespecError):
     """``state.json`` cannot be read (for example empty after a power loss)."""
 
@@ -144,6 +156,16 @@ def load_state(respec_home: Path) -> State:
         data = json.loads(path.read_text("utf-8"))
     except (OSError, ValueError) as error:
         raise _invalid(path, str(error)) from None
+    if (
+        isinstance(data, dict)
+        and isinstance(data.get("version"), int)
+        and data["version"] > VERSION
+    ):
+        raise StateNewer(
+            f"{path} was written by a newer respec (state version "
+            f"{data['version']}; this respec reads version {VERSION}). Use that "
+            "newer respec; nothing was changed."
+        )
     if not isinstance(data, dict) or data.get("version") != VERSION:
         raise _invalid(path, f"expected a mapping with version {VERSION}")
     try:

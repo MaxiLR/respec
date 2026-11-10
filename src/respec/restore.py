@@ -111,13 +111,33 @@ def list_backups(respec_home: Path) -> list[Backup]:
     found: list[Backup] = []
     for run in runs:
         held = tuple(sorted(p.name for p in run.iterdir() if p.is_dir()))
+        if not held:
+            continue  # nothing to restore (for example a damaged state.json)
+        recorded = _recorded_takeovers(run)
         takeover = tuple(
             target
-            for target, entry in state.owned.items()
-            if entry.backup is not None and Path(entry.backup).parent == run
+            for target in held
+            if target in recorded
+            or any(
+                entry.backup is not None and Path(entry.backup) == run / target
+                for entry in state.owned.values()
+            )
         )
         found.append(Backup(run.name, str(run), held, takeover))
     return found
+
+
+def _recorded_takeovers(run: Path) -> set[str]:
+    """Targets whose takeover backup the run's manifest records."""
+    try:
+        data = json.loads((run / switch.BACKUP_MANIFEST).read_text("utf-8"))
+        return {
+            target
+            for target, record in data.get("takeover", {}).items()
+            if record.get("backup")
+        }
+    except (OSError, ValueError, AttributeError):
+        return set()
 
 
 def find_run(respec_home: Path, name: str) -> Path:
@@ -208,6 +228,17 @@ def _plan(
     }
     plans: list[FolderPlan] = []
     if run is None:
+        unknown_takeover = sorted(
+            target for target, entry in state.owned.items() if entry.takeover_unknown
+        )
+        if unknown_takeover:
+            raise RespecError(
+                "cannot restore without naming a backup: state.json was rebuilt "
+                "and respec no longer knows the takeover backup of "
+                f"{', '.join(unknown_takeover)}. Nothing was changed. Name the "
+                "backup run to put back: 'respec restore <backup>' "
+                "('respec restore --list' shows them)."
+            )
         for folder, group in groups.values():
             first = min(
                 group,

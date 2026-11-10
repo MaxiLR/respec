@@ -1032,3 +1032,86 @@ def test_an_empty_or_corrupt_state_file_is_rebuilt_by_recover(
     assert [e.name for e in unknown.find_unknown(respec_home, state)] == ["mine"]
     assert run("use", "b").exit_code == 0
     assert_consistent(respec_home, {"b": PROFILES["b"]}, extra=MINE)
+
+
+# --- review 5 ------------------------------------------------------------------
+
+
+def corrupt_and_rebuild(run, respec_home):
+    (respec_home / "state.json").write_text("")
+    data = payload(run("recover", "--json"))
+    assert interrupted_warnings(data)[0]["outcome"] == "rebuilt"
+
+
+def drop_takeover_records(respec_home):
+    """As runs written before takeovers were recorded in their manifest."""
+    for manifest in (respec_home / "backups").glob("*/manifest.json"):
+        data = json.loads(manifest.read_text())
+        data.pop("takeover", None)
+        manifest.write_text(json.dumps(data))
+
+
+def test_bare_restore_after_a_rebuild_without_takeover_records_refuses(
+    run, isolated_homes
+):
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    two_profiles(respec_home, home)
+    assert run("use", "a").exit_code == 0
+    drop_takeover_records(respec_home)
+    corrupt_and_rebuild(run, respec_home)
+    claude, agents = home / ".claude" / "skills", home / ".agents" / "skills"
+    before = (entries(claude), entries(agents))
+
+    result = run("restore")
+
+    assert result.exit_code == 1
+    assert "restore --list" in result.output
+    assert "from nothing" not in result.output
+    assert (entries(claude), entries(agents)) == before
+    assert (claude / "mine" / "SKILL.md").read_text() == "mine\n"
+
+
+def test_a_rebuild_finds_the_takeover_backups_again(run, isolated_homes):
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    two_profiles(respec_home, home)
+    assert run("use", "a").exit_code == 0
+    corrupt_and_rebuild(run, respec_home)
+
+    listed = json.loads(run("restore", "--list", "--json").stdout)
+    assert [b["takeover"] for b in listed] == [["claude-code"]]  # agents was made
+    result = run("restore")
+
+    assert result.exit_code == 0, result.output
+    assert entries(home / ".claude" / "skills") == ["mine"]
+    assert not (home / ".agents" / "skills").exists()  # respec created it
+    assert load_state(respec_home).owned == {}
+
+
+def test_a_state_file_from_a_newer_respec_is_not_rebuilt(run, isolated_homes):
+    respec_home = isolated_homes.respec_home
+    newer = '{"version": 99, "active_profile": null, "owned": {}, "installed": []}'
+    (respec_home / "state.json").write_text(newer)
+
+    status = run("status")
+    recover = run("recover")
+
+    for result in (status, recover):
+        assert result.exit_code == 1
+        assert "newer" in result.output
+        assert "respec recover" not in result.output
+    assert (respec_home / "state.json").read_text() == newer
+    assert not (respec_home / "backups").exists()
+
+
+def test_recover_note_names_what_kept_the_profile_from_activating(run, cut_switch):
+    home, respec_home = cut_switch
+    blocker = home / ".agents" / "skills" / "docs"
+    blocker.mkdir(parents=True, exist_ok=True)
+    (blocker / "SKILL.md").write_text("in the way\n")
+
+    data = payload(run("recover", "--json"))
+
+    (warning,) = interrupted_warnings(data)
+    assert warning["outcome"] == "rolled-back"
+    assert str(blocker) in warning["message"]
+    assert "respec adopt" in warning["message"]

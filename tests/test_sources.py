@@ -1973,3 +1973,28 @@ def test_update_puts_back_an_old_copy_also_when_up_to_date(
 
     assert (skills / "up" / "SKILL.md").read_text() == "# up v2\n"
     assert not (skills / ".up.old").exists()
+
+
+# --- review 5 ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("with_old", [True, False])
+def test_update_refuses_clearly_while_a_unique_dropping_folder_is_there(
+    run, at_v1_with_v2_upstream, isolated_homes, with_old
+):
+    import shutil
+
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    dropping = skills / ".up.dropping"
+    dropping.mkdir()
+    (dropping / "only.md").write_text("only copy\n")
+    if with_old:
+        shutil.copytree(skills / "up", skills / ".up.old")
+
+    result = run("update", "-p", "work", "--json")
+
+    rows = {row["skill"]: row for row in json.loads(result.stdout)["skills"]}
+    assert rows["up"]["result"] == "error"
+    assert str(dropping) in rows["up"]["error"]
+    assert "Errno" not in rows["up"]["error"]
+    assert (dropping / "only.md").read_text() == "only copy\n"

@@ -755,12 +755,20 @@ def _replace(
     incoming = skills_dir / f".{item}.incoming"
     old = skills_dir / f".{item}.old"
     dropping = skills_dir / f".{item}.dropping"
-    if (
-        dropping.is_dir()
-        and not dropping.is_symlink()
-        and _redundant(respec_home, profile, item, dropping, live)
-    ):
-        shutil.rmtree(dropping)  # its content is held elsewhere
+    if os.path.lexists(dropping):
+        if (
+            dropping.is_dir()
+            and not dropping.is_symlink()
+            and _redundant(respec_home, profile, item, dropping, live)
+        ):
+            shutil.rmtree(dropping)  # its content is held elsewhere
+        else:
+            raise RespecError(
+                f"{dropping} is left from an interrupted change and its content "
+                "is neither in the live folder nor in a backup, so it may hold "
+                f"the only copy of something; move it out of the way first. "
+                f"{item!r} was not updated."
+            )
     if os.path.lexists(old):
         _settle_foreign_old(respec_home, profile, item, live, old)
     shutil.rmtree(incoming, ignore_errors=True)  # fetched files only

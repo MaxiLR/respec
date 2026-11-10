@@ -154,7 +154,10 @@ listed in `set_aside`).
   loss), run `respec recover`: it keeps the damaged `state.json` in a backup
   and rebuilds it from disk (`operation` `state`, `outcome` `rebuilt`). No
   profile is active afterwards; entries it cannot recognise as respec's are
-  unknown entries. Nothing is deleted.
+  unknown entries. Nothing is deleted. If it could not find a folder's
+  takeover record, a bare `respec restore` refuses: name the run with
+  `respec restore <backup>` (`respec restore --list` marks takeover runs).
+  A `state.json` from a newer respec is never rebuilt.
 
 The first `respec use` that touches a folder backs up its full contents to
 `~/.respec/backups/<timestamp>/<target>/` before taking it over. Folders respec

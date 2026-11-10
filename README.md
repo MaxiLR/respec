@@ -183,7 +183,8 @@ interruption had deleted it part way. A `.<skill>.old` that no journaled
 content is verifiably in the skill folder or a backup run (renamed to
 `.<skill>.dropping` first, so a delete cut short is finished by the next
 update), and otherwise keeps it and refuses that skill until it is moved out
-of the way. A journal that
+of the way. The same goes for a `.<skill>.dropping` folder (a redundant
+`.old` being removed) that no journaled update recorded. A journal that
 respec does not recognise, or that is malformed, is only dropped by
 `respec recover --rollback`. `state.json` and `profile.yaml` are written to a
 temporary file, flushed and renamed, so a kill never leaves either half
@@ -204,8 +205,17 @@ After a power loss:
   rebuilds the record from disk: respec owns again the target folders that
   hold its links and records those links as its own; no profile is active,
   and everything else in those folders is an unknown entry. Nothing is
-  deleted. It reports this as an `interrupted-operation` warning with
-  `operation` `state` and `outcome` `rebuilt`.
+  deleted. Each folder's takeover (its backup, and whether respec created the
+  folder) is found again in the takeover record that every takeover writes to
+  its backup run's `manifest.json`. A folder without such a record (taken
+  over by an older respec, or with no backup run because no folder existed)
+  is marked `takeover_unknown`: a bare `respec restore` then refuses and
+  changes nothing, and `respec restore <backup>` names the run to put back
+  (`respec restore --list` marks takeover runs). It reports this as an
+  `interrupted-operation` warning with `operation` `state` and `outcome`
+  `rebuilt`.
+- A `state.json` written by a newer respec is never rebuilt: every command
+  says so and changes nothing.
 
 ### TUI
 

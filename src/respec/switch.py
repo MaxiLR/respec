@@ -370,8 +370,23 @@ def _take_over(
         )
     state.owned.update(owned)
     if run_dir is not None:
+        _record_takeovers(run_dir, owned)
         journal.mark(respec_home, None, state)
     return backups
+
+
+def _record_takeovers(run_dir: Path, owned: dict[str, Owned]) -> None:
+    """Note in the run's manifest which targets it took over, and how (the
+    ``takeover`` key), so a rebuilt ``state.json`` can find them again
+    (:func:`respec.journal.rebuild_state`)."""
+    manifest = run_dir / BACKUP_MANIFEST
+    data = json.loads(manifest.read_text("utf-8")) if manifest.exists() else {}
+    data.setdefault("version", 1)
+    data.setdefault("installed", {})
+    data.setdefault("takeover", {}).update(
+        {target: entry.to_dict() for target, entry in owned.items()}
+    )
+    manifest.write_text(json.dumps(data, indent=2) + "\n", "utf-8")
 
 
 def remove_installed(respec_home: Path, item: Installed) -> bool:
