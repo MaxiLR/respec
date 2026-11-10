@@ -2,6 +2,18 @@
 
 Switchable global profiles of agent skills across coding harnesses (Claude Code, oh-my-pi, .agents readers)
 
+## Install
+
+Ask your coding agent to "install respec" from a checkout of this repository.
+It follows [the install skill](.agents/skills/install-respec/SKILL.md), which
+adds a `respec` alias to `~/.bashrc` (and `~/.zshrc` for zsh) so the command
+works from any directory. By hand:
+
+```sh
+uv sync --frozen
+echo "alias respec='uv run --project \"$PWD\" respec'" >> ~/.bashrc
+```
+
 ## Usage
 
 ```sh
@@ -283,6 +295,12 @@ Select a profile with the arrow keys or a click, then press Enter or click
 choices (add to the active profile, or back up and remove); so do entries found
 in a folder the switch took over for the first time. `a` resolves unknown
 entries outside a switch, `r` refreshes and `q` quits.
+
+The arrow keys move between controls on every screen, like Tab and Shift+Tab:
+Down and Right go to the next control, Up and Left to the previous one. A
+control that uses an arrow itself keeps it: a text field keeps Left and Right, a
+scrolled panel keeps Up and Down, and a list or a group of choices keeps them
+until its first or last entry, where the next press moves on.
 
 **Edit** (`e`) opens the selected profile: its skills grouped by layer, with a
 toggle per skill and, in an active exclusive layer, a choice of one skill (or

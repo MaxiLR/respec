@@ -369,10 +369,57 @@ def _unknown_meta(entry: unknown.Unknown) -> str:
     return f"{entry.kind} in {', '.join(entry.targets)}{replaced}"
 
 
+# Arrow keys move between controls wherever the focused control has no use
+# for them itself (a text field keeps Left and Right, a list keeps Up and Down
+# until its ends, a scrolled panel keeps Up and Down).
+ARROW_BINDINGS = [
+    Binding("up,left", "app.focus_previous", "Previous", show=False),
+    Binding("down,right", "app.focus_next", "Next", show=False),
+]
+
+
+class ChoiceSet(RadioSet):
+    """A radio group the arrow keys can leave: no wrapping at its ends."""
+
+    def _step(self, direction: int) -> None:
+        before = self._selected
+        if direction > 0:
+            super().action_next_button()
+        else:
+            super().action_previous_button()
+        after = self._selected
+        if before is None or after is None:
+            return
+        if (after - before) * direction <= 0:  # wrapped around, or nowhere to go
+            self._selected = before
+            if direction > 0:
+                self.screen.focus_next()
+            else:
+                self.screen.focus_previous()
+
+    def action_next_button(self) -> None:
+        self._step(1)
+
+    def action_previous_button(self) -> None:
+        self._step(-1)
+
+
 class ProfileList(ListView):
     """Profile list: a click or the arrow keys select, Enter activates."""
 
     BINDINGS = [Binding("enter", "select_cursor", "Activate")]
+
+    def action_cursor_down(self) -> None:
+        if self.index is None or self.index >= len(self.children) - 1:
+            self.screen.focus_next()
+        else:
+            super().action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        if not self.index:
+            self.screen.focus_previous()
+        else:
+            super().action_cursor_up()
 
     def action_select_cursor(self) -> None:
         item = self.highlighted_child
@@ -406,7 +453,7 @@ class AdoptDialog(ModalScreen[dict[str, str] | None]):
     when cancelled.
     """
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [Binding("escape", "cancel", "Cancel"), *ARROW_BINDINGS]
 
     def __init__(
         self, entries: list[unknown.Unknown], profile: str | None, reason: str
@@ -430,7 +477,7 @@ class AdoptDialog(ModalScreen[dict[str, str] | None]):
                     with Vertical(id=f"unknown-{index}", classes="unknown"):
                         yield Static(entry.path, classes="unknown-path")
                         yield Static(_unknown_meta(entry), classes="unknown-meta")
-                        with RadioSet(id=f"unknown-{index}-choice"):
+                        with ChoiceSet(id=f"unknown-{index}-choice"):
                             for choice in adopt.choices(
                                 self.profile, entry, self.app.respec_home
                             ):
@@ -465,7 +512,7 @@ class AddDialog(ModalScreen[tuple[str, str | None] | None]):
     Dismisses with ``(text, ref)`` or ``None`` when cancelled.
     """
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [Binding("escape", "cancel", "Cancel"), *ARROW_BINDINGS]
 
     def __init__(self, profile: str, git: bool) -> None:
         super().__init__()
@@ -518,7 +565,7 @@ class AddDialog(ModalScreen[tuple[str, str | None] | None]):
 class NewProfileDialog(ModalScreen[profiles.Profile | None]):
     """Name a new profile and choose its targets; creates it on confirm."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [Binding("escape", "cancel", "Cancel"), *ARROW_BINDINGS]
 
     def __init__(self, respec_home: Path) -> None:
         super().__init__()
@@ -578,7 +625,7 @@ class NewProfileDialog(ModalScreen[profiles.Profile | None]):
 class RemoveProfileDialog(ModalScreen[bool]):
     """Ask before removing a profile; its folder moves to a backup."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [Binding("escape", "cancel", "Cancel"), *ARROW_BINDINGS]
 
     def __init__(self, respec_home: Path, name: str) -> None:
         super().__init__()
@@ -632,7 +679,7 @@ class SkillChoice(RadioButton):
         self.skill = skill
 
 
-class LayerChoice(RadioSet):
+class LayerChoice(ChoiceSet):
     """Exclusive selection inside one active exclusive layer."""
 
     def __init__(self, layer: str, *buttons: SkillChoice) -> None:
@@ -653,6 +700,7 @@ class ProfileScreen(Screen[None]):
         Binding("a", "add_folder", "Add folder"),
         Binding("g", "add_git", "Add from git"),
         Binding("u", "check_updates", "Check updates"),
+        *ARROW_BINDINGS,
     ]
 
     def __init__(self, respec_home: Path, user_home: Path, profile: str) -> None:
@@ -1070,6 +1118,7 @@ class SyncScreen(ModalScreen[None]):
     BINDINGS = [
         Binding("escape", "close", "Close"),
         Binding("c", "recheck", "Check again"),
+        *ARROW_BINDINGS,
     ]
 
     def __init__(self, respec_home: Path, user_home: Path) -> None:
@@ -1204,7 +1253,7 @@ class SyncScreen(ModalScreen[None]):
             row.compose_add_child(Static(entry.path, classes="unknown-path"))
             row.compose_add_child(Static(_unknown_meta(entry), classes="unknown-meta"))
             row.compose_add_child(
-                RadioSet(
+                ChoiceSet(
                     *(
                         RadioButton(labels[choice], id=f"sync-unknown-{index}-{choice}")
                         for choice in adopt.choices(profile, entry, self.respec_home)
@@ -1236,7 +1285,7 @@ class SyncScreen(ModalScreen[None]):
                 )
             )
             row.compose_add_child(
-                RadioSet(
+                ChoiceSet(
                     *(
                         RadioButton(
                             skill,
@@ -1461,6 +1510,7 @@ class RespecApp(App[None]):
         Binding("a", "adopt", "Resolve unknown"),
         Binding("r", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
+        *ARROW_BINDINGS,
     ]
 
     def __init__(self, respec_home: Path, user_home: Path) -> None:
