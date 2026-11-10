@@ -69,6 +69,7 @@ class UnknownEntries(SwitchBlocked):
         entries: list[unknown.Unknown],
         lead: str | None = None,
         note: str = "",
+        can_add: bool = True,
     ) -> None:
         self.profile = profile
         self.entries = entries
@@ -77,8 +78,14 @@ class UnknownEntries(SwitchBlocked):
         super().__init__(
             f"{lead}: these entries are not managed by respec and sit where it "
             f"would install or remove a skill:\n{lines}\n"
-            "Resolve them with 'respec adopt': add each to the active profile, "
-            "or remove it (it is backed up first)." + (f"\n{note}" if note else "")
+            + (
+                "Resolve them with 'respec adopt': add each to the active "
+                "profile, or remove it (it is backed up first)."
+                if can_add
+                else "No profile is active, so they can only be removed (each is "
+                "backed up first): run 'respec adopt --remove <name>'."
+            )
+            + (f"\n{note}" if note else "")
         )
 
 
@@ -402,7 +409,9 @@ def use(
     _check_sources(profile, lead)
     found = conflicts(respec_home, user_home, profile, state)
     if found and on_unknown is None:
-        raise UnknownEntries(profile.name, found, lead=lead)
+        raise UnknownEntries(
+            profile.name, found, lead=lead, can_add=state.active_profile is not None
+        )
     result = SwitchResult(profile=profile.name, previous=state.active_profile)
 
     result.backups = _take_over(respec_home, user_home, profile, state, now)
@@ -416,7 +425,9 @@ def use(
         _check_sources(profile, lead)
         left = conflicts(respec_home, user_home, profile, state)
         if left:
-            raise UnknownEntries(profile.name, left, lead=lead)
+            raise UnknownEntries(
+                profile.name, left, lead=lead, can_add=state.active_profile is not None
+            )
     plan = _plan(profile, user_home)
 
     # state.json is saved after every removal and every install, so it always

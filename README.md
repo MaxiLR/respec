@@ -71,9 +71,13 @@ terminal asks per entry; other runs stop unless
 over a folder that already holds entries, a terminal asks about each right
 away (after the switch, which has already backed up the whole folder);
 `--unknown` given on a terminal answers these too. At the very first takeover
-no profile was active yet, so `add` goes to the profile being activated.
-Interrupting the prompt leaves the rest unknown. Other runs back the folder up
-as always and warn. Whatever was already done is always reported. `respec adopt`
+no profile was active yet, so a terminal's `add` goes to the profile being
+activated; `--unknown add` always means the profile active now, so it is refused
+when none is. Interrupting a prompt leaves the rest unknown. Other runs back the
+folder up as always and warn. Whatever was already done is always reported,
+with backup paths, also when a switch fails or is interrupted part way: choices
+already made are kept, not undone. An add that replaces the profile's own copy
+of a skill says so and names the backup of the previous copy. `respec adopt`
 resolves unknown entries at any time (`--add` or `--remove` per entry, or
 `--all`).
 

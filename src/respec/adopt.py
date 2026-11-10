@@ -59,6 +59,19 @@ class Resolution:
     # Backup of the profile's own copy that an edited copy replaced.
     replaced_copy: str | None = None
 
+    def describe(self) -> str:
+        """What was done, in the words the CLI and the TUI print."""
+        path = self.entry.path
+        if self.choice != "add":
+            return f"Backed up {path} to {self.backup} and removed it"
+        if self.replaced_copy is not None:
+            return (
+                f"Replaced profile {self.profile!r}'s copy of {self.entry.name!r} "
+                f"with {path} (its previous copy is backed up at "
+                f"{self.replaced_copy})"
+            )
+        return f"Added {path} to profile {self.profile!r}"
+
     def to_dict(self) -> dict[str, object]:
         return {
             **self.entry.to_dict(),
@@ -118,6 +131,21 @@ def _copy_entry(source: Path, destination: Path) -> None:
         ) from None
 
 
+STAGED = ".respec-new"
+RETIRED = ".respec-old"
+
+
+def _clean_leftovers(skills_dir: Path) -> None:
+    """Delete staging folders an interrupted overwrite may have left.
+
+    They only ever hold a copy of content that is also elsewhere: the entry
+    being added, or a profile copy already saved to a backup run.
+    """
+    for leftover in skills_dir.glob(".*.respec-*"):
+        if leftover.name.endswith((STAGED, RETIRED)) and not leftover.is_symlink():
+            shutil.rmtree(leftover, ignore_errors=True)
+
+
 def _overwrite(
     profile: profiles.Profile, entry: unknown.Unknown, run_dir: Callable[[], Path]
 ) -> str:
@@ -133,12 +161,14 @@ def _overwrite(
             f"{source} has no {items.SKILL_FILE}; a skill folder needs one"
         )
     destination = profile.path / profiles.SKILLS_DIR / entry.name
+    staged = destination.with_name(f".{entry.name}{STAGED}")
+    retired = destination.with_name(f".{entry.name}{RETIRED}")
+    if not os.path.lexists(destination) and retired.is_dir():
+        # An earlier overwrite stopped between its two renames: undo the first.
+        os.replace(retired, destination)
     saved = run_dir() / "profiles" / profile.name / entry.name
     _copy_entry(destination, saved)
-    staged = destination.with_name(f".{entry.name}.respec-new")
-    retired = destination.with_name(f".{entry.name}.respec-old")
-    for leftover in (staged, retired):
-        shutil.rmtree(leftover, ignore_errors=True)
+    _clean_leftovers(destination.parent)
     try:
         shutil.copytree(source, staged)
         if os.path.lexists(destination):
@@ -152,7 +182,7 @@ def _overwrite(
             f"could not add {source} to profile {profile.name!r}; "
             f"both were left as they were: {error}"
         ) from None
-    shutil.rmtree(retired, ignore_errors=True)
+    _clean_leftovers(destination.parent)
     return str(saved)
 
 
@@ -172,6 +202,13 @@ def _add(
     profile = profiles.load_profile(respec_home, profile_name)
     if entry.replaced and entry.name in profile.skills:
         resolution.replaced_copy = _overwrite(profile, entry, run_dir)
+    elif entry.name in profile.skills:
+        raise RespecError(
+            f"cannot add {entry.path}: profile {profile_name!r} already has a "
+            f"skill {entry.name!r}; choose remove instead ('respec adopt "
+            f"--remove {entry.name}'): the entry is backed up first, and the "
+            "profile's own copy is kept"
+        )
     else:
         items.add_local(respec_home, profile_name, Path(entry.path), name=entry.name)
     if Path(entry.path).is_symlink():

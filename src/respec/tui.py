@@ -200,12 +200,9 @@ def _folder_text(folder: dict[str, Any]) -> Text:
     return text
 
 
-def _resolution_text(resolution: adopt.Resolution) -> str:
-    """What happened to one unknown entry (the CLI's wording)."""
-    entry = resolution.entry
-    if resolution.choice == "add":
-        return f"Added {entry.path} to profile {resolution.profile}"
-    return f"Backed up {entry.path} to {resolution.backup} and removed it"
+def _resolved_text(lead: str, resolved: Sequence[adopt.Resolution]) -> str:
+    """``lead``, then what happened to each entry (the CLI's wording)."""
+    return "\n".join([lead, *(resolution.describe() for resolution in resolved)])
 
 
 class ProfileList(ListView):
@@ -541,7 +538,10 @@ class RespecApp(App[None]):
             except RespecError as error:
                 self._failed(error, resolved)
                 return
-            self.show_feedback(f"Resolved {len(resolved)} unknown entries", ok=True)
+            self.show_feedback(
+                _resolved_text(f"Resolved {len(resolved)} unknown entries:", resolved),
+                ok=True,
+            )
             self.call_later(self.refresh_view)
 
         folders = ", ".join(result.backups)
@@ -559,16 +559,14 @@ class RespecApp(App[None]):
             parts.append(f"removed {len(result.removed)}")
         if result.backups:
             parts.append(f"backed up {', '.join(result.backups)}")
-        if resolved:
-            parts.append(f"resolved {len(resolved)} unknown")
         self.selected = result.profile
-        self.show_feedback(", ".join(parts), ok=True)
+        self.show_feedback(_resolved_text(", ".join(parts), resolved), ok=True)
         self.call_later(self.refresh_view)
 
     def _failed(
         self, error: RespecError, resolved: Sequence[adopt.Resolution] = ()
     ) -> None:
-        done = [_resolution_text(resolution) for resolution in resolved]
+        done = [resolution.describe() for resolution in resolved]
         detail = " ".join(line.strip() for line in str(error).splitlines())
         self.show_feedback("\n".join([*done, f"error: {detail}"]), ok=False)
         self.call_later(self.refresh_view)
@@ -601,7 +599,11 @@ class RespecApp(App[None]):
                 self._failed(error, done)
                 return
             self.show_feedback(
-                f"Resolved {len(result.resolved)} unknown entries", ok=True
+                _resolved_text(
+                    f"Resolved {len(result.resolved)} unknown entries:",
+                    result.resolved,
+                ),
+                ok=True,
             )
             self.call_later(self.refresh_view)
 

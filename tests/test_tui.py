@@ -506,3 +506,42 @@ def test_very_first_takeover_in_the_tui_adds_to_the_profile_being_activated(
     added = respec_home / "profiles" / "beta" / "skills" / "old" / "SKILL.md"
     assert added.read_text() == "foreign\n"
     assert old.is_symlink()
+
+
+def test_tui_names_what_it_resolved_and_where_backups_went(
+    isolated_homes, respec_home, two_profiles, dirs, run
+):
+    stray = drop_skill(dirs["claude-code"], "stray")
+
+    async def scenario(app, pilot):
+        await pilot.press("a")
+        await pilot.pause()
+        await pilot.click("#unknown-0-remove")
+        await pilot.click("#apply")
+        await pilot.pause()
+        feedback = text_of(app.query_one("#feedback"))
+        assert f"Backed up {stray}" in feedback
+
+    drive(isolated_homes, scenario)
+
+
+def test_tui_says_an_overwriting_add_replaced_the_profile_copy(
+    isolated_homes, respec_home, two_profiles, dirs, run
+):
+    link = dirs["claude-code"] / "a1"
+    link.unlink()
+    drop_skill(dirs["claude-code"], "a1")
+
+    async def scenario(app, pilot):
+        await pilot.press("a")
+        await pilot.pause()
+        await pilot.click("#unknown-0-add")
+        await pilot.click("#apply")
+        await pilot.pause()
+        feedback = text_of(app.query_one("#feedback"))
+        assert "Replaced" in feedback and "backed up" in feedback
+
+    drive(isolated_homes, scenario)
+
+    copy = respec_home / "profiles" / "alpha" / "skills" / "a1" / "SKILL.md"
+    assert copy.read_text() == "foreign\n"

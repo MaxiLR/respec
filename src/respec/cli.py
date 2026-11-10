@@ -278,11 +278,7 @@ def _prompt_choice(entry: unknown.Unknown, profile: str | None) -> str:
 
 
 def _report_resolution(resolution: adopt_entries.Resolution) -> None:
-    entry = resolution.entry
-    if resolution.choice == "add":
-        typer.echo(f"Added {entry.path} to profile {resolution.profile!r}")
-    else:
-        typer.echo(f"Backed up {entry.path} to {resolution.backup} and removed it")
+    typer.echo(resolution.describe())
 
 
 def _warn_unresolved(homes: Homes) -> list[dict[str, Any]]:
@@ -359,6 +355,7 @@ def _ask_about_takeover(
             done=done,
         )
     except PROMPT_ABORTED:
+        typer.echo()  # end the interrupted prompt's line
         typer.echo(
             "warning: interrupted; the remaining entries stay as they are",
             err=True,
@@ -376,6 +373,40 @@ def _ask_about_takeover(
     for path in linked.linked:
         typer.echo(f"  linked {path}")
     return code
+
+
+def _interrupted_switch(
+    homes: Homes,
+    name: str,
+    resolutions: list[adopt_entries.Resolution],
+    owned_before: set[str],
+) -> NoReturn:
+    """A prompt before the switch was interrupted: report what was done."""
+    typer.echo()  # end the interrupted prompt's line
+    linked: list[str] = []
+    try:
+        state = load_state(homes.respec_home)
+        # The profile being left is still active: link what was added to it.
+        linked = adopt_entries.link_added(
+            homes.respec_home, homes.user_home, resolutions
+        ).linked
+    except RespecError as error:
+        typer.echo(f"error: {error}", err=True)
+        state = None
+    for resolution in resolutions:
+        _report_resolution(resolution)
+    for path in linked:
+        typer.echo(f"  linked {path}")
+    if state is not None:
+        for target, entry in state.owned.items():
+            if target not in owned_before and entry.backup:
+                typer.echo(f"Backed up {target} folder to {entry.backup}")
+    typer.echo(
+        f"warning: interrupted; the switch to profile {name!r} did not happen",
+        err=True,
+    )
+    _warn_unresolved(homes)
+    raise typer.Exit(code=1)
 
 
 @app.command("use")
@@ -412,8 +443,10 @@ def use(
         if on_unknown.value not in adopt_entries.choices(previous):
             _fail(
                 RespecError(
-                    "'--unknown add' needs an active profile to add to and there "
-                    "is no active profile; use '--unknown remove' instead"
+                    "'--unknown add' adds to the profile active now, and no "
+                    "profile is active; use '--unknown remove' instead. On a "
+                    "terminal without '--unknown', entries found at the first "
+                    "takeover can be added to the profile being activated."
                 )
             )
         policy = on_unknown.value
@@ -431,13 +464,20 @@ def use(
             )
 
     try:
+        owned_before = set(load_state(homes.respec_home).owned)
         result = switch.use(
             homes.respec_home, homes.user_home, name, on_unknown=handler
         )
+    except PROMPT_ABORTED:
+        _interrupted_switch(homes, name, resolutions, owned_before)
     except switch.UnknownEntries as error:
         _fail_after(
             resolutions,
-            RespecError(f"{error}\nOr pass '--unknown add|remove' to 'respec use'."),
+            RespecError(
+                f"{error}\nOr pass "
+                f"'--unknown {'|'.join(adopt_entries.choices(previous))}' "
+                "to 'respec use'."
+            ),
             as_json,
         )
     except RespecError as error:
@@ -1015,6 +1055,7 @@ def adopt(
             homes.respec_home, homes.user_home, decide, done=done
         )
     except PROMPT_ABORTED:
+        typer.echo()  # end the interrupted prompt's line
         for resolution in done:
             _report_resolution(resolution)
         typer.echo(

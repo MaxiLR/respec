@@ -359,7 +359,7 @@ def test_switch_policy_add_without_an_active_profile_fails_before_any_change(
     result = run("use", "b", "--unknown", "add")
 
     assert result.exit_code == 1
-    assert "no active profile" in result.output and "remove" in result.output
+    assert "no profile is active" in result.output and "remove" in result.output
     assert (in_the_way / "SKILL.md").read_text() == "foreign\n"
     assert not (respec_home / "backups").exists()
 
@@ -943,3 +943,120 @@ def test_failed_link_after_an_overwriting_add_puts_both_copies_back(
     profile_copy = respec_home / "profiles" / "a" / "skills" / "tdd" / "SKILL.md"
     assert profile_copy.read_text() == "# tdd from a\n"
     assert yaml_file.read_bytes() == yaml_before
+
+
+# --- fix round 2 -------------------------------------------------------------
+
+
+@pytest.fixture
+def two_in_the_way(run, activated, respec_home, dirs, monkeypatch):
+    """Profile c installs first and second, where hand-made folders sit."""
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    make_profile(respec_home, "c", ["claude-code"], ["first", "second"])
+    first = drop_skill(dirs["claude-code"], "first", "first\n")
+    second = drop_skill(dirs["claude-code"], "second", "second\n")
+    return first, second
+
+
+def test_abort_at_a_second_switch_prompt_reports_a_removal_and_its_backup(
+    run, two_in_the_way, respec_home
+):
+    first, second = two_in_the_way
+
+    result = run("use", "c", input="remove\n")  # the input ends at "second"
+
+    assert result.exit_code == 1
+    assert active_profile(respec_home) == "a"
+    line = next(
+        x for x in result.stdout.splitlines() if x.startswith(f"Backed up {first}")
+    )
+    backup = line.removeprefix(f"Backed up {first} to ").removesuffix(" and removed it")
+    assert open(os.path.join(backup, "SKILL.md")).read() == "first\n"
+    assert "interrupted" in result.stderr and "did not happen" in result.stderr
+    assert str(second) in result.stderr and "respec adopt" in result.stderr
+    assert (second / "SKILL.md").read_text() == "second\n"
+
+
+def test_abort_at_a_second_switch_prompt_reports_and_links_an_add(
+    run, two_in_the_way, respec_home
+):
+    first, second = two_in_the_way
+
+    result = run("use", "c", input="add\n")
+
+    assert result.exit_code == 1
+    assert f"Added {first} to profile 'a'" in result.stdout
+    copied = respec_home / "profiles" / "a" / "skills" / "first"
+    assert (copied / "SKILL.md").read_text() == "first\n"
+    assert first.is_symlink() and first.resolve() == copied.resolve()
+    assert active_profile(respec_home) == "a"
+    assert "interrupted" in result.stderr
+
+
+def test_overwriting_add_says_the_previous_copy_was_replaced_and_where_it_went(
+    run, activated_as_copy, respec_home
+):
+    (activated_as_copy / "SKILL.md").write_text("edited by hand\n")
+
+    result = ok(run("adopt", "--add", "tdd"))
+
+    [saved] = [
+        p for p in (respec_home / "backups").rglob("tdd") if "profiles" in p.parts
+    ]
+    assert "Replaced" in result.stdout and "'tdd'" in result.stdout
+    assert str(saved) in result.stdout
+    assert (saved / "SKILL.md").read_text() == "# tdd from a\n"
+
+
+def test_overwrite_cleans_up_leftover_staging_folders(
+    run, activated_as_copy, respec_home
+):
+    skills = respec_home / "profiles" / "a" / "skills"
+    (skills / ".old-skill.respec-old").mkdir()
+    (skills / ".old-skill.respec-new").mkdir()
+    (activated_as_copy / "SKILL.md").write_text("edited by hand\n")
+
+    ok(run("adopt", "--add", "tdd"))
+
+    assert sorted(p.name for p in skills.iterdir()) == ["tdd"]
+
+
+def test_add_clash_points_to_remove_with_a_backup_not_respec_remove(
+    run, activated, respec_home, dirs
+):
+    ok(run("disable", "tdd"))
+    clash = drop_skill(dirs["claude-code"], "tdd", "someone else's tdd\n")
+
+    result = run("adopt", "--add", "tdd")
+
+    assert result.exit_code == 1
+    assert "already has a skill 'tdd'" in result.output
+    assert "respec remove" not in result.output
+    assert "--remove" in result.output and "backed up" in result.output
+    assert (clash / "SKILL.md").read_text() == "someone else's tdd\n"
+
+
+def test_block_without_an_active_profile_does_not_offer_add(
+    run, activated, respec_home, dirs
+):
+    deactivate(respec_home)
+    drop_skill(dirs["claude-code"], "lint")
+
+    result = run("use", "b")
+
+    assert result.exit_code == 1
+    assert "add each to the active profile" not in result.output
+    assert "no profile is active" in result.output.lower()
+    assert "--unknown add" not in result.output
+
+
+def test_unknown_add_without_an_active_profile_explains_the_takeover_case(
+    run, respec_home, dirs
+):
+    make_profile(respec_home, "a", ["claude-code"], ["tdd"])
+
+    result = run("use", "a", "--unknown", "add")
+
+    assert result.exit_code == 1
+    assert "no profile is active" in result.output
+    assert "profile being activated" in result.output
