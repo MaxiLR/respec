@@ -42,6 +42,7 @@ class Homes:
 def main(ctx: typer.Context) -> None:
     ctx.obj = Homes(respec_home=paths.respec_home(), user_home=paths.user_home())
     profiles.take_warnings()  # start clean; one process may run several commands
+    restore_backups.take_unreadable()
     _failure.clear()
     # A change that was cut short is finished (or rolled back) by the next
     # command that changes skills, and reported as a warning.
@@ -95,10 +96,20 @@ def _print_warnings() -> None:
     for conflict in profiles.take_warnings():
         if conflict.message not in explained:
             typer.echo(f"warning: {conflict.message}", err=True)
+    for path in restore_backups.take_unreadable():
+        typer.echo(f"warning: {_manifest_note(path)}", err=True)
     for report in _journal_reports(take=True):
         if report.message not in explained:
             typer.echo(f"warning: {report.message}", err=True)
     journal.refuse_pending()
+
+
+def _manifest_note(path: str) -> str:
+    return (
+        f"{path} could not be read, so its record of respec's own copies is "
+        "lost: every entry of that backup run was treated as yours (put back, "
+        "nothing left out)."
+    )
 
 
 def _journal_reports(take: bool = False) -> list[journal.Recovery]:
@@ -143,6 +154,14 @@ def _print_json(data: Any) -> None:
             for conflict in profiles.peek_warnings()
         ]
         interrupted = [report.to_warning() for report in _journal_reports()]
+        interrupted += [
+            {
+                "type": "unreadable-manifest",
+                "path": path,
+                "message": _manifest_note(path),
+            }
+            for path in restore_backups.peek_unreadable()
+        ]
         data = {
             **data,
             "warnings": layer_conflicts + interrupted + list(data.get("warnings", [])),
@@ -1225,10 +1244,23 @@ def restore(
             help="Back up entries the backup would overwrite, then replace them.",
         ),
     ] = False,
+    release_only: Annotated[
+        bool,
+        typer.Option(
+            "--release-only",
+            help=(
+                "Let go of every folder without putting a backup back: remove "
+                "only what respec can verify as its own; the rest stays."
+            ),
+        ),
+    ] = False,
     as_json: JsonOption = False,
 ) -> None:
     """Put a backup back and release every folder respec owns."""
     homes = _homes(ctx)
+    if release_only:
+        _release_only(homes, backup, as_json)
+        return
     if list_only:
         try:
             found = restore_backups.list_backups(homes.respec_home)
@@ -1350,6 +1382,45 @@ def _check_same_restore(
             "another backup"
         )
     return True
+
+
+def _release_only(homes: Homes, backup: str | None, as_json: bool) -> None:
+    if backup is not None:
+        _fail(RespecError("'--release-only' puts no backup back; name none"))
+    progress = restore_backups.RestoreResult(backup=None)
+    try:
+        result = restore_backups.release_only(
+            homes.respec_home, homes.user_home, progress=progress
+        )
+    except RespecError as error:
+        if as_json:
+            _print_json(
+                {
+                    **_restore_payload(progress, _unresolved(homes, warn=False)),
+                    "kept": progress.kept,
+                    "resolved": [],
+                    "error": str(error),
+                }
+            )
+            raise typer.Exit(code=1)
+        _fail(error)
+    if as_json:
+        _print_json(
+            {
+                **_restore_payload(result, _unresolved(homes, warn=False)),
+                "kept": result.kept,
+                "resolved": [],
+            }
+        )
+        return
+    if result.removed:
+        typer.echo(f"Removed {len(result.removed)} respec skills")
+    for path in result.kept:
+        typer.echo(f"Kept {path}: respec cannot verify it as its own")
+    typer.echo(
+        "respec let go of its folders without putting a backup back; no "
+        "profile is active. Backup runs stay ('respec restore --list')."
+    )
 
 
 def _restore_payload(

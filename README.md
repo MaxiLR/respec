@@ -14,7 +14,7 @@ respec disable my-skill [-p work] # stop linking it; files and metadata stay
 respec enable my-skill [-p work]
 respec remove my-skill [-p work]  # drop it from profile.yaml and delete its folder
 respec adopt [--add|--remove <entry>] [--all add|remove]
-respec restore [<backup>] [--list] [--unknown add|remove] [--overwrite]
+respec restore [<backup>] [--list] [--unknown add|remove] [--overwrite] [--release-only]
 respec recover [--rollback]       # finish (or roll back) an interrupted change
 respec add owner/repo[#path] [--ref main] [-p work]  # fetch skill(s) from git
 respec update --check [-p work]   # which sourced skills have newer commits
@@ -205,15 +205,20 @@ After a power loss:
   rebuilds the record from disk: respec owns again the target folders that
   hold its links and records those links as its own; no profile is active,
   and everything else in those folders is an unknown entry. Nothing is
-  deleted. Each folder's takeover (its backup, and whether respec created the
-  folder) is found again in the takeover record that every takeover writes to
-  its backup run's `manifest.json`. A folder without such a record (taken
-  over by an older respec, or with no backup run because no folder existed)
-  is marked `takeover_unknown`: a bare `respec restore` then refuses and
-  changes nothing, and `respec restore <backup>` names the run to put back
-  (`respec restore --list` marks takeover runs). It reports this as an
-  `interrupted-operation` warning with `operation` `state` and `outcome`
-  `rebuilt`.
+  deleted. Each folder's takeover (its backup run, or that the folder did not
+  exist, and which folders respec created) is found again in
+  `~/.respec/takeovers.json`, a log every takeover appends to and every
+  restore marks as released; it is written apart from `state.json` and
+  flushed to disk. A folder with no unreleased record there (taken over by an
+  older respec, or the log is lost too) is marked `takeover_unknown`: a bare
+  `respec restore` then refuses and changes nothing. Either name the run to
+  put back, `respec restore <backup>` (`respec restore --list` marks takeover
+  runs), or run `respec restore --release-only`, which lets go of every folder
+  without putting anything back: it removes only the records it can verify as
+  respec's (a link into its folders, or a copy with the recorded digest),
+  lists the rest under `kept`, removes only folders respec recorded creating,
+  and keeps every backup run. It reports this as an `interrupted-operation`
+  warning with `operation` `state` and `outcome` `rebuilt`.
 - A `state.json` written by a newer respec is never rebuilt: every command
   says so and changes nothing.
 
@@ -306,6 +311,9 @@ Every `--json` output that is an object uses one vocabulary:
   warning is an object with a `type` and a `message`. The types:
   - `layer-conflict`: an exclusive layer has several enabled skills; also
     gives `profile`, `layer`, `skills` and `fix`.
+  - `unreadable-manifest`: a backup run's `manifest.json` could not be read
+    during a restore, so every entry of that run was put back as the user's;
+    gives its `path`.
   - `interrupted-operation`: a change that was cut short (see
     [Interrupted changes](#interrupted-changes)); also gives `operation`
     (`use`, `restore`, `adopt`, `links`, `update`, `add`, `install`, or `state`

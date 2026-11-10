@@ -41,7 +41,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import adopt, global_skills, journal, switch, targets, trees, unknown
+from respec import adopt, global_skills, journal, switch, takeovers, targets
+from respec import trees, unknown
 from respec.errors import RespecError
 from respec.state import Installed, State, load_state, save_state
 
@@ -80,6 +81,8 @@ class RestoreResult:
     released: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)  # backup paths left out
     left: list[str] = field(default_factory=list)  # hidden, not in the backup
+    # release_only: recorded paths it could not verify as respec's, left as is.
+    kept: list[str] = field(default_factory=list)
 
 
 class RestoreBlocked(RespecError):
@@ -113,11 +116,11 @@ def list_backups(respec_home: Path) -> list[Backup]:
         held = tuple(sorted(p.name for p in run.iterdir() if p.is_dir()))
         if not held:
             continue  # nothing to restore (for example a damaged state.json)
-        recorded = _recorded_takeovers(run)
+        recorded = takeovers.backup_targets(respec_home)
         takeover = tuple(
             target
             for target in held
-            if target in recorded
+            if run / target in recorded
             or any(
                 entry.backup is not None and Path(entry.backup) == run / target
                 for entry in state.owned.values()
@@ -125,19 +128,6 @@ def list_backups(respec_home: Path) -> list[Backup]:
         )
         found.append(Backup(run.name, str(run), held, takeover))
     return found
-
-
-def _recorded_takeovers(run: Path) -> set[str]:
-    """Targets whose takeover backup the run's manifest records."""
-    try:
-        data = json.loads((run / switch.BACKUP_MANIFEST).read_text("utf-8"))
-        return {
-            target
-            for target, record in data.get("takeover", {}).items()
-            if record.get("backup")
-        }
-    except (OSError, ValueError, AttributeError):
-        return set()
 
 
 def find_run(respec_home: Path, name: str) -> Path:
@@ -186,9 +176,28 @@ def _recorded_at_backup(run: Path, target: str) -> list[dict[str, object]]:
     try:
         data = json.loads(manifest.read_text("utf-8"))
         items = data["installed"].get(target, [])
-    except (OSError, ValueError, KeyError, AttributeError) as error:
-        raise RespecError(f"invalid backup manifest {manifest}: {error}") from None
+    except (OSError, ValueError, KeyError, AttributeError):
+        # Its record of respec's own copies is lost: every entry of the run
+        # is put back as the user's (nothing is left out), and it is reported.
+        if str(manifest) not in _unreadable:
+            _unreadable.append(str(manifest))
+        return []
     return [item for item in items if isinstance(item, dict)]
+
+
+# Manifests a restore could not read, reported as ``unreadable-manifest``
+# warnings by the CLI.
+_unreadable: list[str] = []
+
+
+def peek_unreadable() -> list[str]:
+    return list(_unreadable)
+
+
+def take_unreadable() -> list[str]:
+    found = list(_unreadable)
+    _unreadable.clear()
+    return found
 
 
 def _entries(
@@ -237,7 +246,9 @@ def _plan(
                 "and respec no longer knows the takeover backup of "
                 f"{', '.join(unknown_takeover)}. Nothing was changed. Name the "
                 "backup run to put back: 'respec restore <backup>' "
-                "('respec restore --list' shows them)."
+                "('respec restore --list' shows them), or let go of the folders "
+                "without putting anything back: 'respec restore --release-only' "
+                "(it removes only what it can verify as respec's)."
             )
         for folder, group in groups.values():
             first = min(
@@ -421,6 +432,7 @@ def _apply(
             ) from None
         result.released = sorted(state.owned)
         _remove_created(state, plans)
+        takeovers.release(respec_home, state.owned)
         save_state(respec_home, State())
 
 
@@ -465,4 +477,40 @@ def restore(
         for name in plan.skipped
     ]
     _apply(respec_home, plans, found, result, now)
+    return result
+
+
+def release_only(
+    respec_home: Path,
+    user_home: Path,
+    progress: RestoreResult | None = None,
+) -> RestoreResult:
+    """Let go of every owned folder without putting any backup back.
+
+    Removes only the recorded items that are verifiably respec's (a link into
+    its own folders, or a copy whose digest matches) and lists the others
+    under ``kept``; removes only folders respec recorded creating, once
+    empty. Backup runs stay. The way out when a takeover backup is unknown.
+    """
+    journal.ready(respec_home, user_home)
+    state = load_state(respec_home)
+    if not state.owned:
+        raise RespecError("respec owns no folders; nothing to release.")
+    result = progress if progress is not None else RestoreResult(backup=None)
+    with journal.begin(respec_home, "restore", release_only=True, phase="apply"):
+        state = load_state(respec_home)
+        state.active_profile = None
+        save_state(respec_home, state)
+        for item in list(state.installed):
+            if unknown.is_managed(respec_home, item):
+                if switch.remove_step(respec_home, state, item):
+                    result.removed.append(item)
+            else:
+                result.kept.append(item.path)
+                state.installed.remove(item)
+                save_state(respec_home, state)
+        result.released = sorted(state.owned)
+        _remove_created(state, [])
+        takeovers.release(respec_home, state.owned)
+        save_state(respec_home, State())
     return result

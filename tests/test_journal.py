@@ -1044,11 +1044,8 @@ def corrupt_and_rebuild(run, respec_home):
 
 
 def drop_takeover_records(respec_home):
-    """As runs written before takeovers were recorded in their manifest."""
-    for manifest in (respec_home / "backups").glob("*/manifest.json"):
-        data = json.loads(manifest.read_text())
-        data.pop("takeover", None)
-        manifest.write_text(json.dumps(data))
+    """As a home whose takeovers predate the takeover log."""
+    (respec_home / "takeovers.json").unlink()
 
 
 def test_bare_restore_after_a_rebuild_without_takeover_records_refuses(
@@ -1115,3 +1112,72 @@ def test_recover_note_names_what_kept_the_profile_from_activating(run, cut_switc
     assert warning["outcome"] == "rolled-back"
     assert str(blocker) in warning["message"]
     assert "respec adopt" in warning["message"]
+
+
+# --- review 6 ------------------------------------------------------------------
+
+
+def test_folders_that_did_not_exist_are_released_after_a_rebuild(run, isolated_homes):
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    make_profile(respec_home, "a", ["claude-code", "agents"], ["tdd"])
+    assert run("use", "a").exit_code == 0  # nothing existed: no backup run
+    corrupt_and_rebuild(run, respec_home)
+
+    result = run("restore")
+
+    assert result.exit_code == 0, result.output
+    assert not (home / ".claude").exists()
+    assert not (home / ".agents").exists()
+    assert load_state(respec_home).owned == {}
+
+
+def test_release_only_removes_only_what_respec_can_verify(run, isolated_homes):
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    two_profiles(respec_home, home)
+    assert run("use", "a").exit_code == 0
+    drop_takeover_records(respec_home)
+    corrupt_and_rebuild(run, respec_home)
+    claude = home / ".claude" / "skills"
+    refused = run("restore")
+    assert refused.exit_code == 1 and "--release-only" in refused.output
+
+    data = payload(run("restore", "--release-only", "--json"))
+
+    assert entries(claude) == ["mine"]  # respec's links gone, the user's kept
+    assert (claude / "mine" / "SKILL.md").read_text() == "mine\n"
+    assert (home / ".agents" / "skills").is_dir()  # not recorded as created
+    assert sorted(Path(p).name for p in data["removed"]) == sorted(PROFILES["a"] * 2)
+    assert data["restored"] == {}
+    assert load_state(respec_home).owned == {}
+    assert (respec_home / "backups").is_dir()  # the takeover run stays
+
+
+def test_an_empty_manifest_does_not_stop_a_restore(run, isolated_homes):
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    two_profiles(respec_home, home)
+    assert run("use", "a").exit_code == 0
+    (run_dir,) = (respec_home / "backups").iterdir()
+    (run_dir / "manifest.json").write_text("")
+
+    data = payload(run("restore", "--json"))
+
+    assert entries(home / ".claude" / "skills") == ["mine"]
+    (warning,) = [w for w in data["warnings"] if w["type"] == "unreadable-manifest"]
+    assert warning["path"] == str(run_dir / "manifest.json")
+
+
+def test_a_released_takeover_is_not_reused_by_a_rebuild(run, isolated_homes):
+    import shutil
+
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    two_profiles(respec_home, home)
+    assert run("use", "a").exit_code == 0
+    assert run("restore").exit_code == 0  # 'mine' is back; respec let go
+    shutil.rmtree(home / ".claude")  # the user removes it all
+    assert run("use", "a").exit_code == 0  # taken over again, nothing existed
+    corrupt_and_rebuild(run, respec_home)
+
+    result = run("restore")
+
+    assert result.exit_code == 0, result.output
+    assert not (home / ".claude").exists()  # 'mine' does not come back

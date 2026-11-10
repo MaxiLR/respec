@@ -64,7 +64,6 @@ Tests inject failures at every step boundary through :func:`checkpoint`.
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import threading
@@ -714,7 +713,9 @@ def rebuild_state(respec_home: Path, user_home: Path) -> Recovery:
     kept = run / STATE_FILE
     shutil.move(str(state_path(respec_home)), str(kept))
     roots = global_skills.source_roots(respec_home)
-    takeovers = _takeovers_on_disk(respec_home)
+    from respec import takeovers as takeover_log
+
+    takeovers = takeover_log.current(respec_home)
     state = State()
     owned_folders: set[Path] = set()
     recorded: set[Path] = set()
@@ -756,8 +757,9 @@ def rebuild_state(respec_home: Path, user_home: Path) -> Recovery:
     unknown_takeover = sorted(t for t, e in state.owned.items() if e.takeover_unknown)
     found_note = (
         f" No takeover record was found for {', '.join(unknown_takeover)}: "
-        "'respec restore' then needs a backup run named "
-        "('respec restore --list' shows them)."
+        "'respec restore' then needs a backup run named ('respec restore "
+        "--list' shows them), or 'respec restore --release-only' lets go of "
+        "the folders without putting anything back."
         if unknown_takeover
         else " Each folder's takeover backup was found again in its run's " "manifest."
     )
@@ -777,32 +779,6 @@ def rebuild_state(respec_home: Path, user_home: Path) -> Recovery:
     )
     _policy.reports.append(report)
     return report
-
-
-def _takeovers_on_disk(respec_home: Path) -> dict[str, Owned]:
-    """The latest takeover of each target recorded in a backup run's
-    ``manifest.json`` (``takeover``), as ownership records."""
-    from respec import restore, switch
-
-    found: dict[str, Owned] = {}
-    root = switch.backups_dir(respec_home)
-    if not root.is_dir():
-        return found
-    runs = sorted((p for p in root.iterdir() if p.is_dir()), key=restore._run_key)
-    for run in runs:  # later runs replace earlier ones
-        try:
-            data = json.loads((run / switch.BACKUP_MANIFEST).read_text("utf-8"))
-            records = data.get("takeover", {})
-            for target, record in records.items():
-                found[target] = Owned(
-                    skills_dir=record["skills_dir"],
-                    backup=record.get("backup"),
-                    taken_over_at=record["taken_over_at"],
-                    created=tuple(record.get("created", ())),
-                )
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
-            continue  # no manifest, or one without takeover records
-    return found
 
 
 Handler = Callable[[Path, Path, dict[str, Any], bool], tuple[str, str]]
@@ -894,6 +870,13 @@ def _recover_restore(
         return ROLLED_BACK, (
             "Rolled back the restore: it had not removed any skill yet. Entries "
             "it set aside stay in their backup run."
+        )
+    if journal.get("release_only"):
+        if load_state(respec_home).owned:
+            restore.release_only(respec_home, user_home)
+        return FINISHED, (
+            "Finished letting go of respec's folders: what respec could verify "
+            "as its own was removed, nothing was put back."
         )
     restore.restore(respec_home, user_home, journal.get("backup"), overwrite=True)
     return FINISHED, (

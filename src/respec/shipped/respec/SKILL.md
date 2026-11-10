@@ -156,7 +156,9 @@ listed in `set_aside`).
   profile is active afterwards; entries it cannot recognise as respec's are
   unknown entries. Nothing is deleted. If it could not find a folder's
   takeover record, a bare `respec restore` refuses: name the run with
-  `respec restore <backup>` (`respec restore --list` marks takeover runs).
+  `respec restore <backup>` (`respec restore --list` marks takeover runs), or
+  run `respec restore --release-only` to let go of the folders without putting
+  anything back (only what it can verify as respec's is removed).
   A `state.json` from a newer respec is never rebuilt.
 
 The first `respec use` that touches a folder backs up its full contents to

@@ -33,9 +33,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from respec import global_skills, journal, profiles, targets, trees, unknown
+from respec import global_skills, journal, profiles, takeovers, targets, trees
+from respec import unknown
 from respec.errors import RespecError
 from respec.state import Installed, Owned, State, load_state, save_state
+from respec.state import sync_folder, write_durably
 
 Clock = Callable[[], datetime]
 UnknownHandler = Callable[[list[unknown.Unknown]], None]
@@ -304,10 +306,16 @@ def _record_backed_up_items(
     if not items:
         return
     manifest = run_dir / BACKUP_MANIFEST
-    data = json.loads(manifest.read_text("utf-8")) if manifest.exists() else {}
+    try:
+        data = json.loads(manifest.read_text("utf-8")) if manifest.exists() else {}
+    except ValueError:
+        data = {}  # written by this same takeover; rewritten whole below
     data.setdefault("version", 1)
     data.setdefault("installed", {})[target] = items
-    manifest.write_text(json.dumps(data, indent=2) + "\n", "utf-8")
+    temporary = manifest.with_name(f".{BACKUP_MANIFEST}.tmp")
+    write_durably(temporary, json.dumps(data, indent=2) + "\n")
+    os.replace(temporary, manifest)
+    sync_folder(run_dir)
 
 
 def _missing_folders(folder: Path, user_home: Path) -> tuple[str, ...]:
@@ -369,24 +377,12 @@ def _take_over(
             created=_missing_folders(folder, user_home),
         )
     state.owned.update(owned)
+    # Kept apart from state.json, so a rebuilt one finds every takeover again,
+    # also of a folder that did not exist (respec.takeovers).
+    takeovers.record(respec_home, owned)
     if run_dir is not None:
-        _record_takeovers(run_dir, owned)
         journal.mark(respec_home, None, state)
     return backups
-
-
-def _record_takeovers(run_dir: Path, owned: dict[str, Owned]) -> None:
-    """Note in the run's manifest which targets it took over, and how (the
-    ``takeover`` key), so a rebuilt ``state.json`` can find them again
-    (:func:`respec.journal.rebuild_state`)."""
-    manifest = run_dir / BACKUP_MANIFEST
-    data = json.loads(manifest.read_text("utf-8")) if manifest.exists() else {}
-    data.setdefault("version", 1)
-    data.setdefault("installed", {})
-    data.setdefault("takeover", {}).update(
-        {target: entry.to_dict() for target, entry in owned.items()}
-    )
-    manifest.write_text(json.dumps(data, indent=2) + "\n", "utf-8")
 
 
 def remove_installed(respec_home: Path, item: Installed) -> bool:
