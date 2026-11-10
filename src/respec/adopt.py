@@ -34,7 +34,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import global_skills, items, profiles, switch, trees, unknown
+from respec import global_skills, items, journal, profiles, switch, trees, unknown
 from respec.errors import RespecError
 from respec.state import State, load_state, save_state
 
@@ -265,23 +265,46 @@ def _add(
         respec_home, [entry.name], profile_name, _reserved_hint(entry.name)
     )
     profile = profiles.load_profile(respec_home, profile_name)
-    if entry.replaced and entry.name in profile.skills:
-        resolution.replaced_copy, resolution.leftovers = _overwrite(
-            respec_home, profile, entry, run_dir
-        )
-    elif entry.name in profile.skills:
+    overwrite = entry.replaced and entry.name in profile.skills
+    if entry.name in profile.skills and not overwrite:
         raise RespecError(
             f"cannot add {entry.path}: profile {profile_name!r} already has a "
             f"skill {entry.name!r}; choose remove instead ('respec adopt "
             f"--remove {entry.name}'): the entry is backed up first, and the "
             "profile's own copy is kept"
         )
-    else:
-        items.add_local(respec_home, profile_name, Path(entry.path), name=entry.name)
+    # Journaled in two stages (see respec.journal): the copy into the profile,
+    # then the delete of the original, which only starts once the copy is whole.
+    step = {
+        "step": "adopt",
+        "choice": "add",
+        "stage": "copy",
+        "path": entry.path,
+        "name": entry.name,
+        "profile": profile_name,
+        "overwrite": overwrite,
+    }
+    journal.mark(respec_home, step)
+    try:
+        if overwrite:
+            resolution.replaced_copy, resolution.leftovers = _overwrite(
+                respec_home, profile, entry, run_dir
+            )
+        else:
+            items.add_local(
+                respec_home, profile_name, Path(entry.path), name=entry.name
+            )
+    except RespecError:
+        journal.mark(respec_home, None)
+        raise
+    journal.checkpoint("copied")
     if Path(entry.path).is_symlink():
         resolution.link = os.readlink(entry.path)
+    journal.mark(respec_home, {**step, "stage": "delete"})
     _delete(Path(entry.path))
+    journal.checkpoint("deleted")
     _settle(respec_home, entry)
+    journal.mark(respec_home, None)
     return profile_name
 
 
@@ -377,9 +400,25 @@ def _undo_adds(
 def _remove(respec_home: Path, entry: unknown.Unknown, run_dir: Path) -> str:
     source = Path(entry.path)
     destination = run_dir / entry.targets[0] / entry.name
-    _copy_entry(source, destination)
+    step = {
+        "step": "adopt",
+        "choice": "remove",
+        "stage": "copy",
+        "path": entry.path,
+        "backup": str(destination),
+    }
+    journal.mark(respec_home, step)
+    try:
+        _copy_entry(source, destination)
+    except RespecError:
+        journal.mark(respec_home, None)
+        raise
+    journal.checkpoint("backed-up")
+    journal.mark(respec_home, {**step, "stage": "delete"})
     _delete(source)
+    journal.checkpoint("deleted")
     _settle(respec_home, entry)
+    journal.mark(respec_home, None)
     return str(destination)
 
 
@@ -399,6 +438,19 @@ def resolve(
     ``done`` (when given) as it happens, so a caller still knows what was done
     when a later entry fails.
     """
+    journal.ready(respec_home)
+    with journal.begin(respec_home, "adopt", profile=profile):
+        return _resolve(respec_home, entries, decide, profile, now, done)
+
+
+def _resolve(
+    respec_home: Path,
+    entries: list[unknown.Unknown],
+    decide: Decide,
+    profile: str | None,
+    now: switch.Clock,
+    done: list[Resolution] | None,
+) -> list[Resolution]:
     resolutions: list[Resolution] = []
     run_dir: Path | None = None
 
@@ -497,6 +549,7 @@ def adopt(
     Entries added are linked right away where nothing is in the way. Each
     applied choice is appended to ``done`` as it happens.
     """
+    journal.ready(respec_home, user_home)
     result = AdoptResult()
     if done is None:
         done = []
@@ -516,6 +569,38 @@ def adopt(
         switch.refuse_layer_conflicts(before, "adopt into")
     state_before = load_state(respec_home)
     start = len(done)
+    with journal.begin(respec_home, "adopt", profile=active):
+        _adopt(
+            respec_home,
+            user_home,
+            result,
+            entries,
+            chosen,
+            active,
+            now,
+            done,
+            before,
+            state_before,
+            start,
+        )
+    result.unknown = unresolved(respec_home)
+    return result
+
+
+def _adopt(
+    respec_home: Path,
+    user_home: Path,
+    result: AdoptResult,
+    entries: list[unknown.Unknown],
+    chosen: dict[str, str | None],
+    active: str | None,
+    now: switch.Clock,
+    done: list[Resolution],
+    before: profiles.Profile | None,
+    state_before: State,
+    start: int,
+) -> None:
+    """The changing part of :func:`adopt`, inside its journal."""
     try:
         result.resolved = resolve(
             respec_home, entries, lambda e: chosen[e.path], active, now, done=done
@@ -533,5 +618,3 @@ def adopt(
         if notes:
             message += "\n" + "\n".join(f"  - {note}" for note in notes)
         raise RespecError(message) from None
-    result.unknown = unresolved(respec_home)
-    return result

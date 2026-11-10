@@ -41,7 +41,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import adopt, global_skills, switch, targets, trees, unknown
+from respec import adopt, global_skills, journal, switch, targets, trees, unknown
 from respec.errors import RespecError
 from respec.state import Installed, State, load_state, save_state
 
@@ -291,7 +291,7 @@ def _put_back(source: Path, destination: Path) -> None:
         ) from None
 
 
-def _restore_folder(plan: FolderPlan) -> None:
+def _restore_folder(respec_home: Path, plan: FolderPlan) -> None:
     folder = plan.folder
     if plan.source is None:
         if folder.is_dir() and not folder.is_symlink() and not any(folder.iterdir()):
@@ -304,7 +304,18 @@ def _restore_folder(plan: FolderPlan) -> None:
             if trees.same_entry(destination, source):
                 continue
             raise OSError(f"{destination} appeared during the restore; left as is")
+        journal.mark(
+            respec_home,
+            {
+                "step": "put-back",
+                "path": str(destination),
+                "source": str(source),
+                "target": plan.targets[0],
+            },
+        )
         _put_back(source, destination)
+        journal.checkpoint("put-back")
+        journal.mark(respec_home, None)
 
 
 def _remove_created(state: State, plans: list[FolderPlan]) -> None:
@@ -338,40 +349,43 @@ def _apply(
     result: RestoreResult,
     now: switch.Clock,
 ) -> None:
-    """Every change a restore makes to disk and ``state.json``, in order."""
-    if overwritten:
-        adopt.resolve(
-            respec_home,
-            overwritten,
-            lambda entry: "remove",
-            None,
-            now=now,
-            done=result.set_aside,
-        )
-    state = load_state(respec_home)
-    state.active_profile = None
-    save_state(respec_home, state)
-    try:
-        for item in list(state.installed):
-            if switch.remove_installed(respec_home, item):
-                result.removed.append(item)
-            state.installed.remove(item)
-            save_state(respec_home, state)
-        for plan in plans:
-            _restore_folder(plan)
-            for target in plan.targets:
-                result.restored[target] = str(plan.source) if plan.source else None
-    except OSError as error:
-        save_state(respec_home, state)
-        again = f" {result.backup}" if result.backup else ""
-        raise RespecError(
-            f"restore did not complete: {error}\n"
-            "respec's skills are removed and no profile is active; respec still "
-            f"owns its folders. Run 'respec restore{again}' again to finish."
-        ) from None
-    result.released = sorted(state.owned)
-    _remove_created(state, plans)
-    save_state(respec_home, State())
+    """Every change a restore makes to disk and ``state.json``, in order.
+
+    Journaled (see :mod:`respec.journal`): a crash part way is finished by
+    the next respec command.
+    """
+    with journal.begin(respec_home, "restore", backup=result.backup, phase="prepare"):
+        if overwritten:
+            adopt.resolve(
+                respec_home,
+                overwritten,
+                lambda entry: "remove",
+                None,
+                now=now,
+                done=result.set_aside,
+            )
+        state = load_state(respec_home)
+        state.active_profile = None
+        journal.set_phase(respec_home, "apply", state)
+        try:
+            for item in list(state.installed):
+                if switch.remove_step(respec_home, state, item):
+                    result.removed.append(item)
+            for plan in plans:
+                _restore_folder(respec_home, plan)
+                for target in plan.targets:
+                    result.restored[target] = str(plan.source) if plan.source else None
+        except OSError as error:
+            again = f" {result.backup}" if result.backup else ""
+            raise RespecError(
+                f"restore did not complete: {error}\n"
+                "respec's skills are removed and no profile is active; respec "
+                f"still owns its folders. Run 'respec restore{again}' (or any "
+                "respec command that changes skills) to finish it."
+            ) from None
+        result.released = sorted(state.owned)
+        _remove_created(state, plans)
+        save_state(respec_home, State())
 
 
 def restore(
@@ -388,6 +402,7 @@ def restore(
     Given ``progress``, that result is filled in as the restore goes and
     returned, so a caller can report what was done when it fails part way.
     """
+    journal.ready(respec_home, user_home)
     state = load_state(respec_home)
     if backup is None and not state.owned:
         raise RespecError(

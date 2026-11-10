@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import global_skills, profiles, switch
+from respec import global_skills, journal, profiles, switch
 from respec.errors import RespecError
 from respec.state import load_state
 
@@ -184,7 +184,9 @@ def commit(
     change: SkillChange,
 ) -> None:
     """Save ``after`` and refresh an active profile; if refused, put back the
-    exact file ``before`` was loaded from."""
+    exact file ``before`` was loaded from. An interrupted change is dealt
+    with first (:func:`respec.journal.ready`)."""
+    journal.ready(respec_home, user_home)
     profiles.save_profile(after)
     _refresh(respec_home, user_home, change, lambda: profiles.restore_profile(before))
 
@@ -196,6 +198,7 @@ def add(
     profile_name: str | None = None,
 ) -> SkillChange:
     """Add a local skill folder to a profile (default: the active one)."""
+    journal.ready(respec_home, user_home)
     name = resolve_profile_name(respec_home, profile_name)
     before = profiles.load_profile(respec_home, name)
     profile = add_local(respec_home, name, source)
@@ -259,6 +262,7 @@ def remove(
     profile_name: str | None = None,
 ) -> SkillChange:
     """Remove an item: drop it from ``profile.yaml`` and delete its folder."""
+    journal.ready(respec_home, user_home)
     profile = _load_with_skill(respec_home, profile_name, item)
     folder = _skill_folder(profile, item)
     change = SkillChange(

@@ -35,7 +35,7 @@ from pathlib import Path
 
 import yaml
 
-from respec import global_skills, items, profiles, trees
+from respec import global_skills, items, journal, profiles, trees
 from respec.errors import RespecError
 
 SHORTHAND = profiles.REPO_SHORTHAND
@@ -500,8 +500,22 @@ def add(
 ) -> SourceChange:
     """Fetch the skill(s) named by ``text`` into a profile and record sources."""
     spec = parse_spec(text, ref)
+    journal.ready(respec_home, user_home)
     name = items.resolve_profile_name(respec_home, profile_name)
     before = profiles.load_profile(respec_home, name)
+    with journal.begin(respec_home, "add", profile=name, phase="copy"):
+        return _add(respec_home, user_home, spec, ref, name, before)
+
+
+def _add(
+    respec_home: Path,
+    user_home: Path,
+    spec: Spec,
+    ref: str | None,
+    name: str,
+    before: profiles.Profile,
+) -> SourceChange:
+    """The changing part of :func:`add`, inside its journal."""
     with checkout(spec.url, ref, spec.repo) as (tree, commit):
         found = _find_skills(tree, spec)
         global_skills.refuse_reserved(respec_home, [item for item, _ in found], name)
@@ -513,6 +527,7 @@ def add(
             )
         added: list[str] = []
         sources: dict[str, dict[str, str]] = {}
+        journal.set_phase(respec_home, "copy", skills=[item for item, _ in found])
         try:
             with tempfile.TemporaryDirectory(prefix="respec-stage-") as staging:
                 for item, path in found:
@@ -526,6 +541,7 @@ def add(
                         digest=fetched_digest(staged),
                     )
                     items.add_local(respec_home, name, staged, origin=source)
+                    journal.checkpoint("added")
                     added.append(item)
                     sources[item] = source.to_dict()
         except RespecError:
@@ -536,6 +552,7 @@ def add(
             raise RespecError(f"could not add from {spec.repo}: {error}") from None
 
     change = SourceChange(profile=name, skills=added, sources=sources)
+    journal.set_phase(respec_home, "refresh")
     items.refresh_active(respec_home, user_home, change, lambda: _forget(before, added))
     return change
 
@@ -642,9 +659,28 @@ def update(
     An item whose files were edited locally is replaced only when
     ``overwrite_edits(item)`` returns true; otherwise it is skipped.
     """
+    journal.ready(respec_home, user_home)
     profile = profiles.load_profile(
         respec_home, items.resolve_profile_name(respec_home, profile_name)
     )
+    with journal.begin(
+        respec_home,
+        "update",
+        profile=profile.name,
+        skills=list(_sourced(profile, item)),
+        phase="copy",
+    ):
+        return _update(respec_home, user_home, profile, item, overwrite_edits)
+
+
+def _update(
+    respec_home: Path,
+    user_home: Path,
+    profile: profiles.Profile,
+    item: str | None,
+    overwrite_edits: Confirm,
+) -> UpdateResult:
+    """The changing part of :func:`update`, inside its journal."""
     result = UpdateResult(profile=profile.name)
     skills = dict(profile.skills)
     replaced: list[tuple[Path, Path]] = []  # (live folder, kept old folder)
@@ -681,6 +717,7 @@ def update(
         if not replaced:
             return result
         profiles.save_profile(dataclasses.replace(profile, skills=skills))
+        journal.set_phase(respec_home, "refresh")
     except BaseException:
         _restore(profile, replaced)
         raise
@@ -708,6 +745,8 @@ def _replace(
     live = skills_dir / item
     incoming = skills_dir / f".{item}.incoming"
     old = skills_dir / f".{item}.old"
+    if os.path.lexists(old) and not os.path.lexists(live):
+        os.replace(old, live)  # an interrupted swap; the old folder is the copy
     for leftover in (incoming, old):
         shutil.rmtree(leftover, ignore_errors=True)
     with checkout(repo_url(source.repo), source.ref, source.repo) as (tree, commit):
@@ -718,7 +757,9 @@ def _replace(
                 f"in {source.path or 'its root'}"
             )
         copy_fetched(tree, upstream, incoming)
+    journal.checkpoint("fetched")
     os.replace(live, old)
+    journal.checkpoint("swapped-out")
     try:
         os.replace(incoming, live)
     except OSError as error:
@@ -726,6 +767,7 @@ def _replace(
         shutil.rmtree(incoming, ignore_errors=True)
         raise RespecError(f"could not replace {live}: {error}") from None
     replaced.append((live, old))
+    journal.checkpoint("swapped-in")
     return dataclasses.replace(source, commit=commit, digest=fetched_digest(live))
 
 
@@ -755,6 +797,19 @@ def install_profile(
             f"profile {name!r} already exists at {destination}; "
             "choose another name with '--name'"
         )
+    journal.ready(respec_home)
+    with journal.begin(respec_home, "install", profile=name, path=str(destination)):
+        return _install_profile(respec_home, spec, ref, name, destination)
+
+
+def _install_profile(
+    respec_home: Path,
+    spec: Spec,
+    ref: str | None,
+    name: str,
+    destination: Path,
+) -> profiles.Profile:
+    """The changing part of :func:`install_profile`, inside its journal."""
     where = f"{spec.repo}#{spec.path}" if spec.path else spec.repo
     with checkout(spec.url, ref, spec.repo) as (tree, _commit):
         folder = inside(tree, spec.path)
@@ -789,6 +844,7 @@ def install_profile(
                     folder / profiles.SKILLS_DIR / item,
                     destination / profiles.SKILLS_DIR / item,
                 )
+                journal.checkpoint("copied")
             profiles.save_profile(profile)
         except RespecError:
             shutil.rmtree(destination, ignore_errors=True)

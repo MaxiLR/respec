@@ -22,6 +22,11 @@ Schema (version 1)::
       ]
     }
 
+``journal`` (left out when nothing is in progress) records a change that
+spans several steps while it runs: which operation, its plan and the one
+step in flight. A crash leaves it behind, and the next respec command finishes
+or rolls back that change (see :mod:`respec.journal`).
+
 ``backup`` is null when the folder did not exist at takeover. ``created`` (left
 out when empty) lists the folders missing at takeover, deepest first, which
 respec then created; ``respec restore`` removes those that are empty again. ``mode`` is
@@ -95,14 +100,19 @@ class State:
     active_profile: str | None = None
     owned: dict[str, Owned] = field(default_factory=dict)
     installed: list[Installed] = field(default_factory=list)
+    # The change in progress (see :mod:`respec.journal`); None when there is none.
+    journal: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "version": VERSION,
             "active_profile": self.active_profile,
             "owned": {name: entry.to_dict() for name, entry in self.owned.items()},
             "installed": [item.to_dict() for item in self.installed],
         }
+        if self.journal is not None:
+            data["journal"] = self.journal
+        return data
 
 
 def state_path(respec_home: Path) -> Path:
@@ -137,7 +147,14 @@ def load_state(respec_home: Path) -> State:
     active = data.get("active_profile")
     if active is not None and not isinstance(active, str):
         raise _invalid(path, "active_profile must be a string or null")
-    return State(active_profile=active, owned=owned, installed=installed)
+    journal = data.get("journal")
+    if journal is not None and not (
+        isinstance(journal, dict) and isinstance(journal.get("operation"), str)
+    ):
+        raise _invalid(path, "journal must be a mapping with an operation")
+    return State(
+        active_profile=active, owned=owned, installed=installed, journal=journal
+    )
 
 
 def save_state(respec_home: Path, state: State) -> None:

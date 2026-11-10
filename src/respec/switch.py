@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from respec import global_skills, profiles, targets, trees, unknown
+from respec import global_skills, journal, profiles, targets, trees, unknown
 from respec.errors import RespecError
 from respec.state import Installed, Owned, State, load_state, save_state
 
@@ -344,6 +344,9 @@ def _take_over(
         if folder.is_dir():
             if run_dir is None:
                 run_dir = new_backup_run(respec_home, moment)
+                journal.mark(
+                    respec_home, {"step": "backup", "path": str(run_dir)}, state
+                )
             destination = run_dir / target
             try:
                 shutil.copytree(folder, destination, symlinks=True)
@@ -351,10 +354,12 @@ def _take_over(
             except (OSError, shutil.Error) as error:
                 # Nothing has changed yet: drop the partial backup run and stop.
                 shutil.rmtree(run_dir, ignore_errors=True)
+                journal.mark(respec_home, None, state)
                 raise RespecError(
                     f"could not back up {folder} before taking it over; "
                     f"nothing was changed: {error}"
                 ) from None
+            journal.checkpoint("backed-up")
             backup = str(destination)
             backups[target] = backup
         owned[target] = Owned(
@@ -364,6 +369,8 @@ def _take_over(
             created=_missing_folders(folder, user_home),
         )
     state.owned.update(owned)
+    if run_dir is not None:
+        journal.mark(respec_home, None, state)
     return backups
 
 
@@ -429,6 +436,57 @@ class LinkResult:
     blocked: list[str] = field(default_factory=list)  # destinations in the way
 
 
+def _install_step(
+    respec_home: Path,
+    state: State,
+    target: str,
+    skill: str,
+    source: Path,
+    destination: Path,
+) -> Installed:
+    """Install one skill and record it, the step journaled while it runs."""
+    journal.mark(
+        respec_home,
+        {
+            "step": "install",
+            "path": str(destination),
+            "target": target,
+            "name": skill,
+            "source": str(source),
+        },
+        state,
+    )
+    mode = _install(source, destination)
+    journal.checkpoint("installed")
+    record = Installed(
+        target=target,
+        name=skill,
+        path=str(destination),
+        mode=mode,
+        digest=trees.digest(destination) if mode == "copy" else None,
+    )
+    state.installed.append(record)
+    journal.mark(respec_home, None, state)
+    return record
+
+
+def remove_step(respec_home: Path, state: State, item: Installed) -> bool:
+    """:func:`remove_installed` and drop its record, journaled while it runs.
+
+    Returns whether something was removed (the record is dropped either way).
+    """
+    journal.mark(
+        respec_home,
+        {"step": "remove", "path": item.path, "item": item.to_dict()},
+        state,
+    )
+    removed = remove_installed(respec_home, item)
+    journal.checkpoint("removed")
+    state.installed.remove(item)
+    journal.mark(respec_home, None, state)
+    return removed
+
+
 def link_skills(
     respec_home: Path, user_home: Path, name: str, skills: list[str]
 ) -> LinkResult:
@@ -439,6 +497,7 @@ def link_skills(
     entries do not matter. A managed copy is reinstalled so it matches the
     profile's current files; a managed link already points at them.
     """
+    journal.ready(respec_home, user_home)
     profile = profiles.load_profile(respec_home, name)
     state = load_state(respec_home)
     owned = {Path(entry.skills_dir).resolve() for entry in state.owned.values()}
@@ -448,46 +507,39 @@ def link_skills(
         if skill in profile.skills and profile.skills[skill].enabled
     }
     result = LinkResult()
-    for target, skill, source, destination in _plan(profile, user_home):
-        if skill not in wanted or destination.parent.resolve() not in owned:
-            continue
-        key = trees.real(destination)
-        record = next((i for i in state.installed if trees.real(i.path) == key), None)
-        if os.path.lexists(destination):
-            if record is None or not unknown.is_managed(respec_home, record):
-                result.blocked.append(str(destination))
+    with journal.begin(respec_home, "links", state=state, profile=name):
+        for target, skill, source, destination in _plan(profile, user_home):
+            if skill not in wanted or destination.parent.resolve() not in owned:
                 continue
-            if record.mode == "symlink":
-                continue
-            remove_installed(respec_home, record)
-        if record is not None:
-            state.installed.remove(record)
-        try:
-            mode = _install(source, destination)
-        except OSError as error:
-            save_state(respec_home, state)
-            reinstall = (
-                " respec's own copy there was removed to be reinstalled; the "
-                "next 'respec use' puts it back."
-                if record is not None
-                else ""
+            key = trees.real(destination)
+            record = next(
+                (i for i in state.installed if trees.real(i.path) == key), None
             )
-            raise LinkFailed(
-                f"linking {skill!r} into {destination.parent} did not complete: "
-                f"{error}.{reinstall}",
-                result.linked,
-            ) from None
-        state.installed.append(
-            Installed(
-                target=target,
-                name=skill,
-                path=str(destination),
-                mode=mode,
-                digest=trees.digest(destination) if mode == "copy" else None,
-            )
-        )
-        save_state(respec_home, state)
-        result.linked.append(str(destination))
+            if os.path.lexists(destination):
+                if record is None or not unknown.is_managed(respec_home, record):
+                    result.blocked.append(str(destination))
+                    continue
+                if record.mode == "symlink":
+                    continue
+                remove_step(respec_home, state, record)
+            elif record is not None:
+                state.installed.remove(record)
+            try:
+                _install_step(respec_home, state, target, skill, source, destination)
+            except OSError as error:
+                journal.mark(respec_home, None, state)
+                reinstall = (
+                    " respec's own copy there was removed to be reinstalled; the "
+                    "next 'respec use' puts it back."
+                    if record is not None
+                    else ""
+                )
+                raise LinkFailed(
+                    f"linking {skill!r} into {destination.parent} did not "
+                    f"complete: {error}.{reinstall}",
+                    result.linked,
+                ) from None
+            result.linked.append(str(destination))
     return result
 
 
@@ -495,6 +547,7 @@ def relink_lasting(respec_home: Path, user_home: Path) -> list[str]:
     """Link missing shipped and global skills of the active profile's switch
     into folders respec owns, where nothing is in the way (for example after
     an entry in their place was removed). Returns the paths linked."""
+    journal.ready(respec_home, user_home)
     state = load_state(respec_home)
     if state.active_profile is None:
         return []
@@ -502,42 +555,54 @@ def relink_lasting(respec_home: Path, user_home: Path) -> list[str]:
     if not lasting:
         return []
     profile = profiles.load_profile(respec_home, state.active_profile)
-    global_skills.refresh_shipped(respec_home)
-    owned = {Path(entry.skills_dir).resolve() for entry in state.owned.values()}
     linked: list[str] = []
-    for target, skill, source, destination in _plan_all(
-        respec_home, user_home, profile
-    ):
-        if (
-            skill not in lasting
-            or destination.parent.resolve() not in owned
-            or os.path.lexists(destination)
-            or not source.is_dir()
+    with journal.begin(respec_home, "links", state=state, profile=profile.name):
+        global_skills.refresh_shipped(respec_home)
+        owned = {Path(entry.skills_dir).resolve() for entry in state.owned.values()}
+        for target, skill, source, destination in _plan_all(
+            respec_home, user_home, profile
         ):
-            continue
-        key = trees.real(destination)
-        state.installed = [i for i in state.installed if trees.real(i.path) != key]
-        try:
-            mode = _install(source, destination)
-        except OSError as error:
-            save_state(respec_home, state)
-            raise LinkFailed(
-                f"linking {skill!r} into {destination.parent} did not complete: "
-                f"{error}; the next 'respec use' puts it back.",
-                linked,
-            ) from None
-        state.installed.append(
-            Installed(
-                target=target,
-                name=skill,
-                path=str(destination),
-                mode=mode,
-                digest=trees.digest(destination) if mode == "copy" else None,
-            )
-        )
-        save_state(respec_home, state)
-        linked.append(str(destination))
+            if (
+                skill not in lasting
+                or destination.parent.resolve() not in owned
+                or os.path.lexists(destination)
+                or not source.is_dir()
+            ):
+                continue
+            key = trees.real(destination)
+            state.installed = [i for i in state.installed if trees.real(i.path) != key]
+            try:
+                _install_step(respec_home, state, target, skill, source, destination)
+            except OSError as error:
+                journal.mark(respec_home, None, state)
+                raise LinkFailed(
+                    f"linking {skill!r} into {destination.parent} did not "
+                    f"complete: {error}; the next 'respec use' puts it back.",
+                    linked,
+                ) from None
+            linked.append(str(destination))
     return linked
+
+
+def align_links(respec_home: Path, user_home: Path) -> list[str]:
+    """Put the links of the active profile in line with its ``profile.yaml``
+    without a full switch: unlink skills it no longer enables, link those it
+    enables, and link missing shipped and global skills. Paths that hold an
+    unknown entry are left alone. Returns the paths linked."""
+    state = load_state(respec_home)
+    if state.active_profile is None:
+        return []
+    profile = profiles.load_profile(respec_home, state.active_profile)
+    enabled = sorted(name for name, entry in profile.skills.items() if entry.enabled)
+    lasting = global_skills.lasting_or_shipped(respec_home)
+    with journal.begin(respec_home, "links", state=state, profile=profile.name):
+        for item in list(state.installed):
+            if item.name in enabled or item.name in lasting:
+                continue
+            if unknown.is_managed(respec_home, item):
+                remove_step(respec_home, state, item)
+        linked = link_skills(respec_home, user_home, profile.name, enabled).linked
+        return linked + relink_lasting(respec_home, user_home)
 
 
 def new_backups(respec_home: Path, owned_before: set[str]) -> dict[str, str]:
@@ -591,6 +656,10 @@ def use(
     names what a refusal says could not be done ("cannot <action> profile"):
     ``"refresh"`` when an edited profile is re-applied.
     """
+    try:
+        journal.ready(respec_home, user_home)
+    except journal.Pending as error:
+        raise SwitchBlocked(str(error)) from None
     profile = profiles.load_profile(respec_home, name)
     refuse_layer_conflicts(profile, action)
     lead = f"cannot {action} profile {profile.name!r}"
@@ -607,7 +676,43 @@ def use(
             clashes=_clashes(respec_home, found),
         )
     result = SwitchResult(profile=profile.name, previous=state.active_profile)
+    with journal.begin(
+        respec_home,
+        "use",
+        state=state,
+        profile=profile.name,
+        previous=state.active_profile,
+        action="refresh" if action == "refresh" else None,
+        phase="prepare",
+    ):
+        _switch(
+            respec_home,
+            user_home,
+            profile,
+            state,
+            now,
+            on_unknown,
+            action,
+            result,
+            found,
+        )
+    return result
 
+
+def _switch(
+    respec_home: Path,
+    user_home: Path,
+    profile: profiles.Profile,
+    state: State,
+    now: Clock,
+    on_unknown: UnknownHandler | None,
+    action: str,
+    result: SwitchResult,
+    found: list[unknown.Unknown],
+) -> None:
+    """The changing part of :func:`use`, inside its journal."""
+    name = profile.name
+    lead = f"cannot {action} profile {name!r}"
     try:
         global_skills.refresh_shipped(respec_home)
     except RespecError as error:
@@ -637,39 +742,31 @@ def use(
 
     # state.json is saved after every removal and every install, so it always
     # lists each path respec has created and a later switch can remove it.
+    # The journal names the step in flight, so a crash between a change on
+    # disk and its record is settled by the next command (respec.journal).
     state.active_profile = None
+    journal.set_phase(respec_home, "apply", state)
     try:
         for item in list(state.installed):
             if trees.real(item.path) in kept:
                 continue
-            if remove_installed(respec_home, item):
+            if remove_step(respec_home, state, item):
                 result.removed.append(item)
-            state.installed.remove(item)
-            save_state(respec_home, state)
 
         for target, skill, source, destination in plan:
-            mode = _install(source, destination)
-            record = Installed(
-                target=target,
-                name=skill,
-                path=str(destination),
-                mode=mode,
-                digest=trees.digest(destination) if mode == "copy" else None,
+            result.installed.append(
+                _install_step(respec_home, state, target, skill, source, destination)
             )
-            state.installed.append(record)
-            result.installed.append(record)
-            save_state(respec_home, state)
     except OSError as error:
         save_state(respec_home, state)
         raise RespecError(
             f"switch to profile {profile.name!r} did not complete: {error}\n"
-            "No profile is active. Skills installed so far are recorded in "
-            "state.json and are removed by the next 'respec use'."
+            "No profile is active. The next respec command that changes skills "
+            "finishes the switch, or 'respec recover --rollback' rolls it back."
         ) from None
 
     state.active_profile = profile.name
     save_state(respec_home, state)
-    return result
 
 
 def _kept(

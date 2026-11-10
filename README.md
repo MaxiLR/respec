@@ -15,6 +15,7 @@ respec enable my-skill [-p work]
 respec remove my-skill [-p work]  # drop it from profile.yaml and delete its folder
 respec adopt [--add|--remove <entry>] [--all add|remove]
 respec restore [<backup>] [--list] [--unknown add|remove] [--overwrite]
+respec recover [--rollback]       # finish (or roll back) an interrupted change
 respec add owner/repo[#path] [--ref main] [-p work]  # fetch skill(s) from git
 respec update --check [-p work]   # which sourced skills have newer commits
 respec update [my-skill] [-p work] [--yes]  # apply; --yes overwrites local edits
@@ -132,6 +133,36 @@ until `--overwrite` backs them up and replaces them. Hidden entries the backup
 does not hold stay in place and are reported. A restore that fails
 part way can be run again to finish.
 
+### Interrupted changes
+
+Every change of several steps (a switch or refresh, a restore, adopt, a layer
+repair, linking outside a switch, `update`, `add` from git and `profile
+install`) is recorded in a journal in `state.json` before it changes anything,
+together with the one step in flight. If respec is killed or crashes part way,
+the journal stays behind:
+
+- `respec status` (and every other command that only reads) reports it.
+- The next command that changes skills first finishes the change or rolls it
+  back, and says which. A switch that had not yet removed any skill is rolled
+  back (the previous profile stays active); one that had is finished, or, if
+  the new profile can no longer be activated, rolled back to the previous one.
+  A restore, adopt or link change is finished. An `update` or git `add` is
+  rolled back until `profile.yaml` was saved and finished after; a half-copied
+  `profile install` is removed.
+- `respec recover` does the same on its own; `respec recover --rollback`
+  undoes the change instead where that is still possible (a switch activates
+  the previous profile again; a restore that already removed skills can only
+  be finished).
+- In the TUI, Sync shows the interrupted change with Finish and Roll back;
+  until it is resolved, Sync offers nothing else and the TUI refuses every
+  change to skill folders.
+
+Nothing is lost on the way: an entry a step left half made (a copy cut short)
+is moved to a fresh backup run and reported under `set_aside`, unless it is
+verifiably what that step was making, in which case it is recorded. Staging
+folders of an interrupted adopt are kept when they may hold the only copy of
+something.
+
 ### TUI
 
 `respec` without a command (or `respec tui`) opens a terminal UI: profiles on
@@ -218,9 +249,17 @@ Every `--json` output that is an object uses one vocabulary:
   way there, including ones outside the folders respec owns.
 - `backups`: the folders `use` took over, with their takeover backups.
 - `warnings`: always present, empty when there is nothing to warn about. Each
-  warning is an object with a `type` and a `message`; the one type is
-  `layer-conflict` (an exclusive layer has several enabled skills), which also
-  gives `profile`, `layer`, `skills` and `fix`.
+  warning is an object with a `type` and a `message`. The types:
+  - `layer-conflict`: an exclusive layer has several enabled skills; also
+    gives `profile`, `layer`, `skills` and `fix`.
+  - `interrupted-operation`: a change that was cut short (see
+    [Interrupted changes](#interrupted-changes)); also gives `operation`
+    (`use`, `restore`, `adopt`, `links`, `update`, `add` or `install`),
+    `outcome` (`finished` or `rolled-back` when this command recovered it,
+    `pending` when it still waits), `set_aside` (paths moved to a backup
+    run) and `profile` when it concerns one. `respec recover --json` gives
+    `active_profile`, `recovered` (whether there was anything to recover)
+    and this warning.
 - `error`: present only when the command failed. `use`, `adopt` and
   `restore` then print every other key of their success output too, filled
   with what was done before the failure. Other commands print their error on

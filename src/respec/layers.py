@@ -19,9 +19,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import items, profiles, switch
+from respec import items, journal, profiles, switch, unknown
 from respec.errors import RespecError
-from respec.state import load_state, save_state
+from respec.state import load_state
 
 
 @dataclass
@@ -285,6 +285,7 @@ def set_active(
         active=load_state(respec_home).active_profile == before.name,
     )
     if after != before:
+        journal.ready(respec_home, user_home)
         profiles.save_profile(after)
         if change.active and not profiles.exclusivity_conflicts(after):
             items.refresh_active(
@@ -361,20 +362,22 @@ def _repair_links(
     still hold what respec placed are removed, and only free paths are linked;
     unknown entries (also at those skills' paths) are left for 'respec adopt'.
     """
-    profiles.save_profile(after)
+    journal.ready(respec_home, user_home)
     state = load_state(respec_home)
     try:
-        for item in list(state.installed):
-            if item.name in change.disabled and switch.remove_installed(
-                respec_home, item
-            ):
-                state.installed.remove(item)
-                change.unlinked.append(item.path)
-                save_state(respec_home, state)
-        assert change.skill is not None
-        change.linked = switch.link_skills(
-            respec_home, user_home, after.name, [change.skill]
-        ).linked
+        with journal.begin(respec_home, "links", state=state, profile=after.name):
+            profiles.save_profile(after)
+            journal.checkpoint("profile-saved")
+            for item in list(state.installed):
+                if item.name in change.disabled and unknown.is_managed(
+                    respec_home, item
+                ):
+                    switch.remove_step(respec_home, state, item)
+                    change.unlinked.append(item.path)
+            assert change.skill is not None
+            change.linked = switch.link_skills(
+                respec_home, user_home, after.name, [change.skill]
+            ).linked
     except (OSError, RespecError) as error:
         raise RespecError(
             f"repair of layer {change.layer!r} did not complete: {error}\n"

@@ -1438,3 +1438,185 @@ def test_git_commands_print_no_undocumented_nulls(run, upstream, assert_no_nulls
 
     for args in (("update", "--check"), ("update",), ("update", "--check")):
         assert_no_nulls(json.loads(ok(run(*args, "--json")).stdout))
+
+
+# --- interruption (see tests/test_journal.py) ------------------------------------
+
+
+class Crash(BaseException):
+    """Stands for the process being killed at a step boundary."""
+
+
+def _points(monkeypatch, action):
+    from respec import journal
+
+    seen: list[str] = []
+    monkeypatch.setattr(journal, "_fault", seen.append)
+    action()
+    monkeypatch.setattr(journal, "_fault", lambda name: None)
+    return len(seen)
+
+
+def _crash(monkeypatch, index, action):
+    from respec import journal
+
+    calls: list[str] = []
+
+    def fault(name):
+        calls.append(name)
+        if len(calls) == index:
+            raise Crash(name)
+
+    monkeypatch.setattr(journal, "_fault", fault)
+    with pytest.raises(Crash):
+        action()
+    monkeypatch.setattr(journal, "_fault", lambda name: None)
+
+
+def _fresh(tmp_path, monkeypatch, label):
+    home = tmp_path / label / "home"
+    respec_home = tmp_path / label / "respec-home"
+    home.mkdir(parents=True)
+    respec_home.mkdir()
+    for key, value in (
+        ("HOME", home),
+        ("RESPEC_HOME", respec_home),
+        ("RESPEC_USER_HOME", home),
+    ):
+        monkeypatch.setenv(key, str(value))
+    return home, respec_home
+
+
+def _recovered(run):
+    data = json.loads(ok(run("recover", "--json")).stdout)
+    (warning,) = [w for w in data["warnings"] if w["type"] == "interrupted-operation"]
+    return warning
+
+
+def _no_journal(respec_home):
+    from respec.state import load_state
+
+    return load_state(respec_home).journal is None
+
+
+def test_update_interrupted_at_every_step_rolls_back_or_finishes(
+    run, upstream, tmp_path, monkeypatch
+):
+    from respec import sources
+
+    repo = upstream("acme/skills")
+    repo.write("tdd/SKILL.md", "# tdd v1\n")
+    first = repo.commit()
+    repo.write("tdd/SKILL.md", "# tdd v2\n")
+    second = repo.commit()
+
+    def setup(label):
+        home, respec_home = _fresh(tmp_path, monkeypatch, label)
+        new_profile(run)
+        ok(run("add", "acme/skills#tdd", "-p", "work"))
+        ok(run("use", "work"))
+        # Pretend 'work' still has v1, so the update has something to apply.
+        path = respec_home / "profiles" / "work" / "profile.yaml"
+        data = yaml.safe_load(path.read_text())
+        data["skills"]["tdd"]["source"]["commit"] = first
+        path.write_text(yaml.safe_dump(data))
+        (respec_home / "profiles" / "work" / "skills" / "tdd" / "SKILL.md").write_text(
+            "# tdd v1\n"
+        )
+        return home, respec_home
+
+    def action(home, respec_home):
+        return lambda: sources.update(
+            respec_home, home, "work", overwrite_edits=lambda name: True
+        )
+
+    total = _points(monkeypatch, action(*setup("count")))
+    assert total > 4
+    outcomes = set()
+    for index in range(1, total + 1):
+        home, respec_home = setup(f"update-{index}")
+        _crash(monkeypatch, index, action(home, respec_home))
+
+        warning = _recovered(run)
+
+        outcomes.add(warning["outcome"])
+        assert _no_journal(respec_home)
+        skills = respec_home / "profiles" / "work" / "skills"
+        assert sorted(p.name for p in skills.iterdir()) == ["tdd"], index
+        text = (skills / "tdd" / "SKILL.md").read_text()
+        commit = read_yaml(respec_home / "profiles", "work")["skills"]["tdd"]
+        expected = {first: "# tdd v1\n", second: "# tdd v2\n"}
+        assert text == expected[commit["source"]["commit"]], index
+        linked = home / ".claude" / "skills" / "tdd"
+        assert linked.is_symlink() and (linked / "SKILL.md").read_text() == text
+    assert outcomes == {"rolled-back", "finished"}
+
+
+def test_add_from_git_interrupted_at_every_step_rolls_back_or_finishes(
+    run, upstream, tmp_path, monkeypatch
+):
+    from respec import sources
+
+    repo = upstream("acme/skills")
+    repo.write("skills/tdd/SKILL.md", "# tdd\n")
+    repo.write("skills/lint/SKILL.md", "# lint\n")
+    repo.commit()
+
+    def setup(label):
+        home, respec_home = _fresh(tmp_path, monkeypatch, label)
+        new_profile(run)
+        ok(run("use", "work"))
+        return home, respec_home
+
+    def action(home, respec_home):
+        return lambda: sources.add(respec_home, home, "acme/skills", "work")
+
+    total = _points(monkeypatch, action(*setup("count")))
+    assert total > 3
+    for index in range(1, total + 1):
+        home, respec_home = setup(f"add-{index}")
+        _crash(monkeypatch, index, action(home, respec_home))
+
+        warning = _recovered(run)
+
+        assert _no_journal(respec_home)
+        listed = set(read_yaml(respec_home / "profiles", "work")["skills"])
+        skills = respec_home / "profiles" / "work" / "skills"
+        assert {p.name for p in skills.iterdir()} == listed, index
+        if warning["outcome"] == "rolled-back":
+            assert listed == set(), index
+        else:
+            assert listed == {"tdd", "lint"}, index
+        claude = home / ".claude" / "skills"
+        linked = {p.name for p in claude.iterdir()} if claude.exists() else set()
+        assert linked == listed, index
+
+
+def test_profile_install_interrupted_at_every_step(
+    run, upstream, skills_repo, tmp_path, monkeypatch
+):
+    from respec import profiles, sources
+
+    make_modpack(upstream, skills_repo)
+
+    def setup(label):
+        return _fresh(tmp_path, monkeypatch, label)
+
+    def action(home, respec_home):
+        return lambda: sources.install_profile(respec_home, "acme/modpack")
+
+    total = _points(monkeypatch, action(*setup("count")))
+    assert total > 2
+    for index in range(1, total + 1):
+        home, respec_home = setup(f"install-{index}")
+        _crash(monkeypatch, index, action(home, respec_home))
+
+        warning = _recovered(run)
+
+        assert _no_journal(respec_home)
+        folder = respec_home / "profiles" / "modpack"
+        if warning["outcome"] == "rolled-back":
+            assert not folder.exists(), index
+        else:
+            profile = profiles.load_profile(respec_home, "modpack")
+            assert set(profile.skills) == {"tdd", "house"}

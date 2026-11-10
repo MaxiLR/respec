@@ -9,7 +9,10 @@
 - links respec placed that are missing or broken, and skills the active
   profile enables that are not linked (or are linked but no longer enabled),
   as recorded in ``state.json``;
-- profiles whose ``profile.yaml`` does not load.
+- profiles whose ``profile.yaml`` does not load;
+- a change that was interrupted part way (:mod:`respec.journal`). While one
+  waits, nothing else is checked: the folders are mid-change, and every fix
+  is refused until it is finished or rolled back (:func:`respec.journal.recover`).
 
 Fixes go through the same core paths as the CLI: ``respec adopt``
 (:func:`respec.adopt.adopt`), ``respec layer repair`` and re-applying the
@@ -23,7 +26,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import global_skills, profiles, switch, trees, unknown
+from respec import global_skills, journal, profiles, switch, trees, unknown
 from respec.errors import RespecError
 from respec.state import State, load_state
 
@@ -91,6 +94,8 @@ class SyncReport:
     conflicts: list[profiles.LayerConflict] = field(default_factory=list)
     links: list[LinkProblem] = field(default_factory=list)
     invalid: list[str] = field(default_factory=list)
+    # An interrupted change waiting to be finished or rolled back.
+    interrupted: journal.Recovery | None = None
 
     @property
     def folders_gone(self) -> dict[str, str]:
@@ -103,7 +108,13 @@ class SyncReport:
 
     @property
     def clean(self) -> bool:
-        return not (self.unknown or self.conflicts or self.links or self.invalid)
+        return not (
+            self.unknown
+            or self.conflicts
+            or self.links
+            or self.invalid
+            or self.interrupted
+        )
 
 
 def _link_problems(
@@ -181,6 +192,9 @@ def check(respec_home: Path, user_home: Path) -> SyncReport:
     """Everything that needs a decision now; reads only."""
     state = load_state(respec_home)
     report = SyncReport(active_profile=state.active_profile)
+    report.interrupted = journal.pending(respec_home)
+    if report.interrupted is not None:
+        return report
     report.unknown = unknown.find_unknown(respec_home, state)
     active: profiles.Profile | None = None
     for name in profiles.list_profile_names(respec_home):

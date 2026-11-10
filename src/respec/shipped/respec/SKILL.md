@@ -17,7 +17,7 @@ every path it creates, and hand edits make its record disagree with disk.
 
 - Pass `--json` to read results. Every command except `tui` accepts it. JSON
   objects carry a `warnings` list; each warning has a `type`
-  (`layer-conflict`) and a `message`. Unknown entries still waiting for a
+  (`layer-conflict` or `interrupted-operation`) and a `message`. Unknown entries still waiting for a
   decision are listed under `unresolved`; entries a command resolved are
   under `resolved`. Fields that do not apply are left out; only
   `active_profile`, `previous_profile`, `same_as` and values under `restored`
@@ -137,6 +137,19 @@ warnings.
   the restore would overwrite are refused unless resolved with
   `--unknown add|remove` or replaced with `--overwrite` (they are backed up
   first).
+
+### Interrupted changes
+
+respec journals every change of several steps in `state.json`. If one was cut
+short (killed, crashed), `respec status` reports it with an
+`interrupted-operation` warning whose `outcome` is `pending`, and the next
+command that changes skills finishes or rolls it back first (`outcome`
+`finished` or `rolled-back`, with anything half made moved to a backup and
+listed in `set_aside`).
+
+- `respec recover`: finish the interrupted change now.
+- `respec recover --rollback`: undo it instead where possible (a switch
+  activates the previous profile again).
 
 The first `respec use` that touches a folder backs up its full contents to
 `~/.respec/backups/<timestamp>/<target>/` before taking it over. Folders respec
