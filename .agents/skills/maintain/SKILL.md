@@ -52,10 +52,10 @@ skills are current.
 ## 3. The repository's own skills
 
 `.agents/skills/` holds the skills for people working in this repository
-(`install`, `maintain`). `.claude/skills/` holds one symlink per skill, pointing
-at the folder in `.agents/skills/`, so both Claude Code and harnesses that read
-the `.agents` standard find them. When you add a repository skill, add the
-folder under `.agents/skills/` and the matching symlink under `.claude/skills/`.
+(`install`, `maintain`). `.claude/skills` is a symlink to that folder, so both
+Claude Code and harnesses that read the `.agents` standard find the same
+skills. To add a repository skill, add its folder under `.agents/skills/`;
+nothing else is needed. Do not replace the symlink with a real folder.
 
 These are separate from the shipped skills: repository skills are found only
 by an agent started inside a checkout; shipped skills are installed by respec
