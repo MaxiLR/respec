@@ -93,7 +93,7 @@ BUILTIN_LAYERS: dict[str, str] = {
 class ProfileError(RespecError):
     """``profile.yaml`` is missing, unreadable or does not match the schema."""
 
-    def __init__(self, path: Path, problems: list[str]):
+    def __init__(self, path: Path | str, problems: list[str]):
         self.path = path
         self.problems = problems
         lines = "\n".join(f"  - {problem}" for problem in problems)

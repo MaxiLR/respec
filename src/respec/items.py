@@ -18,7 +18,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import global_skills, journal, profiles, switch, targets
+from respec import global_skills, journal, paths, profiles, switch, targets
 from respec.errors import RespecError
 from respec.state import load_state
 
@@ -116,7 +116,7 @@ def add_local(
             f"{destination} already exists but is not listed in "
             f"{profiles.PROFILE_FILE}; move it out of the way first"
         )
-    if source == destination.resolve() or source in destination.resolve().parents:
+    if paths.below(destination, source) is not None:
         raise RespecError(f"cannot add {source}: it contains profile {profile.name!r}")
 
     try:
@@ -256,20 +256,16 @@ def add(
     if before.source is not None and before.source.folder is not None:
         from respec import sources
 
-        skills = (Path(before.source.folder) / profiles.SKILLS_DIR).resolve()
-        if skills in given.parents:
+        skills = Path(before.source.folder) / profiles.SKILLS_DIR
+        if names := paths.below(given, skills):
             raise RespecError(
-                f"cannot add {given}: "
-                + sources.own_source_refusal(name, [given.relative_to(skills).parts[0]])
+                f"cannot add {given}: " + sources.own_source_refusal(name, [names[0]])
             )
     record = not any(
-        given == own or own in given.parents
+        paths.below(given, own) is not None
         for own in (
-            respec_home.resolve(),
-            *(
-                target.skills_dir(user_home).resolve()
-                for target in targets.registry().values()
-            ),
+            respec_home,
+            *(target.skills_dir(user_home) for target in targets.registry().values()),
         )
     )
     # Journaled from before the copy (whatever profile it goes to): a crash

@@ -54,13 +54,25 @@ Two kinds of folder are not taken as a source:
   `--json` has no `source`.
 
 `.git` and `.DS_Store` entries, at any depth, are never copied from a source
-(a folder or a repository) and never count as content: they are left out of
-every digest and of the files `profile diff` lists. So a checkout given as a
-source does not bring its `.git` along, a commit there that changes no file
-is no update, and a `.DS_Store` that the Finder writes into the source or into
-the copy is neither an update nor an edit. A digest recorded by an earlier
-respec, when those entries still counted, stays valid as long as the copy
-still matches it.
+(a folder or a repository) and never count as its content: they are left out
+of every digest. So a checkout given as a source does not bring its `.git`
+along (a real folder named `.git` inside a source skill does not arrive in
+the copy either), a commit there that changes no file is no update, and a
+`.DS_Store` that the Finder writes into the source or into the copy is
+neither an update nor an edit. A digest recorded by an earlier respec, when
+those entries still counted, stays valid as long as the copy still matches
+it.
+
+A `.git` entry inside respec's copy of a skill (a file or a folder, at any
+depth) is another matter: no source put it there, so it is yours, for example
+from `git init` in the copy. It counts as a local edit wherever respec asks
+whether a copy was edited: the skill is `edited` in `profile show` and
+`status` and `modified` in `update --check`, `profile diff` lists the entry
+under the skill's `edited` files as `added` (a folder as `.git/`), the copy
+is never adopted, and `update` replaces the skill, or removes it when it is
+gone from the profile's source, only after confirmation or with `--yes`
+(`--json` skips it as `skipped-local-edits`). Only then is the `.git` entry
+deleted with the rest of the copy.
 
 `update --check` reports an update when the folder's files differ from what
 was copied, and `update` copies the folder again and records the new digest.
@@ -162,7 +174,8 @@ skills with the ones its source lists now:
   fails).
 - A skill whose recorded source points into the profile's source and that the
   source no longer lists is **gone**. `update --check` reports it as
-  `gone from the source` (its row has `gone: true` and `modified`). `update`
+  `gone from the source` (its row has `gone: true` and `modified`), also
+  when the skill is named. `update` with no skill named
   removes it as `remove` does: it leaves `profile.yaml` and its layers, its
   links go and its folder is deleted (`result: removed`, with `gone: true`).
   A copy that was edited in the profile is not deleted silently: `update`
@@ -182,8 +195,12 @@ skills with the ones its source lists now:
 `source` record, as saved after an `update` (for git, `commit` is the commit
 the skill list was last read at), plus `latest` in `update --check` for git.
 Naming a skill (`update <skill>`) only checks or updates that skill: nothing is
-added or removed and `source` is left out. A profile without a `source` in its
-`profile.yaml` behaves as before.
+added or removed and `source` is left out. A named skill that is gone from the
+profile's source is only reported, for a folder source as for git: its row
+has `gone: true`, `result: source-missing` and a `message` that says so, with
+a `source-missing` warning, the command succeeds, and `update` with no skill
+named is what removes it. A profile without a `source` in its `profile.yaml`
+behaves as before.
 
 A profile source that cannot be read is reported and changes nothing: no skill
 is added or removed, and the skills that come from it are left as they are
@@ -196,7 +213,9 @@ failure: the text output says `source missing`, `--json` gives a
 with its own warning. Anything
 else (a repository that cannot be fetched, a `profile.yaml` that is not valid,
 a listed skill without its folder) is an error: `source` and the rows of its
-skills have `error` (`update`: `result: error`), and the command fails.
+skills have `error` (`update`: `result: error`), and the command fails. An
+invalid `profile.yaml` of a git source is named by the source and the file's
+path in it (`profile.yaml in owner/repo#path@ref`), not by a temporary path.
 
 Adding and removing is journaled with the rest of the update: an interrupted
 `update` either finishes or is rolled back as a whole, and a rollback removes
@@ -230,7 +249,9 @@ all empty) and:
 - `edited`: skills both have whose files differ in the copy. Each has
   `skill`, `path` and `files`: the paths `added`, `changed` and `removed` in
   the copy, relative to what was copied (an empty folder is listed as
-  `path/`). `changed_in_source: true` means the source changed too since the
+  `path/`). A `.git` entry in the copy is listed as `added` (a folder as
+  `.git/`) and makes the skill `edited` by itself; it is not part of the
+  skill, so do not copy it into the source. `changed_in_source: true` means the source changed too since the
   skill was copied; `not_from_source: true` means the copy never came from
   the source (a skill of the same name was added here). In both cases the
   files are listed against what the source holds now.
@@ -274,7 +295,8 @@ skill's source now points into the profile's source with the digest of its
 files (replacing a source of its own, if it had one), whether it is enabled
 stays as it is, and its row has `result: adopted`. This covers a skill that
 was only in the copy, and a skill edited in the copy whose edits are now in
-the source. Files that differ are never adopted: an edited skill from the
+the source. Files that differ are never adopted, nor is a copy that holds a
+`.git` entry: an edited skill from the
 source is still only overwritten after confirmation or with `--yes`, and a
 skill that did not come from the source is left alone. The change is
 journaled with the rest of the update. `profile diff` then no longer lists
@@ -298,7 +320,10 @@ a source must be edited there, not in the copy: respec never writes to a
 source, so an edit made in the copy never reaches it. After editing the
 source, `respec update <skill> -p <profile>` brings the change into the copy
 (without `-p` only the active profile is looked at). For a git source the edit
-must be committed and pushed first, as respec reads the remote.
+must be committed and pushed first, as respec reads the remote. When the copy
+was edited too, that update would overwrite its edits: `update` asks first
+(without a terminal the question aborts the update), `update --json` skips
+the skill as `skipped-local-edits`, and `update --yes` overwrites the copy.
 
 Each skill of a profile has a provenance, derived from the sources
 `profile.yaml` records (nothing more is stored):
@@ -310,7 +335,8 @@ Each skill of a profile has a provenance, derived from the sources
 | `original`       | `added locally, original`   | Added or made here without a source; the copy is the only one. | In the copy, under `skills/<skill>/`. |
 
 A skill with a source is also flagged `edited` when its files no longer match
-the digest of what was copied. A source record without a digest cannot be
+the digest of what was copied, or when the copy holds a `.git` entry. A source
+record without a digest cannot be
 judged, so the flag is then left out.
 
 `profile show <name>` prints the profile's source (`Source: ...`) and, per
@@ -712,7 +738,9 @@ Every `--json` output that is an object uses one vocabulary:
   - `source-missing`: `update` or `update --check` found a skill's source
     folder gone or without `SKILL.md` and left the skill as it was; also
     gives `profile`, `skill` and `folder` (no `folder` for a skill that is
-    new in the profile's source and was not copied yet). For the profile's own source
+    new in the profile's source and was not copied yet). `update <skill>`
+    gives the same warning for a named skill that is gone from the profile's
+    source and was left as it was (no `folder` for a git source). For the profile's own source
     folder (gone, or without `profile.yaml`) it gives `profile` and `folder`
     and no `skill`: nothing was added or removed. `profile diff` gives that
     second form when it could not compare.

@@ -174,11 +174,12 @@ def _print_json(data: Any) -> None:
       ``set_aside``; ``profile`` when it concerns one; ``in_flight`` when it
       waits and the entry its step in flight was changing exists);
     - ``source-missing``: ``update`` found a skill's source folder gone or
-      without ``SKILL.md`` and left the skill as it was (``profile``,
-      ``skill``, ``folder``), or found the profile's own source folder gone
-      or without ``profile.yaml`` and added and removed nothing (``profile``,
-      ``folder``; no ``skill``), as ``profile diff`` does when it could not
-      compare.
+      without ``SKILL.md``, or a named skill gone from the profile's
+      source, and left the skill as it was (``profile``, ``skill``,
+      ``folder`` for a folder source), or found the profile's own source
+      folder gone or without ``profile.yaml`` and added and removed nothing
+      (``profile``, ``folder``; no ``skill``), as ``profile diff`` does when
+      it could not compare.
 
     Unknown entries are not warnings: commands list them under ``unresolved``.
     """
@@ -1676,6 +1677,8 @@ def _update_line(row: dict[str, Any]) -> str:
     if outcome == "updated":
         current, latest = messages.short(row["current"]), messages.short(row["latest"])
         return f"{name}  updated {current} -> {latest}"
+    if outcome == "source-missing" and row.get("gone"):
+        return f"{name}  {row['message']}"
     if outcome == "source-missing":
         return f"{name}  {_missing_line(row['message'])}"
     if outcome == "up-to-date":

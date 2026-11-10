@@ -9,7 +9,8 @@ Nothing is stored for this: a skill's provenance is derived from the sources
 - ``original``: added locally, without a source; the copy is the only one.
 
 A skill with a source is also ``edited`` when its files no longer match the
-digest of what was copied. Without a digest that cannot be judged.
+digest of what was copied, or when the copy holds a ``.git`` entry
+(:func:`respec.sources.local_git`). Without a digest that cannot be judged.
 
 :func:`source_file` is the text of the generated ``SOURCE.md`` that
 :mod:`respec.profiles` writes beside ``profile.yaml`` on every save.
@@ -43,16 +44,18 @@ def of(profile: profiles.Profile, skill: str) -> str:
 
 
 def edited(profile: profiles.Profile, skill: str) -> bool | None:
-    """Whether the copy of ``skill`` no longer matches what was copied; None
-    when that cannot be judged (no source, no digest, or unreadable files)."""
+    """Whether the copy of ``skill`` no longer matches what was copied, or
+    holds a ``.git`` entry; None when that cannot be judged (no source, no
+    digest, or unreadable files)."""
+    folder = profile.path / profiles.SKILLS_DIR / skill
     try:
         recorded = sources.copied_digest(profile, skill)
         if recorded is None:
             return None
-        copy = sources.fetched_digest(profile.path / profiles.SKILLS_DIR / skill)
+        copy = sources.fetched_digest(folder)
     except OSError:
         return None
-    return copy != recorded
+    return copy != recorded or bool(sources.local_git(folder))
 
 
 def fields(profile: profiles.Profile, skill: str) -> dict[str, Any]:

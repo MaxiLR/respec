@@ -14,8 +14,9 @@ import yaml
 from test_folder_sources import snapshot
 from test_profile_sources import Pack, fails, ok, rows  # noqa: F401
 from test_profile_sources import claude_dir, from_git, installed  # noqa: F401
-from test_profile_sources import pack, profiles_root, read_yaml  # noqa: F401
-from test_sources import isolated_git, upstream  # noqa: F401  (fixtures)
+from test_profile_sources import make_git_pack, pack, profiles_root  # noqa: F401
+from test_profile_sources import read_yaml
+from test_sources import git, isolated_git, upstream  # noqa: F401  (fixtures)
 
 
 def text_of(profiles_root, profile="pack"):
@@ -474,3 +475,360 @@ def test_a_new_skill_whose_folder_vanishes_mid_update_is_reported(
     [warning] = data["warnings"]
     assert (warning["type"], warning["skill"]) == ("source-missing", "zeta")
     assert not (installed / "zeta").exists()
+
+
+# --- a .git inside respec's copy is the user's: a local edit -------------------
+
+
+def git_init(folder):
+    """What ``git init`` in respec's copy of a skill leaves there."""
+    (folder / ".git").mkdir()
+    (folder / ".git" / "HEAD").write_text("ref: refs/heads/mine\n")
+    return folder / ".git" / "HEAD"
+
+
+def shown_edited(run, profile):
+    shown = json.loads(ok(run("profile", "show", profile, "--json")).output)
+    return {skill["name"]: skill["edited"] for skill in shown["skills"]}
+
+
+def test_a_git_folder_in_the_copy_of_a_profile_source_skill_is_a_local_edit(
+    run, installed, pack, profiles_root, assert_no_nulls
+):
+    tdd, house = installed / "tdd", installed / "house"
+    head = git_init(tdd)
+    (tdd / "refs" / ".git").mkdir()
+    precious = tdd / "refs" / ".git" / "precious.txt"
+    precious.write_text("only copy\n")
+    worktree = house / ".git"  # a file, as in a git worktree or submodule
+    worktree.write_text("gitdir: /somewhere/else\n")
+    (tdd / ".DS_Store").write_bytes(b"\0finder")
+
+    assert shown_edited(run, "pack") == {"tdd": True, "house": True}
+
+    pack.write("skills/tdd/SKILL.md", "# tdd v2\n")
+    pack.drop("house")
+    pack.keep()
+    check = assert_no_nulls(json.loads(ok(run("update", "--check", "--json")).output))
+    by_name = {row["skill"]: row for row in check["skills"]}
+    assert by_name["tdd"]["modified"] is by_name["house"]["modified"] is True
+
+    found = rows(ok(run("update", "--json")))
+    declined = ok(run("update", input="n\nn\n"))
+
+    assert found["tdd"]["result"] == "skipped-local-edits"
+    assert found["house"]["result"] == "skipped-local-edits"
+    assert found["house"]["gone"] is True
+    assert "tdd  skipped: local edits kept" in declined.output
+    assert head.is_file() and precious.read_text() == "only copy\n"
+    assert worktree.read_text() == "gitdir: /somewhere/else\n"
+    assert (tdd / "SKILL.md").read_text() == "# tdd v1\n"
+    assert list(read_yaml(profiles_root)["skills"]) == ["tdd", "house"]
+
+    found = rows(ok(run("update", "--yes", "--json")))
+
+    assert found["tdd"]["result"] == "updated"
+    assert found["house"]["result"] == "removed"
+    assert sorted(p.name for p in tdd.iterdir()) == ["SKILL.md", "refs"]
+    assert not house.exists()
+    assert pack.untouched()
+
+
+def test_profile_diff_lists_a_git_entry_of_the_copy_as_an_edit(
+    run, installed, pack, assert_no_nulls
+):
+    git_init(installed / "tdd")
+    (installed / "tdd" / "refs" / ".git").write_text("gitdir: /somewhere/else\n")
+    (installed / "house" / ".DS_Store").write_bytes(b"\0finder")
+
+    data = json.loads(ok(run("profile", "diff", "pack", "--json")).output)
+    text = ok(run("profile", "diff", "pack")).output
+
+    assert_no_nulls(data)
+    assert data["matches"] is False
+    assert data["edited"] == [
+        {
+            "skill": "tdd",
+            "path": str(installed / "tdd"),
+            "files": {"added": [".git/", "refs/.git"], "changed": [], "removed": []},
+        }
+    ]
+    assert data["carried"] == data["changed_in_source"] == []
+    assert "added    .git/" in text
+    assert pack.untouched()
+
+
+def test_a_git_folder_in_the_copy_of_a_skill_with_its_own_folder_source_is_an_edit(
+    run, tmp_path, profiles_root
+):
+    checkout = skill_folder(tmp_path / "checkout" / "solo")
+    ok(run("profile", "new", "work", "--target", "claude-code"))
+    ok(run("add", str(checkout), "-p", "work"))
+    copy = profiles_root / "work" / "skills" / "solo"
+    head = git_init(copy)
+    (checkout / "SKILL.md").write_text("# solo v2\n")
+
+    assert shown_edited(run, "work") == {"solo": True}
+    [row] = json.loads(ok(run("update", "--check", "-p", "work", "--json")).output)[
+        "skills"
+    ]
+    assert (row["update_available"], row["modified"]) == (True, True)
+    for named in ((), ("solo",)):
+        found = rows(ok(run("update", *named, "-p", "work", "--json")))
+        assert found["solo"]["result"] == "skipped-local-edits"
+        assert head.is_file()
+        assert (copy / "SKILL.md").read_text() == "# solo\n"
+    # No --json and no terminal: the question aborts the update.
+    fails(run("update", "solo", "-p", "work"))
+    assert head.is_file()
+    assert (copy / "SKILL.md").read_text() == "# solo\n"
+
+    found = rows(ok(run("update", "-p", "work", "--yes", "--json")))
+
+    assert found["solo"]["result"] == "updated"
+    assert sorted(p.name for p in copy.iterdir()) == ["SKILL.md"]
+
+
+def test_a_copy_with_a_git_folder_is_not_adopted(
+    run, installed, pack, profiles_root, tmp_path, assert_no_nulls
+):
+    """Its other files are the ones the profile's source holds, but adopting
+    it would let a later update replace it without asking."""
+    mine = skill_folder(tmp_path / "elsewhere" / "mine")
+    ok(run("add", str(mine)))
+    heads = [git_init(installed / "mine"), git_init(installed / "tdd")]
+    (installed / "tdd" / "SKILL.md").write_text("# tdd v2\n")
+    pack.write("skills/tdd/SKILL.md", "# tdd v2\n")  # the edit, carried
+    pack.skill("mine", True, "# mine\n")
+    pack.keep()
+
+    diff = assert_no_nulls(
+        json.loads(ok(run("profile", "diff", "pack", "--json")).output)
+    )
+    first = rows(ok(run("update", "--json")))
+    pack.write("skills/mine/SKILL.md", "# mine v2\n")
+    pack.keep()
+    second = rows(ok(run("update", "--json")))
+
+    assert diff["carried"] == []
+    assert {row["skill"]: row["files"]["added"] for row in diff["edited"]} == {
+        "tdd": [".git/"],
+        "mine": [".git/"],
+    }
+    assert first["tdd"]["result"] == second["tdd"]["result"] == "skipped-local-edits"
+    assert first["mine"]["result"] == second["mine"]["result"] == "up-to-date"
+    assert read_yaml(profiles_root)["skills"]["mine"]["source"]["folder"] == str(
+        mine.resolve()
+    )
+    assert all(head.is_file() for head in heads)
+    assert (installed / "mine" / "SKILL.md").read_text() == "# mine\n"
+    assert pack.untouched()
+
+
+# --- the same folder under another spelling --------------------------------------
+
+
+@pytest.fixture
+def other_case(tmp_path):
+    """``other_case(path)``: ``path`` with the first folder below the test's
+    temporary folder in capitals, which names the same folder on a volume
+    that ignores case (the macOS default). Skips the test on any other."""
+    (tmp_path / "CaseProbe").mkdir()
+    if not (tmp_path / "caseprobe").exists():
+        pytest.skip("this volume tells upper and lower case apart")
+
+    def spell(path):
+        first, *rest = path.relative_to(tmp_path).parts
+        return tmp_path.joinpath(first.upper(), *rest)
+
+    return spell
+
+
+def test_profile_install_refuses_the_respec_home_in_another_case(
+    run, installed, profiles_root, other_case
+):
+    before = snapshot(profiles_root)
+
+    result = fails(
+        run(
+            "profile", "install", str(other_case(profiles_root / "pack")), "--name", "q"
+        )
+    )
+
+    assert "respec's own data" in result.output
+    assert snapshot(profiles_root) == before
+
+
+def test_profile_install_refuses_the_respec_home_through_a_symlink(
+    run, installed, profiles_root, isolated_homes, tmp_path
+):
+    (tmp_path / "link").symlink_to(isolated_homes.respec_home)
+    before = snapshot(profiles_root)
+
+    result = fails(
+        run("profile", "install", str(tmp_path / "link" / "profiles" / "pack"))
+    )
+
+    assert "respec's own data" in result.output
+    assert snapshot(profiles_root) == before
+
+
+def test_add_records_no_source_in_the_respec_home_or_a_target_in_another_case(
+    run, installed, claude_dir, profiles_root, other_case
+):
+    skill_folder(claude_dir / "mine")
+    ok(run("profile", "new", "r", "--target", "claude-code"))
+
+    ok(run("add", str(other_case(claude_dir / "mine")), "-p", "r"))
+    ok(run("add", str(other_case(installed / "house")), "-p", "r"))
+
+    assert read_yaml(profiles_root, "r")["skills"] == {
+        "mine": {"enabled": True},
+        "house": {"enabled": True},
+    }
+
+
+def test_add_records_no_source_in_a_target_folder_through_a_symlink(
+    run, claude_dir, profiles_root, tmp_path
+):
+    skill_folder(claude_dir / "mine")
+    (tmp_path / "link").symlink_to(claude_dir)
+    ok(run("profile", "new", "r", "--target", "claude-code"))
+
+    ok(run("add", str(tmp_path / "link" / "mine"), "-p", "r"))
+
+    assert read_yaml(profiles_root, "r")["skills"] == {"mine": {"enabled": True}}
+
+
+def test_add_refuses_a_skill_inside_the_profiles_own_source_in_another_case(
+    run, installed, pack, profiles_root, other_case
+):
+    pack.write("skills/wip/SKILL.md", "# wip\n")
+    pack.keep()
+    before = text_of(profiles_root)
+
+    result = fails(
+        run("add", str(other_case(pack.folder / "skills" / "wip")), "-p", "pack")
+    )
+
+    assert "'wip' is inside the source of profile 'pack'" in result.output
+    assert text_of(profiles_root) == before
+    assert not (installed / "wip").exists()
+    assert pack.untouched()
+
+
+def test_add_refuses_a_folder_that_holds_the_profile_in_another_case(
+    run, installed, profiles_root, other_case
+):
+    (profiles_root / "pack" / "SKILL.md").write_text("# not a skill\n")
+    before = snapshot(profiles_root)
+
+    result = fails(run("add", str(other_case(profiles_root / "pack")), "-p", "pack"))
+
+    assert "it contains profile 'pack'" in result.output
+    assert snapshot(profiles_root) == before
+
+
+# --- naming one skill that came from the profile's source ------------------------
+
+
+def drop_from_folder(pack):
+    pack.drop("house")
+    pack.keep()
+    return {"folder": pack.source_of("house")}, pack.path
+
+
+def drop_from_git(repo):
+    shutil.rmtree(repo.work / "skills" / "house")
+    del repo.data["skills"]["house"]
+    repo.save()
+    repo.commit()
+    return {"current": repo.first}, "acme/pack"
+
+
+@pytest.mark.parametrize(
+    "fixture, drop", [("pack", drop_from_folder), ("from_git", drop_from_git)]
+)
+def test_a_named_update_of_a_skill_gone_from_the_source_reports_it_and_keeps_it(
+    run, request, profiles_root, claude_dir, fixture, drop, assert_no_nulls
+):
+    if fixture == "pack":
+        request.getfixturevalue("installed")
+    origin, label = drop(request.getfixturevalue(fixture))
+    ok(run("enable", "house"))
+    before = text_of(profiles_root)
+
+    check = assert_no_nulls(
+        json.loads(ok(run("update", "--check", "house", "--json")).output)
+    )
+    said = ok(run("update", "--check", "house")).output
+    update = assert_no_nulls(
+        json.loads(ok(run("update", "house", "--yes", "--json")).output)
+    )
+    text = ok(run("update", "house", "--yes")).output
+
+    assert check["skills"] == [
+        {"skill": "house", **origin, "modified": False, "gone": True}
+    ]
+    assert check["warnings"] == []
+    assert "house  gone from the source" in said
+    [row] = update["skills"]
+    message = row.pop("message")
+    assert row == {
+        "skill": "house",
+        **origin,
+        "gone": True,
+        "result": "source-missing",
+    }
+    assert f"gone from the source of profile 'pack' ({label})" in message
+    assert "respec update -p pack" in message
+    [warning] = update["warnings"]
+    assert (warning["type"], warning["skill"]) == ("source-missing", "house")
+    assert warning["message"] == message
+    assert f"house  {message}" in text
+    assert text_of(profiles_root) == before
+    house = profiles_root / "pack" / "skills" / "house"
+    assert (house / "SKILL.md").read_text() == "# house v1\n"
+    assert (claude_dir / "house").is_symlink()
+
+
+def test_an_invalid_profile_yaml_in_a_git_source_is_named_by_its_source(
+    run, upstream, profiles_root
+):
+    repo = make_git_pack(upstream, prefix="packs/web/")
+    git(repo.work, "push", "-q", "origin", "HEAD:stable")
+    ok(
+        run(
+            "profile",
+            "install",
+            "acme/pack#packs/web",
+            "--ref",
+            "stable",
+            "--name",
+            "pack",
+        )
+    )
+    repo.write("packs/web/profile.yaml", "targets: [nowhere]\n")
+    repo.commit(branch="stable")
+    where = "invalid profile file profile.yaml in acme/pack#packs/web@stable:"
+
+    for command in (
+        ("update", "tdd", "-p", "pack", "--json"),
+        ("update", "-p", "pack", "--json"),
+        ("update", "--check", "-p", "pack", "--json"),
+        ("profile", "diff", "pack", "--json"),
+        ("profile", "install", "acme/pack#packs/web", "--ref", "stable", "--name", "q"),
+    ):
+        result = fails(run(*command))
+
+        assert where in result.output.replace("\\n", "\n"), command
+        assert "nowhere" in result.output
+        assert "respec-git-" not in result.output, command
+
+    repo.write("packs/web/profile.yaml", "targets: [\n")
+    repo.commit(branch="stable")
+    result = fails(run("update", "tdd", "-p", "pack", "--json"))
+
+    assert where in result.output.replace("\\n", "\n")
+    assert "not valid YAML" in result.output
+    assert "respec-git-" not in result.output

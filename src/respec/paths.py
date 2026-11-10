@@ -36,3 +36,28 @@ def respec_home() -> Path:
     if env:
         return _absolute(env)
     return user_home() / ".respec"
+
+
+def below(path: Path, folder: Path) -> tuple[str, ...] | None:
+    """Where ``path`` is in ``folder``: the names from ``folder`` down to it
+    (none when it is ``folder`` itself), or None when it is not inside.
+
+    Folders are compared by what they are on disk, not by how they are
+    spelled, so a path through a symlink or, on a volume that ignores case,
+    in another case is still found inside. A part that does not exist is
+    compared by its resolved spelling.
+    """
+    path, folder = path.resolve(), folder.resolve()
+    names: list[str] = []
+    for candidate in (path, *path.parents):
+        if candidate == folder or _same(candidate, folder):
+            return tuple(reversed(names))
+        names.append(candidate.name)
+    return None
+
+
+def _same(left: Path, right: Path) -> bool:
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return False
