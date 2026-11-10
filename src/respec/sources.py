@@ -8,9 +8,12 @@ default ``https://github.com``) or as a git URL, optionally followed by
 (none means the remote's default branch), the resolved commit and a digest of
 the files as fetched, so later local edits can be detected.
 
-Updates are explicit: :func:`check` only reads the remote; :func:`update`
-replaces an item's folder with the newer upstream files. Items without a
-source never change. Git runs as a subprocess with prompts disabled, a time
+A skill added from a local folder records that folder instead (``folder``,
+its absolute path, and the digest of the copy). respec only ever reads it.
+
+Updates are explicit: :func:`check` only reads the remote or the folder;
+:func:`update` replaces an item's folder with the newer upstream files. Items
+without a source never change. Git runs as a subprocess with prompts disabled, a time
 limit (``RESPEC_GIT_TIMEOUT`` seconds per git command, default 120) and, for
 the TUI, a way to be cancelled (:func:`cancel_on`).
 """
@@ -357,6 +360,12 @@ def copy_fetched(tree: Path, source: Path, destination: Path) -> None:
     """
     root = tree.resolve()
     _within(root, source)
+    _copy_checked(source, destination, f"{_label(root, source)!r} from the repository")
+
+
+def _copy_checked(source: Path, destination: Path, what: str) -> None:
+    """Copy ``source`` to ``destination`` by the link rules of
+    :func:`copy_fetched`; ``what`` names the source in a failure."""
     if os.path.lexists(destination):
         raise RespecError(f"{destination} already exists")
     with tempfile.TemporaryDirectory(prefix="respec-check-") as scratch:
@@ -370,10 +379,31 @@ def copy_fetched(tree: Path, source: Path, destination: Path) -> None:
             raise
         except (OSError, shutil.Error) as error:
             shutil.rmtree(destination, ignore_errors=True)
-            raise RespecError(
-                f"could not copy {_label(root, source)!r} from the repository: "
-                f"{_reason(error)}"
-            ) from None
+            raise RespecError(f"could not copy {what}: {_reason(error)}") from None
+
+
+class SourceMissing(RespecError):
+    """A source folder is gone or no longer holds ``SKILL.md``."""
+
+
+def copy_folder(folder: Path, destination: Path) -> None:
+    """Copy the local source ``folder`` to ``destination`` by the rules for
+    fetched content (:func:`copy_fetched`). The folder is only read."""
+    if not folder.is_dir():
+        raise SourceMissing(f"source folder {folder} no longer exists")
+    if not (folder / items.SKILL_FILE).is_file():
+        raise SourceMissing(
+            f"source folder {folder} no longer holds {items.SKILL_FILE}"
+        )
+    _copy_checked(folder, destination, f"source folder {folder}")
+
+
+def folder_digest(folder: str) -> str:
+    """The digest a copy of the source ``folder`` made now would record."""
+    with tempfile.TemporaryDirectory(prefix="respec-folder-") as scratch:
+        copy = Path(scratch) / "skill"
+        copy_folder(Path(folder), copy)
+        return fetched_digest(copy)
 
 
 def _reason(error: OSError | shutil.Error) -> str:
@@ -574,11 +604,18 @@ def _forget(before: profiles.Profile, added: list[str]) -> None:
 
 @dataclass
 class Row:
+    """One sourced skill of a check. A git source gives ``current`` and
+    ``latest`` (commits); a folder source gives ``folder``, and
+    ``source_missing`` (with ``message``) when that folder is gone."""
+
     skill: str
-    current: str | None
+    current: str | None = None
     latest: str | None = None
+    folder: str | None = None
     update_available: bool | None = None
     modified: bool | None = None
+    source_missing: bool | None = None
+    message: str | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, object]:
@@ -608,10 +645,20 @@ def _modified(profile: profiles.Profile, item: str) -> bool:
 
 
 def _latest(source: profiles.Source, cache: dict[tuple[str, str | None], str]) -> str:
+    """What the source holds now: the upstream commit, or for a folder source
+    the digest of its files, to compare with :func:`_recorded`."""
+    if source.folder is not None:
+        return folder_digest(source.folder)
+    assert source.repo is not None
     key = (repo_url(source.repo), source.ref)
     if key not in cache:
         cache[key] = remote_commit(key[0], source.ref, source.repo)
     return cache[key]
+
+
+def _recorded(source: profiles.Source) -> str | None:
+    """What ``profile.yaml`` says the copy was made from (see :func:`_latest`)."""
+    return source.digest if source.folder is not None else source.commit
 
 
 def check(
@@ -626,12 +673,21 @@ def check(
     for name in _sourced(profile, item):
         source = profile.skills[name].source
         assert source is not None
-        row = Row(skill=name, current=source.commit, modified=_modified(profile, name))
+        row = Row(
+            skill=name,
+            current=source.commit,
+            folder=source.folder,
+            modified=_modified(profile, name),
+        )
         try:
-            row.latest = _latest(source, cache)
-            row.update_available = row.latest != source.commit
+            latest = _latest(source, cache)
+            row.update_available = latest != _recorded(source)
+            if source.folder is None:
+                row.latest = latest
         except GitCancelled:
             raise
+        except SourceMissing as error:
+            row.source_missing, row.message = True, str(error)
         except RespecError as error:
             row.error = str(error)
         rows.append(row)
@@ -660,7 +716,8 @@ def update(
     item: str | None = None,
     overwrite_edits: Confirm = lambda item: False,
 ) -> UpdateResult:
-    """Apply newer upstream commits to sourced items.
+    """Apply newer upstream commits, or a source folder's newer files, to
+    sourced items.
 
     An item whose files were edited locally is replaced only when
     ``overwrite_edits(item)`` returns true; otherwise it is skipped.
@@ -700,17 +757,22 @@ def _update(
             source = skills[name].source
             assert source is not None
             _put_back_old(profile, name)
-            row: dict[str, object] = {"skill": name, "current": source.commit}
+            row: dict[str, object] = (
+                {"skill": name, "current": source.commit}
+                if source.folder is None
+                else {"skill": name, "folder": source.folder}
+            )
             result.skills.append(row)
             try:
                 latest = _latest(source, cache)
             except GitCancelled:
                 raise
             except RespecError as error:
-                row.update({"result": "error", "error": str(error)})
+                row.update(_failure(error))
                 continue
-            row["latest"] = latest
-            if latest == source.commit:
+            if source.folder is None:
+                row["latest"] = latest
+            if latest == _recorded(source):
                 row["result"] = "up-to-date"
                 continue
             if _modified(profile, name) and not overwrite_edits(name):
@@ -721,9 +783,11 @@ def _update(
             except GitCancelled:
                 raise
             except (RespecError, OSError, shutil.Error) as error:
-                row.update({"result": "error", "error": str(error)})
+                row.update(_failure(error))
                 continue
-            row.update({"result": "updated", "latest": new_source.commit})
+            row["result"] = "updated"
+            if source.folder is None:
+                row["latest"] = new_source.commit
             skills[name] = dataclasses.replace(skills[name], source=new_source)
         if not replaced:
             return result
@@ -744,6 +808,14 @@ def _update(
         for _, old in replaced:
             shutil.rmtree(old, ignore_errors=True)
     return result
+
+
+def _failure(error: Exception) -> dict[str, object]:
+    """How an update row reports ``error``: a source folder that is gone is
+    ``source-missing`` (reported, not a failure), anything else an error."""
+    if isinstance(error, SourceMissing):
+        return {"result": "source-missing", "message": str(error)}
+    return {"result": "error", "error": str(error)}
 
 
 def _replace(
@@ -780,14 +852,22 @@ def _replace(
     # so recovery puts back only what this run moved (see respec.journal).
     swap = {"skill": item, "live": trees.digest(live), "old": str(old)}
     journal.note(respec_home, "swaps", swap)
-    with checkout(repo_url(source.repo), source.ref, source.repo) as (tree, commit):
-        upstream = inside(tree, source.path)
-        if not (upstream / items.SKILL_FILE).is_file():
-            raise RespecError(
-                f"{source.repo} at {commit[:12]} has no {items.SKILL_FILE} "
-                f"in {source.path or 'its root'}"
-            )
-        copy_fetched(tree, upstream, incoming)
+    commit = source.commit
+    if source.folder is not None:
+        copy_folder(Path(source.folder), incoming)
+    else:
+        assert source.repo is not None
+        with checkout(repo_url(source.repo), source.ref, source.repo) as (
+            tree,
+            commit,
+        ):
+            upstream = inside(tree, source.path)
+            if not (upstream / items.SKILL_FILE).is_file():
+                raise RespecError(
+                    f"{source.repo} at {commit[:12]} has no {items.SKILL_FILE} "
+                    f"in {source.path or 'its root'}"
+                )
+            copy_fetched(tree, upstream, incoming)
     journal.note(
         respec_home, "fetched", {"skill": item, "digest": trees.digest(incoming)}
     )

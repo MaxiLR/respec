@@ -7,12 +7,17 @@ schema of ``profile.yaml``::
     skills:                          # optional; mapping of skill name to entry
       my-skill:
         enabled: true                # required boolean
-        source:                      # optional origin record
-          repo: owner/repo           # required within source
+        source:                      # optional origin record: git ...
+          repo: owner/repo           # required within a git source
           path: skills/my-skill      # optional
           ref: main                  # optional
           commit: 0123abcd           # optional resolved commit
           digest: sha256:...         # optional hash of the files as fetched
+      other-skill:
+        enabled: true
+        source:                      # ... or a local folder, which is only read
+          folder: /abs/other-skill   # absolute path; never with the git keys
+          digest: sha256:...         # optional hash of the files as copied
     layers:                          # optional; named groups of skills
       design-principles:             # built-in: only skills and active allowed
         skills: [my-skill]
@@ -54,7 +59,8 @@ NAME_RULE = "use letters, digits, '.', '_' or '-', starting with a letter or dig
 
 TOP_LEVEL_KEYS = ("targets", "skills", "layers")
 SKILL_KEYS = ("enabled", "source")
-SOURCE_KEYS = ("repo", "path", "ref", "commit", "digest")
+SOURCE_KEYS = ("repo", "path", "ref", "commit", "digest", "folder")
+GIT_SOURCE_KEYS = ("repo", "path", "ref", "commit")
 LAYER_SKILLS_KEY = "skills"
 LEGACY_LAYER_SKILLS_KEY = "items"
 LAYER_KEYS = ("exclusive", "description", "skills", "active", "items")
@@ -89,11 +95,15 @@ class ProfileError(RespecError):
 
 @dataclass(frozen=True)
 class Source:
-    repo: str
+    """Where a skill came from: a git repository (``repo``) or a local folder
+    (``folder``, an absolute path that respec only ever reads)."""
+
+    repo: str | None = None
     path: str | None = None
     ref: str | None = None
     commit: str | None = None
     digest: str | None = None
+    folder: str | None = None
 
     def to_dict(self) -> dict[str, str]:
         return {key: value for key, value in vars(self).items() if value is not None}
@@ -361,6 +371,8 @@ def source_value_problem(key: str, value: str) -> str | None:
         return f"source {key} {value!r} must not contain control characters"
     if key == "repo":
         return _repo_problem(value)
+    if key == "folder" and not os.path.isabs(value):
+        return f"source folder {value!r} must be an absolute path"
     if key == "path" and (
         value.startswith("/")
         or "\\" in value
@@ -390,6 +402,15 @@ def _parse_source(where: str, raw: Any, problems: list[str]) -> Source | None:
             problems.append(f"{where}.{key}: {problem}")
         else:
             values[key] = raw[key]
+    if raw.get("folder") is not None:
+        mixed = [key for key in GIT_SOURCE_KEYS if raw.get(key) is not None]
+        if mixed:
+            problems.append(
+                f"{where}.folder cannot be combined with {', '.join(mixed)}: "
+                "a source is either a git repository or a local folder"
+            )
+            return None
+        return Source(**values) if "folder" in values else None
     if "repo" not in raw:
         problems.append(f"{where}.repo is required (for example 'owner/repo')")
     if "repo" not in values:

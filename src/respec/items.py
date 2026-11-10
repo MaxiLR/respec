@@ -35,6 +35,7 @@ class SkillChange:
     active: bool = False
     linked: list[str] = field(default_factory=list)
     unlinked: list[str] = field(default_factory=list)
+    source: dict[str, str] | None = None  # an added skill's source record
 
     def to_dict(self) -> dict[str, object]:
         return dataclasses.asdict(self)
@@ -76,12 +77,16 @@ def add_local(
     enabled: bool = True,
     name: str | None = None,
     origin: profiles.Source | None = None,
+    reference: bool = False,
 ) -> profiles.Profile:
     """Copy the skill folder ``source`` into a profile and record it.
 
     The item is called ``name``, or after the source folder (after resolving
     symlinks) when no name is given. ``origin`` is recorded as the item's
-    ``source`` (where it was fetched from). Target folders are not touched.
+    ``source`` (where it was fetched from). With ``reference``, the folder
+    itself is recorded as the source (its resolved path and a digest of the
+    copy) and copied by the rules for fetched content
+    (:func:`respec.sources.copy_folder`). Target folders are not touched.
     Returns the updated profile. On failure nothing is left behind in the
     profile.
     """
@@ -113,7 +118,15 @@ def add_local(
         raise RespecError(f"cannot add {source}: it contains profile {profile.name!r}")
 
     try:
-        shutil.copytree(source, destination)
+        if reference:
+            from respec import sources
+
+            sources.copy_folder(source, destination)
+            origin = profiles.Source(
+                folder=str(source), digest=sources.fetched_digest(destination)
+            )
+        else:
+            shutil.copytree(source, destination)
         skills = dict(profile.skills)
         skills[item] = profiles.SkillEntry(enabled=enabled, source=origin)
         updated = dataclasses.replace(profile, skills=skills)
@@ -225,7 +238,8 @@ def add(
     source: Path,
     profile_name: str | None = None,
 ) -> SkillChange:
-    """Add a local skill folder to a profile (default: the active one)."""
+    """Add a local skill folder to a profile (default: the active one) and
+    record the folder as the skill's source. The folder is only read."""
     journal.ready(respec_home, user_home)
     name = resolve_profile_name(respec_home, profile_name)
     before = profiles.load_profile(respec_home, name)
@@ -235,11 +249,17 @@ def add(
         target = _skill_folder(before, user_path(source).resolve().name)
         if not os.path.lexists(target):
             journal.note(respec_home, "created", target.name)
-        profile = add_local(respec_home, name, source)
+        profile = add_local(respec_home, name, source, reference=True)
         item = next(skill for skill in profile.skills if skill not in before.skills)
         folder = _skill_folder(profile, item)
+        origin = profile.skills[item].source
         change = SkillChange(
-            profile=name, skill=item, action="add", enabled=True, path=str(folder)
+            profile=name,
+            skill=item,
+            action="add",
+            enabled=True,
+            path=str(folder),
+            source=origin.to_dict() if origin else None,
         )
 
         def undo() -> None:

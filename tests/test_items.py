@@ -43,6 +43,17 @@ def local_skill(tmp_path, name, body=None):
     return folder
 
 
+def folder_source(folder):
+    """The source record of a skill added from ``folder`` (digest aside)."""
+    return {"folder": str(folder.resolve())}
+
+
+def without_digest(entry):
+    """A skill's profile.yaml entry without its source digest."""
+    source = {k: v for k, v in entry.get("source", {}).items() if k != "digest"}
+    return {**entry, "source": source} if "source" in entry else entry
+
+
 def new_profile(run, name, *targets):
     args = ["profile", "new", name]
     for target in targets:
@@ -69,7 +80,8 @@ def test_add_copies_folder_into_named_profile_and_enables_it(
     assert (copied / "refs" / "note.txt").read_text() == "note\n"
     assert not copied.is_symlink()
     assert (source / "SKILL.md").exists()
-    assert read_yaml(profiles_root, "work")["skills"] == {"tdd": {"enabled": True}}
+    entry = read_yaml(profiles_root, "work")["skills"]["tdd"]
+    assert without_digest(entry) == {"enabled": True, "source": folder_source(source)}
     # The profile is not active, so no target folder is touched.
     assert not dirs["claude-code"].exists()
 
@@ -188,7 +200,7 @@ def test_enable_links_into_active_targets(
 
     ok(run("enable", "tdd"))
 
-    assert read_yaml(profiles_root, "work")["skills"]["tdd"] == {"enabled": True}
+    assert read_yaml(profiles_root, "work")["skills"]["tdd"]["enabled"] is True
     assert (dirs["claude-code"] / "tdd" / "SKILL.md").read_text() == "# tdd\n"
     assert recorded(isolated_homes) == [str(dirs["claude-code"] / "tdd")]
 
@@ -204,7 +216,7 @@ def test_enable_and_disable_of_inactive_profile_leave_targets_alone(
 
     ok(run("disable", "notes", "-p", "home"))
 
-    assert read_yaml(profiles_root, "home")["skills"]["notes"] == {"enabled": False}
+    assert read_yaml(profiles_root, "home")["skills"]["notes"]["enabled"] is False
     assert not dirs["agents"].exists()
     assert (dirs["claude-code"] / "tdd").exists()
     assert recorded(isolated_homes) == [str(dirs["claude-code"] / "tdd")]
@@ -243,7 +255,7 @@ def test_enable_rolls_back_when_active_install_is_blocked(
 
     assert result.exit_code == 1
     assert "not managed by respec" in result.output
-    assert read_yaml(profiles_root, "work")["skills"]["tdd"] == {"enabled": False}
+    assert read_yaml(profiles_root, "work")["skills"]["tdd"]["enabled"] is False
     assert (foreign / "SKILL.md").read_text() == "# hand-installed\n"
     assert recorded(isolated_homes) == []
 
@@ -300,9 +312,14 @@ def test_commands_support_json(run, tmp_path, profiles_root, dirs):
         "active": True,
         "linked": [link],
         "unlinked": [],
+        "source": {
+            "folder": str(source.resolve()),
+            "digest": added["source"]["digest"],
+        },
         "unresolved": [],
         "warnings": [],
     }
+    assert added["source"]["digest"].startswith("sha256:")
     assert disabled["action"] == "disable"
     assert disabled["enabled"] is False
     assert disabled["linked"] == [] and disabled["unlinked"] == [link]

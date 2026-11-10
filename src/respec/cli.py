@@ -172,7 +172,10 @@ def _print_json(data: Any) -> None:
       a journaled operation, or ``state`` for a rebuilt ``state.json``;
       ``outcome``: ``finished``, ``rolled-back``, ``rebuilt`` or ``pending``;
       ``set_aside``; ``profile`` when it concerns one; ``in_flight`` when it
-      waits and the entry its step in flight was changing exists).
+      waits and the entry its step in flight was changing exists);
+    - ``source-missing``: ``update`` found a skill's source folder gone or
+      without ``SKILL.md`` and left the skill as it was (``profile``,
+      ``skill``, ``folder``).
 
     Unknown entries are not warnings: commands list them under ``unresolved``.
     """
@@ -1570,7 +1573,7 @@ def update(
     profile: ProfileOption = None,
     check_only: Annotated[
         bool,
-        typer.Option("--check", help="Only report which skills have newer commits."),
+        typer.Option("--check", help="Only report which skills have an update."),
     ] = False,
     yes: Annotated[
         bool,
@@ -1578,7 +1581,8 @@ def update(
     ] = False,
     as_json: JsonOption = False,
 ) -> None:
-    """Check for or apply newer upstream commits of sourced skills."""
+    """Check for or apply updates of sourced skills: newer upstream commits,
+    or changed files in a source folder."""
     homes = _homes(ctx)
     if check_only:
         _update_check(homes, profile, skill, as_json)
@@ -1604,7 +1608,13 @@ def update(
     failed = any(row["result"] == "error" for row in result.skills)
     unresolved = _unresolved(homes)
     if as_json:
-        _print_json({**result.to_dict(), "unresolved": unresolved})
+        _print_json(
+            {
+                **result.to_dict(),
+                "unresolved": unresolved,
+                "warnings": _source_missing(result.profile, result.skills),
+            }
+        )
     else:
         if not result.skills:
             typer.echo(f"Profile {result.profile!r} has no skills with a source.")
@@ -1619,14 +1629,38 @@ def update(
 def _update_line(row: dict[str, Any]) -> str:
     name = row["skill"]
     outcome = row["result"]
+    if outcome == "updated" and "folder" in row:
+        return f"{name}  updated from {row['folder']}"
     if outcome == "updated":
         current, latest = messages.short(row["current"]), messages.short(row["latest"])
         return f"{name}  updated {current} -> {latest}"
+    if outcome == "source-missing":
+        return f"{name}  {_missing_line(row['message'])}"
     if outcome == "up-to-date":
         return f"{name}  up to date"
     if outcome == "skipped-local-edits":
         return f"{name}  skipped: local edits kept (use --yes to overwrite)"
     return f"{name}  error: {row['error']}"
+
+
+def _missing_line(message: str) -> str:
+    """``source missing: <folder> <what is wrong>`` from a row's message."""
+    return "source missing: " + message.removeprefix("source folder ")
+
+
+def _source_missing(profile: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A ``source-missing`` warning per row whose source folder is gone."""
+    return [
+        {
+            "type": "source-missing",
+            "profile": profile,
+            "skill": row["skill"],
+            "folder": row["folder"],
+            "message": row["message"],
+        }
+        for row in rows
+        if row.get("message")
+    ]
 
 
 def _update_check(
@@ -1637,7 +1671,9 @@ def _update_check(
     except RespecError as error:
         _fail(error)
     if as_json:
-        _print_json({"profile": name, "skills": [row.to_dict() for row in rows]})
+        skills = [row.to_dict() for row in rows]
+        warnings = _source_missing(name, skills)
+        _print_json({"profile": name, "skills": skills, "warnings": warnings})
     else:
         if not rows:
             typer.echo(f"Profile {name!r} has no skills with a source.")
@@ -1645,6 +1681,10 @@ def _update_check(
             edits = "  (local edits)" if row.modified else ""
             if row.error:
                 state = f"error: {row.error}"
+            elif row.source_missing:
+                state = _missing_line(row.message or "")
+            elif row.folder and row.update_available:
+                state = f"update available from {row.folder}"
             elif row.update_available:
                 current, latest = messages.short(row.current), messages.short(
                     row.latest

@@ -129,6 +129,7 @@ WARNING_TYPES = (
     "unreadable-manifest",
     "unreadable-takeover-log",
     "interrupted-operation",
+    "source-missing",
 )
 OUTCOMES = ("finished", "rolled-back", "pending", "rebuilt")
 

@@ -17,8 +17,8 @@ every path it creates, and hand edits make its record disagree with disk.
 
 - Pass `--json` to read results. Every command except `tui` accepts it. JSON
   objects carry a `warnings` list; each warning has a `type`
-  (`layer-conflict`, `unreadable-manifest`, `unreadable-takeover-log` or
-  `interrupted-operation`) and a `message`. An `interrupted-operation`
+  (`layer-conflict`, `unreadable-manifest`, `unreadable-takeover-log`,
+  `interrupted-operation` or `source-missing`) and a `message`. An `interrupted-operation`
   warning's `outcome` is `finished`, `rolled-back`, `pending` or `rebuilt`
   (with `operation` `state`: `respec recover` rebuilt `state.json`). Unknown entries still waiting for a
   decision are listed under `unresolved`; entries a command resolved are
@@ -88,17 +88,30 @@ Every enabled skill of a profile goes to all of that profile's targets.
   folder wins), `owner/repo[#path]`, or a git URL `[#path]`. A repository
   path without `SKILL.md` adds every skill folder directly in it (or in its
   `skills/` folder). Git sources record their origin (repo, path, ref,
-  resolved commit, digest).
+  resolved commit, digest). A local folder is recorded as the skill's source
+  too (its absolute path and a digest of the copy; `source` in the `--json`
+  output). respec copies from that folder and never writes to it. Symlinks in
+  it must point to files inside it, as for git.
 - `respec remove <skill> [-p <profile>]`: remove a skill and delete its files.
 - `respec enable <skill> [-p <profile>]`: enable it; an active profile links
   it right away.
 - `respec disable <skill> [-p <profile>]`: disable it, keeping files and
   source record.
 - `respec update --check [<skill>] [-p <profile>]`: report which sourced
-  skills have newer upstream commits. Reads only.
-- `respec update [<skill>] [-p <profile>] [--yes]`: apply them. A skill with
-  local edits is only overwritten after confirmation or with `--yes`. Skills
-  without a source never change.
+  skills have an update: a newer upstream commit, or a source folder whose
+  files differ from what was copied. Reads only. Each row gives `skill`,
+  `update_available` and `modified` (the profile's copy was edited), with
+  `current` and `latest` commits for git or `folder` for a source folder.
+- `respec update [<skill>] [-p <profile>] [--yes]`: apply them (a source
+  folder is copied again). A skill with local edits is only overwritten after
+  confirmation or with `--yes`; with `--json` it is skipped. Each row's
+  `result` is `updated`, `up-to-date`, `skipped-local-edits`, `source-missing`
+  or `error`. Skills without a source never change.
+- A source folder that is gone or no longer holds `SKILL.md` changes nothing
+  and is not a failure: the skill keeps its files, the other skills still
+  update, and the output gives a `source-missing` warning (`profile`, `skill`,
+  `folder`). Its row has `source_missing: true` (`--check`) or `result`
+  `source-missing` (`update`), with the same `message`.
 
 ### Layers
 
@@ -201,11 +214,16 @@ targets: [claude-code, agents] # at least one known target
 skills:
   my-skill:
     enabled: true
-    source: # only for skills added from git
+    source: # a skill added from git
       repo: owner/repo
       path: skills/my-skill
       ref: main
       commit: 0123abcd...
+      digest: sha256:...
+  other-skill:
+    enabled: true
+    source: # a skill added from a local folder
+      folder: /absolute/path/to/other-skill
       digest: sha256:...
 layers:
   design-principles: # built-in: skills and active only

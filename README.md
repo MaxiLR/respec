@@ -27,8 +27,8 @@ respec use work
   `respec restore` puts it back.
 - **Nothing is lost silently:** skills respec did not install are reported, and
   you choose to add them to a profile or remove them (with a backup).
-- **Skills from git:** add skills from a repository, check for newer commits
-  and update on request.
+- **Skills from a folder or git:** add skills from a local folder or a
+  repository, check them against that source and update on request.
 - **Layers:** group a profile's skills; an exclusive layer keeps at most one of
   its skills enabled.
 - **Terminal UI:** switch, edit and check profiles with the keyboard or mouse.
@@ -143,7 +143,7 @@ anything it did not record.
 | `respec add <folder or owner/repo[#path]>` | Add a skill and enable it.                                      |
 | `respec enable` / `disable <skill>`        | Turn a skill on or off, keeping its files.                      |
 | `respec remove <skill>`                    | Remove a skill from a profile and delete its files.             |
-| `respec update [--check] [<skill>]`        | Check for, or apply, newer commits of skills added from git.    |
+| `respec update [--check] [<skill>]`        | Check for, or apply, updates from a skill's folder or git repo. |
 | `respec layer ...`                         | Group skills into layers (`respec layer --help`).               |
 | `respec adopt`                             | Resolve unknown entries: add or remove each.                    |
 | `respec restore [<backup>]`                | Put a backup back and release every folder.                     |

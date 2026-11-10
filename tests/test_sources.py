@@ -246,8 +246,9 @@ def test_add_of_existing_item_name_adds_none_of_the_skills(
 
 
 @pytest.fixture
-def sourced(run, upstream, tmp_path):
-    """Profile 'work' with sourced items 'tdd' and 'lint' and a local item."""
+def sourced(run, upstream, tmp_path, profiles_root):
+    """Profile 'work' with sourced items 'tdd' and 'lint' and an item without
+    a source (as profiles written before folders were recorded have)."""
     repo = upstream("acme/skills")
     repo.write("tdd/SKILL.md", "# tdd v1\n")
     repo.write("lint/SKILL.md", "# lint v1\n")
@@ -259,6 +260,9 @@ def sourced(run, upstream, tmp_path):
     ok(run("add", "acme/skills#tdd", "-p", "work"))
     ok(run("add", "acme/skills#lint", "-p", "work"))
     ok(run("add", str(local), "-p", "work"))
+    data = read_yaml(profiles_root, "work")
+    del data["skills"]["mine"]["source"]
+    (profiles_root / "work" / "profile.yaml").write_text(yaml.safe_dump(data))
     repo.first = first
     return repo
 

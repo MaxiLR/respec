@@ -9,7 +9,7 @@ respec               # open the TUI (also: respec tui)
 respec profile new work --target claude-code --target agents
 respec use work      # switch: remove the previous profile's skills, link this one's
 respec status        # active profile, targets and managed skills per folder
-respec add ./my-skill [-p work]   # copy a skill folder (with SKILL.md) into a profile
+respec add ./my-skill [-p work]   # copy a skill folder (with SKILL.md) into a profile; the folder is its source
 respec disable my-skill [-p work] # stop linking it; files and metadata stay
 respec enable my-skill [-p work]
 respec remove my-skill [-p work]  # drop it from profile.yaml and delete its folder
@@ -26,6 +26,36 @@ respec profile remove old         # move a profile that is not active to a backu
 `add`, `remove`, `enable` and `disable` change the active profile unless `-p`
 names another. When the changed profile is active, its target folders are
 refreshed right away. Every command except `tui` accepts `--json`.
+
+## Skills from a local folder
+
+`add <folder>` copies the folder into the profile and records it as the
+skill's source in `profile.yaml`: `folder` (the absolute, resolved path, also
+when a relative one was given) and `digest` (a digest of the copied files).
+`--json` gives the same record under `source`. respec only ever reads the
+folder: it is never written, moved or deleted.
+
+`update --check` reports an update when the folder's files differ from what
+was copied, and `update` copies the folder again and records the new digest.
+The rules are those for git sources: a copy that was edited in the profile is
+only overwritten after confirmation or with `--yes` (with `--json` it is
+skipped), the swap is journaled, and symlinks in the folder must point to
+files inside it (they are copied as plain files; links to folders and links
+that leave the folder are refused, by `add` as well).
+
+A source folder that is gone, or that no longer holds `SKILL.md`, is reported
+and changes nothing: the skill keeps its files, the other skills are still
+updated and the command does not fail. The text output says `source missing`;
+`--json` gives a `source-missing` warning, and the skill's row has
+`source_missing: true` (`update --check`) or `result: source-missing`
+(`update`), each with the `message`. A source names a path on this machine, so
+a profile moved to another machine reports its folder sources as missing.
+
+In `--json`, a row of `update --check` has `skill`, `update_available` and
+`modified`, plus `current` and `latest` (commits) for a git source or `folder`
+for a folder source, and `error` when the check failed. A row of `update` has
+`skill`, the same source fields and `result`: `updated`, `up-to-date`,
+`skipped-local-edits`, `source-missing` or `error`.
 
 ## Skills from git
 
@@ -305,7 +335,8 @@ until its first or last entry, where the next press moves on.
 **Edit** (`e`) opens the selected profile: its skills grouped by layer, with a
 toggle per skill and, in an active exclusive layer, a choice of one skill (or
 none). **Add folder** (`a`) and **Add from git** (`g`) add skills, and
-**Check updates** (`u`) marks sourced skills that have a newer commit. Git runs
+**Check updates** (`u`) marks sourced skills that have a newer commit or a
+changed source folder. Git runs
 in the background with a **Cancel** button (or `Esc`). Every
 change goes through the same code as `respec enable`, `respec layer use` and
 `respec add`, so an active profile is re-applied at once and a refused change
@@ -403,6 +434,9 @@ Every `--json` output that is an object uses one vocabulary:
     change, so not listed under `unresolved`). `respec recover --json` gives
     `active_profile`, `recovered` (whether there was anything to recover)
     and this warning.
+  - `source-missing`: `update` or `update --check` found a skill's source
+    folder gone or without `SKILL.md` and left the skill as it was; also
+    gives `profile`, `skill` and `folder`.
 - `error`: present only when the command failed. `use`, `adopt`, `restore`
   (also `--release-only`, which adds `kept`) and `recover` then print every
   other key of their success output too, filled with what was done before the
@@ -418,7 +452,8 @@ Every `--json` output that is an object uses one vocabulary:
 A field that does not apply is left out rather than given as `null`: for
 example a resolved entry has `profile` only when it was added and `backup`
 only when it was removed, a linked skill has no `digest`, a layer change has
-`skill` only when it names one, a skill without a git source has no `source`,
+`skill` only when it names one, a skill without a source has no `source`, a
+source has either the git fields or `folder`,
 and `restore` gives `backup` only when a backup run was named. A change of a
 profile (`add`, `remove`, `enable`, `disable`, `update`) gives `active`:
 whether that profile is the active one. Only these
