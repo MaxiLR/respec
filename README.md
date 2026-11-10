@@ -36,7 +36,10 @@ asks before overwriting them (with `--json` it skips them unless `--yes`).
 Fetched skills may only contain symlinks to files inside the skill's own
 folder; they are copied as plain files, and links to folders are refused. Git
 never prompts: ssh runs with `BatchMode=yes` unless you set your own ssh
-command (`GIT_SSH_COMMAND`, `GIT_SSH` or `core.sshCommand`). A source `repo`
+command (`GIT_SSH_COMMAND`, `GIT_SSH` or `core.sshCommand`). Each git command
+stops after `RESPEC_GIT_TIMEOUT` seconds (default 120); http transfers slower
+than 1 KB/s for 30 seconds, and ssh connections not made within 15 seconds,
+fail sooner. A source `repo`
 must be `owner/repo`, `user@host:path` or an https, http, ssh or git URL; local
 paths and other git transports are refused. Skills installed by
 `profile install` have no recorded digest, so their first `update` asks before
@@ -138,6 +141,25 @@ Select a profile with the arrow keys or a click, then press Enter or click
 choices (add to the active profile, or back up and remove); so do entries found
 in a folder the switch took over for the first time. `a` resolves unknown
 entries outside a switch, `r` refreshes and `q` quits.
+
+**Edit** (`e`) opens the selected profile: its skills grouped by layer, with a
+toggle per skill and, in an active exclusive layer, a choice of one skill (or
+none). **Add folder** (`a`) and **Add from git** (`g`) add skills, and
+**Check updates** (`u`) marks sourced skills that have a newer commit. Git runs
+in the background with a **Cancel** button (or `Esc`). Every
+change goes through the same code as `respec enable`, `respec layer use` and
+`respec add`, so an active profile is re-applied at once and a refused change
+leaves the profile as it was. **New profile** (`n`) asks for a name and targets.
+
+**⟳ Sync** (`s`) is a manual check of the setup and every profile; nothing is
+watched in the background. It lists unknown entries and edited or replaced
+copies (add to the active profile, or back up and remove, as `respec adopt`),
+exclusive layers with several enabled skills (keep one, as `respec layer
+repair`), and links respec placed that are missing, broken or out of line with
+the active profile (re-apply it). Each fix is listed with its backups; with
+nothing found it says everything is in sync. Shipped and global skills are marked
+in the status panel and the editor; Sync expects them where `respec use` puts
+them, and an entry in their place can only be removed.
 
 ### Layers
 

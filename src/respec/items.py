@@ -52,6 +52,18 @@ def resolve_profile_name(respec_home: Path, name: str | None) -> str:
     return active
 
 
+def user_path(text: str | Path) -> Path:
+    """A path as the user typed it, with ``~`` expanded; refuses what cannot be."""
+    if "\0" in str(text):
+        raise RespecError(f"{str(text)!r} is not a valid path: it holds a NUL byte")
+    try:
+        return Path(text).expanduser()
+    except RuntimeError:
+        raise RespecError(
+            f"cannot expand {str(text)!r}: no home folder is known for that user"
+        ) from None
+
+
 def _skill_folder(profile: profiles.Profile, item: str) -> Path:
     return profile.path / profiles.SKILLS_DIR / item
 
@@ -73,7 +85,7 @@ def add_local(
     profile.
     """
     profile = profiles.load_profile(respec_home, profile_name)
-    source = Path(source).expanduser().resolve()
+    source = user_path(source).resolve()
     if not source.is_dir():
         raise RespecError(f"{source} is not a folder; give the path of a skill folder")
     if not (source / SKILL_FILE).is_file():
