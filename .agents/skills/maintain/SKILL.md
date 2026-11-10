@@ -49,6 +49,9 @@ skills are current.
   README.
 - `.agents/skills/install/SKILL.md`: when installing, running or the project
   layout changes (`pyproject.toml` name or entry point, `uv` usage).
+- `docs/assets/tui-demo.svg`: the animated picture at the top of the README. When
+  the TUI's look or keys change, regenerate it with
+  `uv run python scripts/make_tui_demo.py` and look at the result.
 - This file: when the list of documents to check changes.
 - Help text and messages in `src/respec/cli.py` and `src/respec/messages.py`:
   user-facing text says "skill", never "item".
