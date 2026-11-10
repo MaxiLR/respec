@@ -4,10 +4,12 @@ Switchable global profiles of agent skills across coding harnesses (Claude Code,
 
 ## Install
 
-Ask your coding agent to "install respec" from a checkout of this repository.
-It follows [the install skill](.agents/skills/install-respec/SKILL.md), which
-adds a `respec` alias to `~/.bashrc` (and `~/.zshrc` for zsh) so the command
-works from any directory. By hand:
+Clone this repository, start your coding agent inside the checkout and run
+`/install` (or ask it to "install respec"). The agent follows
+[the install skill](.agents/skills/install/SKILL.md), which adds a `respec`
+alias to `~/.bashrc` (and `~/.zshrc` for zsh) so the command works from any
+directory. Claude Code and harnesses that read `.agents/skills/` find the skill
+on their own. By hand:
 
 ```sh
 uv sync --frozen
@@ -439,6 +441,11 @@ uv run respec --help
 uv run pytest
 uv run black --check .
 ```
+
+Agents changing this repository follow
+[the maintain skill](.agents/skills/maintain/SKILL.md): after every change,
+check whether the shipped skills in `src/respec/shipped/` and this README still
+describe the program.
 
 Two environment variables are advanced/testing overrides, not everyday options:
 `RESPEC_USER_HOME` relocates the home that target folders such as

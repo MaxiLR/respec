@@ -1,5 +1,5 @@
 ---
-name: install-respec
+name: install
 description: Install respec from this repository checkout so the `respec` command works from any directory, by adding a shell alias to ~/.bashrc (and ~/.zshrc for zsh users). Use it when asked to install, set up or uninstall respec on this machine.
 ---
 
