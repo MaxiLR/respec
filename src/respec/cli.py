@@ -18,7 +18,7 @@ from respec import sources
 from respec import switch, targets, trees, unknown
 from respec import restore as restore_backups
 from respec.errors import RespecError
-from respec.state import load_state
+from respec.state import StateInvalid, load_state
 
 app = typer.Typer(
     help="Switchable global profiles of agent skills. Without a command, opens the TUI.",
@@ -659,7 +659,11 @@ def recover(
     """Finish (or roll back) a change that was interrupted part way."""
     homes = _homes(ctx)
     try:
-        report = journal.recover(homes.respec_home, homes.user_home, rollback)
+        try:
+            report = journal.recover(homes.respec_home, homes.user_home, rollback)
+        except StateInvalid:
+            # Unreadable state.json (for example after a power loss).
+            report = journal.rebuild_state(homes.respec_home, homes.user_home)
         active = load_state(homes.respec_home).active_profile
     except RespecError as error:
         if as_json:

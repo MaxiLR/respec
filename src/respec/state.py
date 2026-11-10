@@ -124,8 +124,16 @@ def state_path(respec_home: Path) -> Path:
     return respec_home / STATE_FILE
 
 
+class StateInvalid(RespecError):
+    """``state.json`` cannot be read (for example empty after a power loss)."""
+
+
 def _invalid(path: Path, problem: str) -> RespecError:
-    return RespecError(f"invalid state file {path}: {problem}")
+    return StateInvalid(
+        f"invalid state file {path}: {problem}\nRun 'respec recover' to rebuild "
+        "it from what is on disk (the damaged file is kept in a backup run and "
+        "nothing is deleted)."
+    )
 
 
 def load_state(respec_home: Path) -> State:
@@ -166,11 +174,14 @@ def save_state(respec_home: Path, state: State, durable: bool = False) -> None:
     """Write state atomically (a temporary file, then a rename), so a crash or
     kill never leaves a truncated file.
 
-    ``durable`` also flushes the file and its folder to disk (``F_FULLFSYNC``
-    on macOS), so the write survives a power loss. That is slow, so only the
-    journal's boundaries ask for it (a change beginning, changing phase or
-    ending, see :mod:`respec.journal`); the per-item saves in between rely on
-    the rename alone, and recovery never needs more than the last of them.
+    The temporary file is always flushed (``fsync``) before the rename, so
+    a power loss cannot expose an empty file. ``durable`` also flushes to the
+    drive itself (``F_FULLFSYNC`` on macOS) and flushes the folder, so the
+    write itself survives a power loss. That is slow, so only the journal's
+    boundaries ask for it (a change beginning, changing phase or ending, see
+    :mod:`respec.journal`). After a power loss the per-item saves in between
+    may be lost, back to the last boundary; a file that still cannot be read
+    is rebuilt by ``respec recover`` (:func:`respec.journal.rebuild_state`).
     """
     path = state_path(respec_home)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -179,7 +190,10 @@ def save_state(respec_home: Path, state: State, durable: bool = False) -> None:
     if durable:
         write_durably(temporary, text)
     else:
-        temporary.write_text(text, "utf-8")
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
     os.replace(temporary, path)
     if durable:
         sync_folder(path.parent)

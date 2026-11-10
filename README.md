@@ -186,10 +186,26 @@ update), and otherwise keeps it and refuses that skill until it is moved out
 of the way. A journal that
 respec does not recognise, or that is malformed, is only dropped by
 `respec recover --rollback`. `state.json` and `profile.yaml` are written to a
-temporary file and renamed, so a kill never leaves either half written. Each
-`profile.yaml` write and the journal's boundaries (a change beginning, changing
-phase and ending) are also flushed to disk (`F_FULLFSYNC` on macOS); the
-per-skill records in between are not, which keeps a switch fast.
+temporary file, flushed and renamed, so a kill never leaves either half
+written. Each `profile.yaml` write and the journal's boundaries (a change
+beginning, changing phase and ending) are also flushed to the drive itself
+(`F_FULLFSYNC` on macOS); the per-skill records in between are not, which
+keeps a switch fast.
+
+After a power loss:
+
+- `state.json` may have lost the per-skill records written since the last
+  boundary. The journal is still there and the next command recovers it as
+  above; links respec made but no longer records show up as unknown entries
+  (`respec status`), to resolve with `respec adopt` or `respec use <profile>
+--unknown remove`, which back them up first.
+- If `state.json` cannot be read at all, every command stops and names
+  `respec recover`. That moves the damaged file to a new backup run and
+  rebuilds the record from disk: respec owns again the target folders that
+  hold its links and records those links as its own; no profile is active,
+  and everything else in those folders is an unknown entry. Nothing is
+  deleted. It reports this as an `interrupted-operation` warning with
+  `operation` `state` and `outcome` `rebuilt`.
 
 ### TUI
 
@@ -282,8 +298,10 @@ Every `--json` output that is an object uses one vocabulary:
     gives `profile`, `layer`, `skills` and `fix`.
   - `interrupted-operation`: a change that was cut short (see
     [Interrupted changes](#interrupted-changes)); also gives `operation`
-    (`use`, `restore`, `adopt`, `links`, `update`, `add` or `install`),
+    (`use`, `restore`, `adopt`, `links`, `update`, `add`, `install`, or `state`
+    for a rebuilt `state.json`),
     `outcome` (`finished` or `rolled-back` when this command recovered it,
+    `rebuilt` when `respec recover` rebuilt an unreadable `state.json`,
     `pending` when it still waits), `set_aside` (paths moved to a backup
     run) and `profile` when it concerns one. `respec recover --json` gives
     `active_profile`, `recovered` (whether there was anything to recover)

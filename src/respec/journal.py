@@ -76,11 +76,20 @@ from typing import Any
 
 from respec import trees
 from respec.errors import RespecError
-from respec.state import Installed, State, load_state, save_state, state_path
+from respec.state import (
+    STATE_FILE,
+    Installed,
+    Owned,
+    State,
+    load_state,
+    save_state,
+    state_path,
+)
 
 OPERATIONS = ("use", "restore", "adopt", "links", "update", "add", "install")
 WARNING = "interrupted-operation"
 FINISHED = "finished"
+REBUILT = "rebuilt"
 ROLLED_BACK = "rolled-back"
 PENDING = "pending"
 # Phases after which a failure leaves the change for recovery to finish.
@@ -201,7 +210,7 @@ class Recovery:
     """What :func:`recover` did, or (``outcome`` pending) what waits for it."""
 
     operation: str
-    outcome: str  # FINISHED, ROLLED_BACK or PENDING
+    outcome: str  # FINISHED, ROLLED_BACK, REBUILT or PENDING
     message: str
     profile: str | None = None
     set_aside: list[str] = field(default_factory=list)
@@ -688,6 +697,72 @@ def _discard(respec_home: Path, journal: dict[str, Any], why: str) -> Recovery:
     return report
 
 
+def rebuild_state(respec_home: Path, user_home: Path) -> Recovery:
+    """Replace a ``state.json`` that cannot be read (empty or cut off after a
+    power loss) with a record rebuilt from disk. Nothing is deleted.
+
+    The damaged file goes to a fresh backup run. respec owns again every
+    target folder that holds a link into its own folders (profiles, global or
+    shipped skills), and records those links as its own; everything else in
+    those folders (copies included) becomes an unknown entry for
+    ``respec adopt`` or ``respec use --unknown``. No profile is active.
+    """
+    from respec import global_skills, switch, targets
+
+    run = switch.new_backup_run(respec_home, switch.utc_now())
+    kept = run / STATE_FILE
+    shutil.move(str(state_path(respec_home)), str(kept))
+    roots = global_skills.source_roots(respec_home)
+    state = State()
+    owned_folders: set[Path] = set()
+    recorded: set[Path] = set()
+    moment = _now()
+    for target, spec in targets.registry().items():
+        folder = spec.skills_dir(user_home)
+        if not folder.is_dir():
+            continue
+        links = [
+            entry
+            for entry in sorted(folder.iterdir(), key=lambda e: e.name)
+            if entry.is_symlink()
+            and any(
+                entry.resolve() == root or root in entry.resolve().parents
+                for root in roots
+            )
+        ]
+        if not links and folder.resolve() not in owned_folders:
+            continue
+        owned_folders.add(folder.resolve())
+        state.owned[target] = Owned(
+            skills_dir=str(folder), backup=None, taken_over_at=moment
+        )
+        for entry in links:
+            key = trees.real(entry)
+            if key not in recorded:
+                recorded.add(key)
+                state.installed.append(
+                    Installed(target, entry.name, str(entry), "symlink")
+                )
+    save_state(respec_home, state, durable=True)
+    report = Recovery(
+        operation="state",
+        outcome=REBUILT,
+        message=(
+            f"Rebuilt state.json from disk; the damaged file is kept at {kept}. "
+            f"respec owns the {len(state.owned)} target folders that hold its "
+            f"links and recorded {len(state.installed)} links as its own. No "
+            "profile is active: run 'respec use <profile>'. Anything else in "
+            "those folders (copies included) is an unknown entry: 'respec "
+            "adopt' or 'respec use <profile> --unknown remove' backs it up. "
+            "Takeover backups stay in the backups folder ('respec restore "
+            "--list')."
+        ),
+        set_aside=[str(kept)],
+    )
+    _policy.reports.append(report)
+    return report
+
+
 Handler = Callable[[Path, Path, dict[str, Any], bool], tuple[str, str]]
 
 
@@ -738,8 +813,8 @@ def _recover_use(
         try:
             _activate(respec_home, user_home, name)
         except RespecError as error:
-            first = str(error).splitlines()[0]
-            tried.append(f"profile {name!r} could not be activated: {first}")
+            detail = str(error).replace("\n", "\n    ")
+            tried.append(f"profile {name!r} could not be activated: {detail}")
             continue
         if name == profile:
             return FINISHED, f"Finished {what}." + _because(tried)
@@ -886,7 +961,7 @@ def _recover_update(
     folders are still the ones it recorded. Once ``profile.yaml`` holds the new
     commits (it differs from the digest taken at the start) the update is
     finished; before that it is rolled back."""
-    from respec import profiles
+    from respec import adopt, profiles
 
     name = journal["profile"]
     profile = profiles.load_profile(respec_home, name)
@@ -927,9 +1002,24 @@ def _recover_update(
             os.replace(old, live)
         if os.path.lexists(incoming):
             _delete(incoming)  # fetched by this run (an older one was removed)
-    for dropping in skills_dir.glob(".*.dropping"):
-        if dropping.is_dir() and not dropping.is_symlink():
-            _delete(dropping)  # a .old verified redundant before its delete
+    ours_dropping = {Path(path) for path in journal.get("dropping", [])}
+    for dropping in sorted(skills_dir.glob(".*.dropping")):
+        if not dropping.is_dir() or dropping.is_symlink():
+            continue
+        if dropping in ours_dropping:
+            _delete(dropping)  # this run verified it redundant before the delete
+            continue
+        skill = dropping.name[1 : -len(".dropping")]
+        live = skills_dir / skill
+        if (os.path.lexists(live) and trees.same_content(dropping, live)) or (
+            adopt._backed_up(respec_home, name, skill, dropping)
+        ):
+            _delete(dropping)  # its content is held elsewhere
+        else:
+            notes.append(
+                f"left {dropping} in place: no update recorded it and its "
+                "content is held nowhere else, so it may be the only copy"
+            )
     notes += _old_leftovers(skills_dir)
     _reapply(respec_home, user_home, name)
     tail = "".join(f"\n  {note}" for note in notes)

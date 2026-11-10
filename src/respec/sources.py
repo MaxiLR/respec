@@ -695,6 +695,7 @@ def _update(
         for name in _sourced(profile, item):
             source = skills[name].source
             assert source is not None
+            _put_back_old(profile, name)
             row: dict[str, object] = {"skill": name, "current": source.commit}
             result.skills.append(row)
             try:
@@ -708,7 +709,6 @@ def _update(
             if latest == source.commit:
                 row["result"] = "up-to-date"
                 continue
-            _put_back_old(profile, name)
             if _modified(profile, name) and not overwrite_edits(name):
                 row["result"] = "skipped-local-edits"
                 continue
@@ -755,8 +755,12 @@ def _replace(
     incoming = skills_dir / f".{item}.incoming"
     old = skills_dir / f".{item}.old"
     dropping = skills_dir / f".{item}.dropping"
-    if dropping.is_dir() and not dropping.is_symlink():
-        shutil.rmtree(dropping)  # a redundant .old whose delete was cut short
+    if (
+        dropping.is_dir()
+        and not dropping.is_symlink()
+        and _redundant(respec_home, profile, item, dropping, live)
+    ):
+        shutil.rmtree(dropping)  # its content is held elsewhere
     if os.path.lexists(old):
         _settle_foreign_old(respec_home, profile, item, live, old)
     shutil.rmtree(incoming, ignore_errors=True)  # fetched files only
@@ -797,6 +801,18 @@ def _put_back_old(profile: profiles.Profile, item: str) -> None:
         os.replace(old, live)
 
 
+def _redundant(
+    respec_home: Path, profile: profiles.Profile, item: str, folder: Path, live: Path
+) -> bool:
+    """Whether ``folder``'s content is verifiably held by the live skill folder
+    or by a backup run (fix-6's test for leftovers)."""
+    from respec import adopt
+
+    return (os.path.lexists(live) and trees.same_content(folder, live)) or (
+        adopt._backed_up(respec_home, profile.name, item, folder)
+    )
+
+
 def _settle_foreign_old(
     respec_home: Path, profile: profiles.Profile, item: str, live: Path, old: Path
 ) -> None:
@@ -805,18 +821,15 @@ def _settle_foreign_old(
     put back when the live folder is gone, dropped when its content is
     verifiably held by the live folder or a backup run, otherwise kept and the
     skill is refused, as it may hold the only copy of something."""
-    from respec import adopt
-
     if old.is_dir() and not old.is_symlink():
         if not os.path.lexists(live):
             os.replace(old, live)
             return
-        if trees.same_content(old, live) or adopt._backed_up(
-            respec_home, profile.name, item, old
-        ):
+        if _redundant(respec_home, profile, item, old, live):
             # Renamed before the delete: a kill part way leaves a .dropping
             # folder, verified redundant already, which the next update removes.
             dropping = old.with_name(f".{item}.dropping")
+            journal.note(respec_home, "dropping", str(dropping))
             os.replace(old, dropping)
             shutil.rmtree(dropping)
             return

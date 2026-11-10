@@ -150,6 +150,11 @@ listed in `set_aside`).
 - `respec recover`: finish the interrupted change now.
 - `respec recover --rollback`: undo it instead where possible (a switch
   activates the previous profile again).
+- If every command fails with "invalid state file" (for example after a power
+  loss), run `respec recover`: it keeps the damaged `state.json` in a backup
+  and rebuilds it from disk (`operation` `state`, `outcome` `rebuilt`). No
+  profile is active afterwards; entries it cannot recognise as respec's are
+  unknown entries. Nothing is deleted.
 
 The first `respec use` that touches a folder backs up its full contents to
 `~/.respec/backups/<timestamp>/<target>/` before taking it over. Folders respec

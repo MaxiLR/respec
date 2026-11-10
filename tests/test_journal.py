@@ -974,7 +974,8 @@ def test_a_switch_flushes_to_disk_a_fixed_number_of_times(run, monkeypatch, tmp_
     many = full_flushes_of_a_switch(run, monkeypatch, tmp_path, 20)
 
     assert many == few
-    assert many <= 8, many
+    # The begin, the phase change and the end of the switch are flushed.
+    assert 3 <= many <= 8, many
 
 
 def test_remove_from_another_profile_killed_names_no_active_links(
@@ -993,3 +994,41 @@ def test_remove_from_another_profile_killed_names_no_active_links(
     assert "not the active profile" in warning["message"]
     assert not (respec_home / "profiles" / "spare" / "skills" / "lint").exists()
     assert_consistent(respec_home, {"work": ["tdd"]})
+
+
+# --- review 4 ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("damage", ["", '{"version": 1, "own'])
+def test_an_empty_or_corrupt_state_file_is_rebuilt_by_recover(
+    run, isolated_homes, damage
+):
+    """After a power loss state.json may be empty or cut off. Every command
+    then points at 'respec recover', which keeps the damaged file in a backup
+    and rebuilds the record from what is on disk; nothing is deleted."""
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    two_profiles(respec_home, home)
+    assert run("use", "a").exit_code == 0
+    claude = home / ".claude" / "skills"
+    before = entries(claude)
+    (respec_home / "state.json").write_text(damage)
+
+    blocked = run("status")
+    assert blocked.exit_code == 1
+    assert "respec recover" in blocked.output
+
+    data = payload(run("recover", "--json"))
+
+    (warning,) = interrupted_warnings(data)
+    assert warning["operation"] == "state"
+    assert warning["outcome"] == "rebuilt"
+    kept = list((respec_home / "backups").glob("*/state.json"))
+    assert len(kept) == 1 and kept[0].read_text() == damage
+    assert entries(claude) == before  # nothing deleted
+    state = load_state(respec_home)
+    assert state.active_profile is None
+    # respec's own links are recognised again; the user's entry stays unknown.
+    assert {i.name for i in state.installed} >= set(PROFILES["a"])
+    assert [e.name for e in unknown.find_unknown(respec_home, state)] == ["mine"]
+    assert run("use", "b").exit_code == 0
+    assert_consistent(respec_home, {"b": PROFILES["b"]}, extra=MINE)

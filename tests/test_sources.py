@@ -1936,3 +1936,40 @@ def test_update_puts_back_an_old_copy_whose_skill_folder_is_gone(
 
     assert (skills / "up" / "SKILL.md").read_text() == "# up v2\n"
     assert not (skills / ".up.old").exists()
+
+
+# --- review 4 ------------------------------------------------------------------
+
+
+def test_recovery_keeps_a_dropping_folder_no_update_recorded(
+    run, at_v1_with_v2_upstream, isolated_homes, monkeypatch
+):
+    from respec import sources
+
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    foreign = skills / ".notes.dropping"
+    foreign.mkdir()
+    (foreign / "keep.md").write_text("only copy\n")
+    _crash(
+        monkeypatch,
+        1,  # update:begin
+        lambda: sources.update(isolated_homes.respec_home, isolated_homes.home, "work"),
+    )
+
+    warning = _recovered(run)
+
+    assert (foreign / "keep.md").read_text() == "only copy\n"
+    assert str(foreign) in warning["message"]
+
+
+def test_update_puts_back_an_old_copy_also_when_up_to_date(
+    run, at_v1_with_v2_upstream, isolated_homes
+):
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    ok(run("update", "-p", "work"))  # now at v2, up to date
+    (skills / "up").rename(skills / ".up.old")
+
+    ok(run("update", "-p", "work"))
+
+    assert (skills / "up" / "SKILL.md").read_text() == "# up v2\n"
+    assert not (skills / ".up.old").exists()
