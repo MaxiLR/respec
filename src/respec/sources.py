@@ -754,17 +754,11 @@ def _replace(
     incoming = skills_dir / f".{item}.incoming"
     old = skills_dir / f".{item}.old"
     if os.path.lexists(old):
-        # Not this run's: the next respec command settles its own leftovers
-        # first (respec.journal), so this may hold the only copy of something.
-        raise RespecError(
-            f"{old} is left from an interrupted change and may hold the only "
-            "copy of earlier content; move it out of the way first. "
-            f"{item!r} was not updated."
-        )
+        _settle_foreign_old(respec_home, profile, item, live, old)
     shutil.rmtree(incoming, ignore_errors=True)  # fetched files only
     # Journaled before anything is made, with the identity of the live folder,
     # so recovery puts back only what this run moved (see respec.journal).
-    swap = {"skill": item, "live": trees.digest(live)}
+    swap = {"skill": item, "live": trees.digest(live), "old": str(old)}
     journal.note(respec_home, "swaps", swap)
     with checkout(repo_url(source.repo), source.ref, source.repo) as (tree, commit):
         upstream = inside(tree, source.path)
@@ -788,6 +782,33 @@ def _replace(
     replaced.append((live, old))
     journal.checkpoint("swapped-in")
     return dataclasses.replace(source, commit=commit, digest=fetched_digest(live))
+
+
+def _settle_foreign_old(
+    respec_home: Path, profile: profiles.Profile, item: str, live: Path, old: Path
+) -> None:
+    """A ``.<skill>.old`` that no running update made (the journal settles its
+    own first), handled by the same rules as adopt's staging folders (fix-6):
+    put back when the live folder is gone, dropped when its content is
+    verifiably held by the live folder or a backup run, otherwise kept and the
+    skill is refused, as it may hold the only copy of something."""
+    from respec import adopt
+
+    if old.is_dir() and not old.is_symlink():
+        if not os.path.lexists(live):
+            os.replace(old, live)
+            return
+        if trees.same_content(old, live) or adopt._backed_up(
+            respec_home, profile.name, item, old
+        ):
+            shutil.rmtree(old)
+            return
+    raise RespecError(
+        f"{old} is left from an interrupted change and its content is neither "
+        "in the live folder nor in a backup, so it may hold the only copy of "
+        f"earlier content; move it out of the way first. {item!r} was not "
+        "updated."
+    )
 
 
 def _restore(profile: profiles.Profile, replaced: list[tuple[Path, Path]]) -> None:

@@ -44,6 +44,11 @@ from __future__ import annotations
 
 import json
 import os
+
+try:
+    import fcntl
+except ImportError:  # not on Windows
+    fcntl = None  # type: ignore[assignment]
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -174,7 +179,20 @@ def write_durably(path: Path, text: str) -> None:
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(text)
         handle.flush()
-        os.fsync(handle.fileno())
+        _flush_to_disk(handle.fileno())
+
+
+def _flush_to_disk(descriptor: int) -> None:
+    """``fsync``; on macOS ``F_FULLFSYNC``, which also flushes the drive's
+    cache (plain ``fsync`` does not there)."""
+    full = getattr(fcntl, "F_FULLFSYNC", None) if fcntl is not None else None
+    if full is not None:
+        try:
+            fcntl.fcntl(descriptor, full)
+            return
+        except OSError:
+            pass  # not supported by this file system
+    os.fsync(descriptor)
 
 
 def sync_folder(folder: Path) -> None:
@@ -184,7 +202,7 @@ def sync_folder(folder: Path) -> None:
     except OSError:
         return
     try:
-        os.fsync(descriptor)
+        _flush_to_disk(descriptor)
     except OSError:
         pass
     finally:

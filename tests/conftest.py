@@ -126,8 +126,10 @@ def assert_no_nulls():
 
 # Runs the CLI in a child process that SIGKILLs itself at a step boundary:
 # ``point`` is a checkpoint name (killed at its ``nth`` pass), ``#`` (killed at
-# the ``nth`` checkpoint of any name) or ``after-save-profile`` (killed right
-# after the ``nth`` profile.yaml write). Nothing in the child handles the kill.
+# the ``nth`` checkpoint of any name), ``after-save-profile`` (killed right
+# after the ``nth`` profile.yaml write) or ``rmtree-old`` (killed after
+# deleting ``nth`` files of the first ``.old`` folder it removes). Nothing in
+# the child handles the kill.
 KILL_SCRIPT = """
 import os, signal, sys
 from respec import global_skills, journal, profiles
@@ -153,6 +155,22 @@ if point == "after-save-profile":
         if len(saved) == nth:
             die()
     profiles.save_profile = save
+if point == "rmtree-old":
+    import shutil
+    real_rmtree = shutil.rmtree
+    def rmtree(path, *args, **kwargs):
+        if str(path).endswith(".old") and os.path.isdir(path):
+            # Delete part of it, then die, as a kill mid-delete would.
+            files = sorted(
+                os.path.join(root, name)
+                for root, _, names in os.walk(path)
+                for name in names
+            )
+            for file in files[:nth]:
+                os.unlink(file)
+            die()
+        return real_rmtree(path, *args, **kwargs)
+    shutil.rmtree = rmtree
 from respec.cli import app
 app(sys.argv[3:])
 """

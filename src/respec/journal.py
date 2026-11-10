@@ -42,16 +42,22 @@ How each operation is recovered, after the step in flight is settled:
   put in line with its ``profile.yaml``. Staging folders are settled by
   :func:`respec.adopt._clean_leftovers` (fix-6); those of the overwrite in
   flight that it keeps are set aside.
-- ``update``: rolled back until ``profile.yaml`` differs from the digest taken
-  at the start, finished after. Only the skills journaled under ``swaps`` are
-  touched, and only while their ``.old`` folder still has the recorded digest;
-  any other ``.old`` folder is kept and reported.
+  A local add journals the folder it makes (``created``; dropped unless
+  ``profile.yaml`` lists it), a remove the skill whose folder goes
+  (``removing``; deleted once ``profile.yaml`` no longer lists it).
+- ``update``: rolled back while ``profile.yaml`` still has the digest taken
+  at the start (also after an in-process undo in a late phase), finished
+  once it differs. Only the skills journaled under ``swaps`` are touched: a
+  rollback puts back their ``.old`` only while it has the recorded digest; a
+  finished update deletes its own ``.old`` whatever is left of it. Any other
+  ``.old`` folder is kept and reported.
 - ``add``: rolled back in ``copy`` (only the skill folders journaled under
   ``created``, which did not exist before, are removed), finished in
   ``refresh``.
 - ``install``: kept when its ``profile.yaml`` was written (the last step),
   otherwise the half-copied profile folder is removed (fetched content only).
-- An unknown ``operation`` is only discarded by ``recover(rollback=True)``.
+- An unknown ``operation`` or a malformed journal is only discarded, by
+  ``recover(rollback=True)``.
 
 Tests inject failures at every step boundary through :func:`checkpoint`.
 """
@@ -607,22 +613,9 @@ def recover(
         if not rollback:
             raise RespecError(
                 f"could not recover {what}: respec does not know this kind of "
-                "change. 'respec recover --rollback' discards the journal; the "
-                "records in state.json are kept as they are, and Sync checks "
-                "the folders."
+                f"change. {_DISCARD_HINT}"
             )
-        _clear(respec_home)
-        report = Recovery(
-            operation=str(journal.get("operation")),
-            outcome=ROLLED_BACK,
-            message=(
-                f"Discarded the journal of {what}, which respec does not know; "
-                "the records in state.json are kept. Run Sync (or 'respec "
-                "status') to check the folders."
-            ),
-        )
-        _policy.reports.append(report)
-        return report
+        return _discard(respec_home, journal, "which respec does not know")
     try:
         notes = _settle_pending(respec_home, journal, aside)
         journal = load_state(respec_home).journal or journal
@@ -635,10 +628,12 @@ def recover(
         outcome, message = handler(respec_home, user_home, journal, rollback)
         _clear(respec_home)
     except (KeyError, TypeError, ValueError) as error:
+        if rollback:
+            _local.recovering = False
+            return _discard(respec_home, journal, f"which is malformed ({error!r})")
         raise RespecError(
             f"could not recover {what}: its journal in state.json is malformed "
-            f"({error!r}). It stays recorded; fix it, or remove the journal "
-            "entry from state.json by hand and run Sync."
+            f"({error!r}). It stays recorded. {_DISCARD_HINT}"
         ) from None
     except RespecError as error:
         raise RespecError(
@@ -660,6 +655,29 @@ def recover(
         message=message,
         profile=journal.get("profile"),
         set_aside=aside.moved,
+    )
+    _policy.reports.append(report)
+    return report
+
+
+_DISCARD_HINT = (
+    "'respec recover --rollback' discards the journal: the records of "
+    "state.json are kept as they are, and Sync (or 'respec status') checks the "
+    "folders afterwards."
+)
+
+
+def _discard(respec_home: Path, journal: dict[str, Any], why: str) -> Recovery:
+    """Drop a journal that cannot be recovered; the records stay as they are."""
+    _clear(respec_home)
+    report = Recovery(
+        operation=str(journal.get("operation")),
+        outcome=ROLLED_BACK,
+        message=(
+            f"Discarded the journal of {describe(journal)}, {why}; the records "
+            "in state.json are kept. Run Sync (or 'respec status') to check "
+            "the folders."
+        ),
     )
     _policy.reports.append(report)
     return report
@@ -784,6 +802,16 @@ def _recover_links(
                 "hold the only copy of earlier content"
                 for kept in adopt._clean_leftovers(respec_home, profile)
             ]
+    if profile is not None:
+        folders = profile.path / profiles.SKILLS_DIR
+        for skill in journal.get("created", []):
+            # A local add: its copy goes unless profile.yaml lists it.
+            if skill not in profile.skills and os.path.lexists(folders / skill):
+                _delete(folders / skill)  # a copy; its source is untouched
+        for skill in journal.get("removing", []):
+            # A remove: the folder goes once profile.yaml no longer lists it.
+            if skill not in profile.skills and os.path.lexists(folders / skill):
+                _delete(folders / skill)
     unchanged = (
         profile is not None
         and "profile_digest" in journal
@@ -849,10 +877,12 @@ def _recover_update(
     profile = profiles.load_profile(respec_home, name)
     skills_dir = profile.path / profiles.SKILLS_DIR
     yaml_file = profile.path / profiles.PROFILE_FILE
-    committed = journal.get("phase") == "refresh" or (
-        "profile_digest" in journal
-        and journal["profile_digest"] != file_digest(yaml_file)
-    )
+    # profile.yaml decides: an in-process undo may have put the old one back
+    # after the refresh phase began.
+    if "profile_digest" in journal:
+        committed = journal["profile_digest"] != file_digest(yaml_file)
+    else:
+        committed = journal.get("phase") == "refresh"
     swaps = {swap["skill"]: swap["live"] for swap in journal.get("swaps", [])}
     fetched = {entry["skill"]: entry["digest"] for entry in journal.get("fetched", [])}
     aside = _local.aside
@@ -862,8 +892,16 @@ def _recover_update(
         old = skills_dir / f".{skill}.old"
         incoming = skills_dir / f".{skill}.incoming"
         ours = old.is_dir() and not old.is_symlink() and _digest_or_none(old) == before
-        if ours and committed:
-            _delete(old)  # the previous files; profile.yaml records the new
+        if committed and old.is_dir() and not old.is_symlink():
+            # This run's own .old: an update starts only when there is none,
+            # and the journal kept every other writer out since. It holds the
+            # previous files, which profile.yaml no longer records.
+            _delete(old)
+            if not ours:
+                notes.append(
+                    f"removed the rest of {old}: this update's previous files "
+                    f"of {skill!r}, whose removal the interruption had cut short"
+                )
         elif ours:
             if os.path.lexists(live):
                 if fetched.get(skill) and _digest_or_none(live) == fetched[skill]:

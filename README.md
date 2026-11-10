@@ -151,9 +151,11 @@ install`. If respec is killed or crashes part way, the journal stays behind:
   - An adopt keeps every choice it completed; the entry in flight is finished
     once its copy was whole and otherwise left as it was (then it reports
     `rolled-back`).
-  - An edit of the active profile or a layer repair is finished when
-    `profile.yaml` was already saved, and rolled back when it was not; the
-    links then match `profile.yaml` either way.
+  - An edit of the active profile, a layer repair, a local `add` and a
+    `remove` are finished when `profile.yaml` was already saved, and rolled
+    back when it was not; the links then match `profile.yaml` either way. A
+    local `add` that is rolled back drops its copy (the source folder is never
+    touched); a finished `remove` deletes the skill folder it was removing.
   - An `update` or git `add` is rolled back until `profile.yaml` records the
     new skills and finished after. A rollback only touches what that run
     made: the skills it swapped (when the folders are still the ones it
@@ -163,8 +165,7 @@ install`. If respec is killed or crashes part way, the journal stays behind:
 - `respec recover` does the same on its own; `respec recover --rollback`
   undoes the change instead where that is still possible (a switch activates
   the previous profile again; a restore that already removed skills, and the
-  choices adopt completed, cannot be undone). A journal respec does not
-  recognise is only dropped by `respec recover --rollback`.
+  choices adopt completed, cannot be undone).
 - While a restore waits, `respec restore` finishes that same restore and
   refuses another backup.
 - In the TUI, Sync shows the interrupted change with Finish and Roll back;
@@ -174,15 +175,16 @@ install`. If respec is killed or crashes part way, the journal stays behind:
 Nothing is lost on the way: an entry a step left half made (a copy cut short,
 or a staging folder of an adopt overwrite) is moved to a fresh backup run and
 reported under `set_aside`, unless it is verifiably what that step was making,
-in which case it is recorded. A `.<skill>.old` folder that no journaled
-`update` made is never used to replace a skill: it is kept, reported, and
-`update` refuses that skill until it is moved out of the way. `state.json` and
-`profile.yaml` are written to a temporary file, flushed to disk and renamed.
-
-Known limit: `respec remove` deletes the skill folder after the profile is
-refreshed. If it is interrupted at that point, the folder stays in the profile
-without being listed in `profile.yaml`, and `respec add` of the same name
-refuses until it is moved away (its content is kept).
+in which case it is recorded. An `update` that already saved `profile.yaml`
+removes its own `.<skill>.old` (the previous files), also when the
+interruption had deleted it part way. A `.<skill>.old` that no journaled
+`update` made is never used to replace a skill: like adopt's staging folders,
+it is put back when the skill folder is gone, removed when its content is
+verifiably in the skill folder or a backup run, and otherwise kept, with
+`update` refusing that skill until it is moved out of the way. A journal that
+respec does not recognise, or that is malformed, is only dropped by
+`respec recover --rollback`. `state.json` and `profile.yaml` are written to a
+temporary file, flushed to disk (`F_FULLFSYNC` on macOS) and renamed.
 
 ### TUI
 

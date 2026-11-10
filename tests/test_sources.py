@@ -1824,3 +1824,84 @@ def test_add_from_git_killed_at_every_step_keeps_a_hand_placed_folder(
         skills = respec_home / "profiles" / "work" / "skills"
         assert {p.name for p in skills.iterdir()} == listed | {"up"}, index
     assert index > 2
+
+
+# --- review 2 ------------------------------------------------------------------
+
+
+@pytest.fixture
+def at_v1_with_v2_upstream(run, upstream, isolated_homes):
+    """Active 'work' with sourced 'up' (several files) at v1; v2 upstream."""
+    repo = upstream("acme/skills")
+    repo.write("skills/up/SKILL.md", "# up v1\n")
+    for number in range(6):
+        repo.write(f"skills/up/part{number}.md", f"v1 part {number}\n")
+    repo.first = repo.commit()
+    new_profile(run)
+    ok(run("add", "acme/skills#skills/up", "-p", "work"))
+    ok(run("use", "work"))
+    repo.write("skills/up/SKILL.md", "# up v2\n")
+    repo.second = repo.commit()
+    return repo
+
+
+def test_update_killed_while_dropping_its_old_copy_settles_it(
+    run, killed, at_v1_with_v2_upstream, isolated_homes
+):
+    repo = at_v1_with_v2_upstream
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    assert killed("rmtree-old", 3, "update", "-p", "work")
+    assert (skills / ".up.old").is_dir()  # cut part way through the delete
+
+    warning = _recovered(run)
+
+    assert warning["outcome"] == "finished"
+    assert "not from this update" not in warning["message"]
+    assert not (skills / ".up.old").exists()
+    assert (skills / "up" / "SKILL.md").read_text() == "# up v2\n"
+    repo.write("skills/up/SKILL.md", "# up v3\n")
+    repo.commit()
+    ok(run("update", "-p", "work"))
+    assert (skills / "up" / "SKILL.md").read_text() == "# up v3\n"
+
+
+def test_update_interrupted_at_refresh_and_undone_in_process_says_rolled_back(
+    run, at_v1_with_v2_upstream, isolated_homes, monkeypatch
+):
+    """Ctrl-C at phase:refresh: _update's own handler puts v1 back, so the
+    recovery must not claim the new commits were kept."""
+    from respec import journal, sources
+
+    calls: list[str] = []
+
+    def fault(name):
+        calls.append(name)
+        if name == "phase:refresh":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(journal, "_fault", fault)
+    with pytest.raises(KeyboardInterrupt):
+        sources.update(isolated_homes.respec_home, isolated_homes.home, "work")
+    monkeypatch.setattr(journal, "_fault", lambda name: None)
+
+    warning = _recovered(run)
+
+    assert warning["outcome"] == "rolled-back"
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    assert (skills / "up" / "SKILL.md").read_text() == "# up v1\n"
+    commit = read_yaml(isolated_homes.respec_home / "profiles", "work")
+    assert commit["skills"]["up"]["source"]["commit"] == at_v1_with_v2_upstream.first
+
+
+def test_a_foreign_old_copy_that_is_verifiably_redundant_does_not_block_update(
+    run, at_v1_with_v2_upstream, isolated_homes
+):
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    import shutil
+
+    shutil.copytree(skills / "up", skills / ".up.old")  # same as the live folder
+
+    ok(run("update", "-p", "work"))
+
+    assert (skills / "up" / "SKILL.md").read_text() == "# up v2\n"
+    assert not (skills / ".up.old").exists()

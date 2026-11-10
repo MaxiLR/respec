@@ -882,3 +882,60 @@ def test_an_unknown_journal_can_be_discarded_with_rollback(run, isolated_homes):
     assert interrupted_warnings(data)[0]["outcome"] == "rolled-back"
     assert load_state(respec_home).journal is None
     assert payload(run("status", "--json"))["warnings"] == []
+
+
+# --- review 2 ------------------------------------------------------------------
+
+
+def test_a_journal_without_its_profile_can_be_discarded_with_rollback(
+    run, isolated_homes
+):
+    from respec.state import State, save_state
+
+    respec_home = isolated_homes.respec_home
+    save_state(respec_home, State(journal={"operation": "update", "started_at": "x"}))
+
+    refused = run("recover", "--json")
+    assert refused.exit_code == 1
+    assert "--rollback" in json.loads(refused.stdout)["error"]
+
+    data = payload(run("recover", "--rollback", "--json"))
+
+    assert interrupted_warnings(data)[0]["outcome"] == "rolled-back"
+    assert load_state(respec_home).journal is None
+
+
+def test_remove_killed_after_saving_profile_yaml_is_finished(
+    run, killed, isolated_homes
+):
+    respec_home = isolated_homes.respec_home
+    make_profile(respec_home, "work", ["claude-code"], ["tdd", "lint"])
+    assert run("use", "work").exit_code == 0
+
+    assert killed("after-save-profile", 1, "remove", "lint")
+    data = payload(run("status", "--json"))
+    assert interrupted_warnings(data)[0]["outcome"] == "pending"
+    data = payload(run("recover", "--json"))
+
+    assert interrupted_warnings(data)[0]["outcome"] == "finished"
+    assert not (respec_home / "profiles" / "work" / "skills" / "lint").exists()
+    assert_consistent(respec_home, {"work": ["tdd"]})
+
+
+def test_local_add_killed_mid_copy_leaves_no_partial_copy(
+    run, killed, isolated_homes, tmp_path
+):
+    respec_home = isolated_homes.respec_home
+    make_profile(respec_home, "work", ["claude-code"], ["tdd"])
+    assert run("use", "work").exit_code == 0
+    source = tmp_path / "src" / "fresh"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("fresh\n")
+
+    assert killed("note:created", 1, "add", str(source))
+    data = payload(run("recover", "--json"))
+
+    assert interrupted_warnings(data)[0]["outcome"] == "rolled-back"
+    assert not (respec_home / "profiles" / "work" / "skills" / "fresh").exists()
+    assert (source / "SKILL.md").read_text() == "fresh\n"
+    assert run("add", str(source)).exit_code == 0

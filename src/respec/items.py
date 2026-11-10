@@ -199,12 +199,13 @@ def commit(
 
 @contextlib.contextmanager
 def journaled(
-    respec_home: Path, profile: profiles.Profile, active: bool
+    respec_home: Path, profile: profiles.Profile, active: bool, **fields: object
 ) -> Iterator[None]:
-    """Journal an edit of the active profile with its refresh, from before
+    """Journal an edit of a profile with its refresh, from before
     ``profile.yaml`` is saved, so a crash in between is put in line by the next
-    command (see :mod:`respec.journal`). Other profiles' edits only write
-    ``profile.yaml``."""
+    command (see :mod:`respec.journal`). With ``active`` false (an edit of
+    another profile that only writes ``profile.yaml``) nothing is journaled.
+    ``fields`` go into the journal (``removing``: a skill whose folder goes)."""
     if not active:
         yield
         return
@@ -213,6 +214,7 @@ def journaled(
         "links",
         profile=profile.name,
         profile_digest=journal.file_digest(profile.path / profiles.PROFILE_FILE),
+        **fields,
     ):
         yield
 
@@ -227,18 +229,24 @@ def add(
     journal.ready(respec_home, user_home)
     name = resolve_profile_name(respec_home, profile_name)
     before = profiles.load_profile(respec_home, name)
-    profile = add_local(respec_home, name, source)
-    item = next(skill for skill in profile.skills if skill not in before.skills)
-    folder = _skill_folder(profile, item)
-    change = SkillChange(
-        profile=name, skill=item, action="add", enabled=True, path=str(folder)
-    )
+    # Journaled from before the copy (whatever profile it goes to): a crash
+    # leaves no half copy or unrefreshed profile behind (respec.journal).
+    with journaled(respec_home, before, True):
+        target = _skill_folder(before, user_path(source).resolve().name)
+        if not os.path.lexists(target):
+            journal.note(respec_home, "created", target.name)
+        profile = add_local(respec_home, name, source)
+        item = next(skill for skill in profile.skills if skill not in before.skills)
+        folder = _skill_folder(profile, item)
+        change = SkillChange(
+            profile=name, skill=item, action="add", enabled=True, path=str(folder)
+        )
 
-    def undo() -> None:
-        profiles.restore_profile(before)
-        shutil.rmtree(folder, ignore_errors=True)
+        def undo() -> None:
+            profiles.restore_profile(before)
+            shutil.rmtree(folder, ignore_errors=True)
 
-    _refresh(respec_home, user_home, change, undo)
+        _refresh(respec_home, user_home, change, undo)
     return change
 
 
@@ -305,17 +313,26 @@ def remove(
         )
         for name, layer in profile.layers.items()
     }
-    profiles.save_profile(dataclasses.replace(profile, skills=skills, layers=layers))
-    try:
-        _refresh(
-            respec_home, user_home, change, lambda: profiles.restore_profile(profile)
+    # Journaled from before profile.yaml is saved, naming the folder that goes:
+    # recovery deletes it once profile.yaml no longer lists the skill.
+    with journaled(respec_home, profile, True, removing=[item]):
+        profiles.save_profile(
+            dataclasses.replace(profile, skills=skills, layers=layers)
         )
-    except switch.SwitchBlocked:
-        raise
-    except RespecError:
-        # The item is gone from profile.yaml; any links still recorded in
-        # state.json are removed by the next switch, so delete the folder too.
+        journal.checkpoint("profile-saved")
+        try:
+            _refresh(
+                respec_home,
+                user_home,
+                change,
+                lambda: profiles.restore_profile(profile),
+            )
+        except switch.SwitchBlocked:
+            raise
+        except RespecError:
+            # The item is gone from profile.yaml; any links still recorded in
+            # state.json are removed by the next switch, so delete the folder.
+            shutil.rmtree(folder, ignore_errors=True)
+            raise
         shutil.rmtree(folder, ignore_errors=True)
-        raise
-    shutil.rmtree(folder, ignore_errors=True)
     return change
