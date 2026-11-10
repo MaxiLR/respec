@@ -130,7 +130,9 @@ def assert_no_nulls():
 # Runs the CLI in a child process that SIGKILLs itself at a step boundary:
 # ``point`` is a checkpoint name (killed at its ``nth`` pass), ``#`` (killed at
 # the ``nth`` checkpoint of any name), ``after-save-profile`` (killed right
-# after the ``nth`` profile.yaml write) or ``rmtree-old`` (killed after
+# after the ``nth`` profile.yaml write), ``before-source-file`` (killed after
+# the ``nth`` profile.yaml write, before its SOURCE.md is written) or
+# ``rmtree-old`` (killed after
 # deleting ``nth`` files of the first ``.old`` (or ``.dropping``) folder it
 # removes). Nothing in
 # the child handles the kill.
@@ -159,6 +161,15 @@ if point == "after-save-profile":
         if len(saved) == nth:
             die()
     profiles.save_profile = save
+if point == "before-source-file":
+    real_source_file = profiles._write_source_file
+    written = []
+    def source_file(profile):
+        written.append(profile)
+        if len(written) == nth:
+            die()
+        real_source_file(profile)
+    profiles._write_source_file = source_file
 if point == "rmtree-old":
     import shutil
     real_rmtree = shutil.rmtree

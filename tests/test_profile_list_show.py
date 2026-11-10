@@ -130,6 +130,7 @@ def test_show_json_includes_resolved_target_dirs_and_skills(
             {
                 "name": "tdd",
                 "enabled": True,
+                "provenance": "own-source",
                 "source": {
                     "repo": "example/skills",
                     "path": "skills/tdd",
@@ -137,7 +138,7 @@ def test_show_json_includes_resolved_target_dirs_and_skills(
                     "commit": "0123abcd",
                 },
             },
-            {"name": "notes", "enabled": False},
+            {"name": "notes", "enabled": False, "provenance": "original"},
         ],
     }
 

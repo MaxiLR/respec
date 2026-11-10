@@ -29,8 +29,8 @@ respec use work
   `respec restore` puts it back.
 - **Nothing is lost silently:** skills respec did not install are reported, and
   you choose to add them to a profile or remove them (with a backup).
-- **Skills from git:** add skills from a repository, check for newer commits
-  and update on request.
+- **Skills from a folder or git:** add skills from a local folder or a
+  repository, check them against that source and update on request.
 - **Layers:** group a profile's skills; an exclusive layer keeps at most one of
   its skills enabled.
 - **Terminal UI:** switch, edit and check profiles with the keyboard or mouse.
@@ -126,6 +126,7 @@ export RESPEC_USER_HOME="$(mktemp -d)"
 | **Layer**         | A named group of skills inside a profile. An exclusive layer keeps at most one enabled.                                                          |
 | **Shipped skill** | `respec` and `profile-maker`, installed into every target whenever a profile is active so any agent can manage profiles.                         |
 | **Global skill**  | A skill of yours listed in `~/.respec/config.yaml`; it survives every switch.                                                                    |
+| **Source**        | Where a profile or a skill was copied from: a folder or a git repository. respec reads it and never writes to it.                                |
 
 Skills are installed as symlinks into the profile, or as copies where
 symlinking fails. respec records every path it creates and never removes
@@ -138,14 +139,15 @@ anything it did not record.
 | `respec` / `respec tui`                    | Open the terminal UI.                                           |
 | `respec profile new <name> -t <target>`    | Create an empty profile.                                        |
 | `respec profile list` / `show <name>`      | Inspect profiles.                                               |
-| `respec profile install owner/repo[#path]` | Copy a whole profile from a repository once.                    |
+| `respec profile install <folder or repo>`  | Copy a whole profile and remember where it came from.           |
+| `respec profile diff <name>`               | Show how a profile differs from its source; changes nothing.    |
 | `respec profile remove <name>`             | Move a profile that is not active to a backup.                  |
 | `respec use <profile>`                     | Switch to a profile.                                            |
 | `respec status`                            | Show the active profile, its targets and the skills per folder. |
 | `respec add <folder or owner/repo[#path]>` | Add a skill and enable it.                                      |
 | `respec enable` / `disable <skill>`        | Turn a skill on or off, keeping its files.                      |
 | `respec remove <skill>`                    | Remove a skill from a profile and delete its files.             |
-| `respec update [--check] [<skill>]`        | Check for, or apply, newer commits of skills added from git.    |
+| `respec update [--check] [<skill>]`        | Check for, or apply, updates from a skill's folder or git repo. |
 | `respec layer ...`                         | Group skills into layers (`respec layer --help`).               |
 | `respec adopt`                             | Resolve unknown entries: add or remove each.                    |
 | `respec restore [<backup>]`                | Put a backup back and release every folder.                     |
@@ -180,6 +182,16 @@ target:
   skills when you ask.
 - `profile-maker`: a guided interview that builds a profile.
 
+respec keeps its own copy of every skill and never writes to a skill's source.
+An agent asked to edit a global skill first looks up where it came from:
+`respec profile show <name> --json` (and `respec status --json`) give each
+skill's `provenance` and `source`. A skill with a source is edited there and
+brought in with `respec update <skill> -p <profile>`; only a skill that is original to the
+copy is edited under `~/.respec/profiles/`. The shipped `respec` skill states
+this rule, and a generated `SOURCE.md` in each profile's folder repeats it per
+skill. See
+[Finding a skill's true source](docs/reference.md#finding-a-skills-true-source).
+
 Every command's `--json` output uses one vocabulary (`resolved`, `unresolved`,
 `backups`, `warnings`, `error`), described in the
 [reference](docs/reference.md#json-output).
@@ -189,6 +201,7 @@ Every command's `--json` output uses one vocabulary (`resolved`, `unresolved`,
 The [reference](docs/reference.md) covers every command in detail:
 
 - [Skills from git](docs/reference.md#skills-from-git)
+- [Finding a skill's true source](docs/reference.md#finding-a-skills-true-source)
 - [Shipped and global skills](docs/reference.md#shipped-and-global-skills)
 - [Unknown entries](docs/reference.md#unknown-entries)
 - [Undo](docs/reference.md#undo)

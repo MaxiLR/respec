@@ -246,8 +246,9 @@ def test_add_of_existing_item_name_adds_none_of_the_skills(
 
 
 @pytest.fixture
-def sourced(run, upstream, tmp_path):
-    """Profile 'work' with sourced items 'tdd' and 'lint' and a local item."""
+def sourced(run, upstream, tmp_path, profiles_root):
+    """Profile 'work' with sourced items 'tdd' and 'lint' and an item without
+    a source (as profiles written before folders were recorded have)."""
     repo = upstream("acme/skills")
     repo.write("tdd/SKILL.md", "# tdd v1\n")
     repo.write("lint/SKILL.md", "# lint v1\n")
@@ -259,6 +260,9 @@ def sourced(run, upstream, tmp_path):
     ok(run("add", "acme/skills#tdd", "-p", "work"))
     ok(run("add", "acme/skills#lint", "-p", "work"))
     ok(run("add", str(local), "-p", "work"))
+    data = read_yaml(profiles_root, "work")
+    del data["skills"]["mine"]["source"]
+    (profiles_root / "work" / "profile.yaml").write_text(yaml.safe_dump(data))
     repo.first = first
     return repo
 
@@ -529,7 +533,7 @@ def test_profile_install_copies_whole_profile(
     folder = profiles_root / "modpack"
     data = read_yaml(profiles_root, "modpack")
     assert data["targets"] == ["claude-code", "agents"]
-    assert data["skills"]["house"] == {"enabled": False}
+    assert data["skills"]["house"]["enabled"] is False
     assert data["skills"]["tdd"]["source"]["repo"] == "acme/skills"
     assert (folder / "skills" / "house" / "SKILL.md").read_text() == "# house\n"
     assert not (folder / ".git").exists()
@@ -553,16 +557,17 @@ def test_profile_install_counts_one_skill_in_the_singular(run, upstream):
     assert "(1 skill)" in result.stdout
 
 
-def test_profile_install_with_name_and_then_owned_locally(
+def test_profile_install_with_name_and_then_updated_from_both_sources(
     run, upstream, skills_repo, profiles_root
 ):
     pack = make_modpack(upstream, skills_repo)
     ok(run("profile", "install", pack.url, "--name", "mine"))
 
-    # Later changes to the modpack never reach the installed profile...
+    # A skill without a source of its own follows the modpack...
     pack.write("skills/house/SKILL.md", "# house v2\n")
+    pack.write("skills/tdd/SKILL.md", "# tdd from the modpack\n")
     pack.commit()
-    # ...but its items keep their own sources and update from those.
+    # ...and a skill that carries its own source keeps updating from that.
     skills_repo.write("tdd/SKILL.md", "# tdd v2\n")
     skills_repo.commit()
     rows = {
@@ -571,14 +576,16 @@ def test_profile_install_with_name_and_then_owned_locally(
             ok(run("update", "--check", "-p", "mine", "--json")).output
         )["skills"]
     }
-    assert set(rows) == {"tdd"}
+    assert set(rows) == {"tdd", "house"}
     assert rows["tdd"]["update_available"] is True
+    assert rows["house"]["update_available"] is True
+    assert rows["house"]["modified"] is False
 
     ok(run("update", "-p", "mine", "--yes"))
 
     folder = profiles_root / "mine" / "skills"
     assert (folder / "tdd" / "SKILL.md").read_text() == "# tdd v2\n"
-    assert (folder / "house" / "SKILL.md").read_text() == "# house\n"
+    assert (folder / "house" / "SKILL.md").read_text() == "# house v2\n"
 
 
 def test_profile_install_refuses_existing_profile(run, upstream, skills_repo):

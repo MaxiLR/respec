@@ -1,18 +1,27 @@
 """Profiles: self-contained folders under ``<respec home>/profiles/<name>/``.
 
-Each profile folder holds ``profile.yaml`` and a ``skills/`` directory. The
-schema of ``profile.yaml``::
+Each profile folder holds ``profile.yaml`` and a ``skills/`` directory, plus a
+generated ``SOURCE.md`` (see :mod:`respec.provenance`). The schema of
+``profile.yaml``::
 
     targets: [claude-code, agents]   # at least one known target, no repeats
+    source:                          # optional; where 'profile install' got
+      folder: /abs/profile           # the profile: a folder (absolute path),
+                                     # or repo, path, ref and commit as below
     skills:                          # optional; mapping of skill name to entry
       my-skill:
         enabled: true                # required boolean
-        source:                      # optional origin record
-          repo: owner/repo           # required within source
+        source:                      # optional origin record: git ...
+          repo: owner/repo           # required within a git source
           path: skills/my-skill      # optional
           ref: main                  # optional
           commit: 0123abcd           # optional resolved commit
           digest: sha256:...         # optional hash of the files as fetched
+      other-skill:
+        enabled: true
+        source:                      # ... or a local folder, which is only read
+          folder: /abs/other-skill   # absolute path; never with the git keys
+          digest: sha256:...         # optional hash of the files as copied
     layers:                          # optional; named groups of skills
       design-principles:             # built-in: only skills and active allowed
         skills: [my-skill]
@@ -42,19 +51,23 @@ from typing import Any
 
 import yaml
 
+from respec import lock
 from respec.errors import RespecError
 from respec.state import sync_folder, write_durably
 from respec.targets import known_names, registry
 
 PROFILE_FILE = "profile.yaml"
+# Generated beside profile.yaml on every save; see :mod:`respec.provenance`.
+SOURCE_FILE = "SOURCE.md"
 SKILLS_DIR = "skills"
 # ``\Z``, not ``$``: ``$`` also matches before a trailing newline.
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 NAME_RULE = "use letters, digits, '.', '_' or '-', starting with a letter or digit"
 
-TOP_LEVEL_KEYS = ("targets", "skills", "layers")
+TOP_LEVEL_KEYS = ("targets", "source", "skills", "layers")
 SKILL_KEYS = ("enabled", "source")
-SOURCE_KEYS = ("repo", "path", "ref", "commit", "digest")
+SOURCE_KEYS = ("repo", "path", "ref", "commit", "digest", "folder")
+GIT_SOURCE_KEYS = ("repo", "path", "ref", "commit")
 LAYER_SKILLS_KEY = "skills"
 LEGACY_LAYER_SKILLS_KEY = "items"
 LAYER_KEYS = ("exclusive", "description", "skills", "active", "items")
@@ -80,7 +93,7 @@ BUILTIN_LAYERS: dict[str, str] = {
 class ProfileError(RespecError):
     """``profile.yaml`` is missing, unreadable or does not match the schema."""
 
-    def __init__(self, path: Path, problems: list[str]):
+    def __init__(self, path: Path | str, problems: list[str]):
         self.path = path
         self.problems = problems
         lines = "\n".join(f"  - {problem}" for problem in problems)
@@ -89,11 +102,15 @@ class ProfileError(RespecError):
 
 @dataclass(frozen=True)
 class Source:
-    repo: str
+    """Where a skill came from: a git repository (``repo``) or a local folder
+    (``folder``, an absolute path that respec only ever reads)."""
+
+    repo: str | None = None
     path: str | None = None
     ref: str | None = None
     commit: str | None = None
     digest: str | None = None
+    folder: str | None = None
 
     def to_dict(self) -> dict[str, str]:
         return {key: value for key, value in vars(self).items() if value is not None}
@@ -145,16 +162,18 @@ class Profile:
     targets: list[str]
     skills: dict[str, SkillEntry] = field(default_factory=dict)
     layers: dict[str, Layer] = field(default_factory=builtin_layers)
+    # Where the profile was installed from; respec only ever reads it.
+    source: Source | None = None
     # The exact text this profile was loaded from, for byte-exact rollback.
     # ``init=False``: ``dataclasses.replace`` never copies it, so an edited
     # copy of a loaded profile cannot roll back to the original's bytes.
     loaded_text: str | None = field(default=None, init=False, compare=False, repr=False)
 
     def to_yaml_data(self) -> dict[str, Any]:
-        data: dict[str, Any] = {
-            "targets": list(self.targets),
-            "skills": {name: entry.to_dict() for name, entry in self.skills.items()},
-        }
+        data: dict[str, Any] = {"targets": list(self.targets)}
+        if self.source is not None:
+            data["source"] = self.source.to_dict()
+        data["skills"] = {name: entry.to_dict() for name, entry in self.skills.items()}
         layers = {
             name: layer.to_dict()
             for name, layer in self.layers.items()
@@ -361,6 +380,8 @@ def source_value_problem(key: str, value: str) -> str | None:
         return f"source {key} {value!r} must not contain control characters"
     if key == "repo":
         return _repo_problem(value)
+    if key == "folder" and not os.path.isabs(value):
+        return f"source folder {value!r} must be an absolute path"
     if key == "path" and (
         value.startswith("/")
         or "\\" in value
@@ -390,6 +411,15 @@ def _parse_source(where: str, raw: Any, problems: list[str]) -> Source | None:
             problems.append(f"{where}.{key}: {problem}")
         else:
             values[key] = raw[key]
+    if raw.get("folder") is not None:
+        mixed = [key for key in GIT_SOURCE_KEYS if raw.get(key) is not None]
+        if mixed:
+            problems.append(
+                f"{where}.folder cannot be combined with {', '.join(mixed)}: "
+                "a source is either a git repository or a local folder"
+            )
+            return None
+        return Source(**values) if "folder" in values else None
     if "repo" not in raw:
         problems.append(f"{where}.repo is required (for example 'owner/repo')")
     if "repo" not in values:
@@ -558,8 +588,16 @@ def parse_profile(name: str, folder: Path, data: Any) -> Profile:
         raw_skills if isinstance(raw_skills, dict) else {},
         problems,
     )
+    source = None
+    if data.get("source") is not None:
+        source = _parse_source("source", data["source"], problems)
     profile = Profile(
-        name=name, path=folder, targets=targets, skills=skills, layers=layers
+        name=name,
+        path=folder,
+        targets=targets,
+        skills=skills,
+        layers=layers,
+        source=source,
     )
     if problems:
         raise ProfileError(file, problems)
@@ -570,7 +608,12 @@ def load_profile(respec_home: Path, name: str) -> Profile:
     """Read and validate a profile; its layer conflicts become warnings."""
     folder = existing_folder(respec_home, name)
     _touched[(folder, name)] = None
-    return _read_folder(name, folder)
+    profile = _read_folder(name, folder)
+    if lock.holds(respec_home):
+        # Loaded for a change (or a recovery): a SOURCE.md that an earlier
+        # save could not write, or was killed before writing, is put in line.
+        _refresh_source_file(profile)
+    return profile
 
 
 def existing_folder(respec_home: Path, name: str) -> Path:
@@ -648,6 +691,39 @@ def _write(profile: Profile, text: str) -> None:
     os.replace(temporary, file)
     sync_folder(file.parent)
     _touched[(profile.path, profile.name)] = None
+    _write_source_file(profile)
+
+
+def _write_source_file(profile: Profile) -> None:
+    """Write the generated ``SOURCE.md`` that tells agents where each skill
+    came from, as atomically as ``profile.yaml``. It is only a note: when it
+    cannot be written the profile change stands and the next save tries again.
+    """
+    from respec import provenance  # imports this module
+
+    file = profile.path / SOURCE_FILE
+    temporary = file.with_name(f".{SOURCE_FILE}.tmp")
+    try:
+        write_durably(temporary, provenance.source_file(profile))
+        os.replace(temporary, file)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _refresh_source_file(profile: Profile) -> None:
+    """Write ``SOURCE.md`` again when it does not say what ``profile.yaml``
+    gives now; otherwise nothing is written."""
+    from respec import provenance  # imports this module
+
+    try:
+        current = (profile.path / SOURCE_FILE).read_text("utf-8")
+    except (OSError, UnicodeDecodeError):
+        current = None
+    if current != provenance.source_file(profile):
+        _write_source_file(profile)
 
 
 def save_profile(profile: Profile) -> None:
