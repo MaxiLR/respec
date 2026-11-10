@@ -226,8 +226,8 @@ def test_takeover_of_a_folder_outside_the_profile_backs_it_up(run, respec_home, 
     assert (dirs["claude-code"] / "mine" / "SKILL.md").exists()
     assert open(os.path.join(backup, "mine", "SKILL.md")).read() == "mine\n"
     # The user's own skill stays and is reported, never blocking the switch.
-    warnings = json.loads(result.stdout)["warnings"]
-    assert [w["name"] for w in warnings] == ["mine"]
+    unresolved = json.loads(result.stdout)["unresolved"]
+    assert [entry["name"] for entry in unresolved] == ["mine"]
 
 
 def test_unknown_entry_where_a_shipped_skill_goes_is_resolved_first(
@@ -529,3 +529,73 @@ def test_restore_never_removes_folders_that_existed_before_takeover(
     assert run("restore").exit_code == 0
 
     assert dirs["agents"].is_dir() and names(dirs["agents"]) == []
+
+
+# Status marks shipped and global skills, as the TUI does.
+
+
+def test_status_json_says_where_each_installed_skill_comes_from(run, respec_home, dirs):
+    make_profile(respec_home, "a", ["agents"], ["tdd"])
+    make_global(respec_home, "notes")
+    assert run("use", "a").exit_code == 0
+
+    report = json.loads(run("status", "--json").stdout)
+
+    folders = {folder["target"]: folder for folder in report["folders"]}
+    origins = {s["name"]: s["origin"] for s in folders["agents"]["skills"]}
+    assert origins == {
+        "notes": "global",
+        "profile-maker": "shipped",
+        "respec": "shipped",
+        "tdd": "profile",
+    }
+
+
+def test_status_text_marks_shipped_and_global_skills(run, respec_home, dirs):
+    make_profile(respec_home, "a", ["agents"], ["tdd"])
+    make_global(respec_home, "notes")
+    assert run("use", "a").exit_code == 0
+
+    lines = run("status").stdout.splitlines()
+
+    agents = lines.index(next(line for line in lines if line.startswith("agents")))
+    block = lines[agents + 1 : agents + 5]
+    by_name = {line.split()[0]: line for line in block}
+    assert by_name["respec"].rstrip().endswith("shipped")
+    assert by_name["notes"].rstrip().endswith("global")
+    assert by_name["tdd"].split() == ["tdd", "symlink"]
+
+
+# A user's own entry with a reserved name at the very first takeover.
+
+
+def test_first_takeover_says_an_entry_clashes_with_a_shipped_skill(
+    run, respec_home, dirs
+):
+    make_profile(respec_home, "cc", ["claude-code"], ["tdd"])
+    own = dirs["agents"] / "respec"
+    own.mkdir(parents=True)
+    (own / "SKILL.md").write_text("# my own respec notes\n")
+
+    result = run("use", "cc")
+
+    assert result.exit_code == 1
+    assert str(own) in result.output
+    assert "respec ships a skill named 'respec'" in result.output
+    assert (own / "SKILL.md").read_text() == "# my own respec notes\n"
+
+
+def test_first_takeover_says_an_entry_clashes_with_a_global_skill(
+    run, respec_home, dirs
+):
+    make_profile(respec_home, "cc", ["claude-code"], ["tdd"])
+    make_global(respec_home, "notes")
+    own = dirs["claude-code"] / "notes"
+    own.mkdir(parents=True)
+    (own / "SKILL.md").write_text("# mine\n")
+
+    result = run("use", "cc")
+
+    assert result.exit_code == 1
+    assert "'notes' is a global skill listed in" in result.output
+    assert "config.yaml" in result.output

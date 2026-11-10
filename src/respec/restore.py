@@ -369,8 +369,13 @@ def _apply(
 ) -> None:
     """Every change a restore makes to disk and ``state.json``, in order."""
     if overwritten:
-        result.set_aside = adopt.resolve(
-            respec_home, overwritten, lambda entry: "remove", None, now=now
+        adopt.resolve(
+            respec_home,
+            overwritten,
+            lambda entry: "remove",
+            None,
+            now=now,
+            done=result.set_aside,
         )
     state = load_state(respec_home)
     state.active_profile = None
@@ -405,8 +410,13 @@ def restore(
     on_unknown: switch.UnknownHandler | None = None,
     overwrite: bool = False,
     now: switch.Clock = switch.utc_now,
+    progress: RestoreResult | None = None,
 ) -> RestoreResult:
-    """Restore ``backup`` (default: each folder's takeover backup) and release."""
+    """Restore ``backup`` (default: each folder's takeover backup) and release.
+
+    Given ``progress``, that result is filled in as the restore goes and
+    returned, so a caller can report what was done when it fails part way.
+    """
     state = load_state(respec_home)
     if backup is None and not state.owned:
         raise RespecError(
@@ -423,7 +433,9 @@ def restore(
         found, left = _conflicts(respec_home, state, plans)
     if found and not overwrite:
         raise RestoreBlocked(found)
-    result = RestoreResult(backup=run.name if run is not None else None, left=left)
+    result = progress if progress is not None else RestoreResult(backup=None)
+    result.backup = run.name if run is not None else None
+    result.left = left
     result.skipped = [
         str(plan.source / name)
         for plan in plans

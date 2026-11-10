@@ -13,8 +13,8 @@ import click
 import typer
 
 from respec import adopt as adopt_entries
-from respec import items, layers, messages, paths, profiles, sources, switch, targets
-from respec import unknown
+from respec import global_skills, items, layers, messages, paths, profiles, sources
+from respec import switch, targets, unknown
 from respec import restore as restore_backups
 from respec.errors import RespecError
 from respec.state import load_state
@@ -96,14 +96,11 @@ def _fail(error: RespecError) -> NoReturn:
 def _print_json(data: Any) -> None:
     """Print ``data``; an object always carries one ``warnings`` list.
 
-    Every warning is an object with a ``type`` and a ``message``:
-
-    - ``layer-conflict``: an exclusive layer of a profile the command read has
-      several enabled skills, as the command left it (``profile``, ``layer``,
-      ``skills``, ``fix``);
-    - ``unknown-entry``: an entry respec did not place, or an edited or
-      replaced copy, in a folder it owns (``name``, ``path``, ``kind``,
-      ``targets``, ``replaced``), passed in by the command as ``warnings``.
+    Every warning is an object with a ``type`` and a ``message``. The one type
+    is ``layer-conflict``: an exclusive layer of a profile the command read
+    has several enabled skills, as the command left it (``profile``,
+    ``layer``, ``skills``, ``fix``). Unknown entries are not warnings: commands
+    list them under ``unresolved``.
     """
     if isinstance(data, dict):
         layer_conflicts = [
@@ -184,9 +181,6 @@ def profile_list(ctx: typer.Context, as_json: JsonOption = False) -> None:
         typer.echo(f"{entry['name']:<{width}}  {detail}")
 
 
-_source_label = messages.source_label
-
-
 @profile_app.command("show")
 def profile_show(
     ctx: typer.Context,
@@ -240,7 +234,7 @@ def profile_show(
     width = max(len(row["name"]) for row in skill_rows)
     for skill, entry in profile.skills.items():
         state = "enabled " if entry.enabled else "disabled"
-        origin = f"  {_source_label(entry.source)}" if entry.source else ""
+        origin = f"  {messages.source_label(entry.source)}" if entry.source else ""
         typer.echo(f"  {skill:<{width}}  {state}{origin}".rstrip())
 
 
@@ -249,15 +243,17 @@ def _interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
-def _prompt_choice(entry: unknown.Unknown, profile: str | None) -> str:
+def _prompt_choice(
+    respec_home: Path, entry: unknown.Unknown, profile: str | None
+) -> str:
     """Ask what to do with one unknown entry; ``add`` goes to ``profile``."""
     typer.echo(f"Unknown entry {switch.describe(entry)} in {', '.join(entry.targets)}")
-    available = adopt_entries.choices(profile, entry, paths.respec_home())
-    if profile is not None and available == ("remove",):
+    available = adopt_entries.choices(profile, entry, respec_home)
+    clash = global_skills.clash(respec_home, entry.name)
+    if clash is not None:
         question = (
-            f"  {entry.name!r} is the name of a skill respec ships or a global "
-            "skill, so it cannot be added; remove: back up and remove (respec "
-            "links its own skill there again) [remove]"
+            f"  {clash}; remove: back up and remove (respec links its own skill "
+            "there again) [remove]"
         )
     elif profile is None:
         question = (
@@ -282,28 +278,30 @@ def _report_resolution(resolution: adopt_entries.Resolution) -> None:
     typer.echo(resolution.describe())
 
 
-def _warn_unresolved(homes: Homes) -> list[dict[str, Any]]:
-    """Report unknown entries on stderr; return them as JSON warnings."""
+def _unresolved(
+    homes: Homes, also: list[unknown.Unknown] | None = None, warn: bool = True
+) -> list[dict[str, Any]]:
+    """Unknown entries left in owned folders (plus ``also``, entries that
+    blocked the command elsewhere), as JSON ``unresolved``. With ``warn``, each
+    one in an owned folder is also reported on stderr."""
     try:
         entries = adopt_entries.unresolved(homes.respec_home)
     except RespecError:
-        return []
-    warnings: list[dict[str, Any]] = []
-    for entry in entries:
+        entries = []
+    for entry in entries if warn else []:
         what = (
             f"is an edited or replaced copy of skill {entry.name!r}"
             if entry.replaced
             else f"is a {entry.kind} respec did not place"
         )
-        message = (
-            f"{entry.path} {what}; run 'respec adopt' to add it to the active "
-            "profile or remove it"
+        typer.echo(
+            f"warning: {entry.path} {what}; run 'respec adopt' to add it to the "
+            "active profile or remove it",
+            err=True,
         )
-        typer.echo(f"warning: {message}", err=True)
-        warnings.append(
-            {"type": "unknown-entry", **entry.to_dict(), "message": message}
-        )
-    return warnings
+    listed = {entry.path for entry in entries}
+    entries += [entry for entry in also or [] if entry.path not in listed]
+    return [entry.to_dict() for entry in entries]
 
 
 # Ctrl-C or the end of input at a prompt (typer and click raise their own).
@@ -316,12 +314,20 @@ class UnknownChoice(str, Enum):
 
 
 def _fail_after(
-    resolutions: list[adopt_entries.Resolution], error: RespecError, as_json: bool
+    resolutions: list[adopt_entries.Resolution],
+    error: RespecError,
+    as_json: bool,
+    data: dict[str, Any],
 ) -> NoReturn:
-    """Fail, still reporting every resolution that was already applied."""
+    """Fail, still reporting every resolution that was already applied.
+
+    With ``--json``, ``data`` is the command's success payload as far as it
+    got, so a failure carries the same keys plus ``error``.
+    """
     if as_json:
         _print_json(
             {
+                **data,
                 "resolved": [resolution.to_dict() for resolution in resolutions],
                 "error": str(error),
             }
@@ -347,6 +353,8 @@ class _SwitchRun:
     errors: list[str] = field(default_factory=list)
     notices: list[str] = field(default_factory=list)
     prompt_cut: bool = False
+    # Unknown entries that refused the switch (also outside owned folders).
+    blocking: list[unknown.Unknown] = field(default_factory=list)
 
     def interrupted(self, what: str) -> None:
         self.prompt_cut = True
@@ -414,7 +422,7 @@ class _SwitchRun:
             typer.echo(f"error: {error}", err=True)
         for notice in self.notices:
             typer.echo(f"warning: {notice}", err=True)
-        warnings = _warn_unresolved(self.homes)
+        unresolved = _unresolved(self.homes, self.blocking)
         if as_json:
             data: dict[str, Any] = {
                 "active_profile": result.profile if result else None,
@@ -422,11 +430,11 @@ class _SwitchRun:
                 "backups": backups,
                 "removed": [item.path for item in result.removed] if result else [],
                 "installed": (
-                    [vars(item) for item in result.installed] if result else []
+                    [item.to_dict() for item in result.installed] if result else []
                 ),
                 "resolved": [resolution.to_dict() for resolution in self.resolutions],
                 "linked": self.linked,
-                "warnings": warnings,
+                "unresolved": unresolved,
             }
             if self.errors:
                 data["error"] = "\n".join(self.errors)
@@ -479,7 +487,9 @@ def use(
         policy = on_unknown.value
         decide = lambda entry: policy  # noqa: E731
     elif interactive:
-        decide = lambda entry: _prompt_choice(entry, previous)  # noqa: E731
+        decide = lambda entry: _prompt_choice(
+            homes.respec_home, entry, previous
+        )  # noqa: E731
 
     handler: switch.UnknownHandler | None = None
     if decide is not None:
@@ -497,6 +507,7 @@ def use(
     except PROMPT_ABORTED:
         run.interrupted(f"the switch to profile {name!r} did not happen")
     except switch.UnknownEntries as error:
+        run.blocking = error.entries
         run.errors.append(
             f"{error}\nOr pass "
             f"'--unknown {'|'.join(adopt_entries.choices(previous))}' "
@@ -508,7 +519,9 @@ def use(
         takeover = adopt_entries.takeover_profile(run.result)
         ask = decide if on_unknown is not None else None
         if ask is None:
-            ask = lambda entry: _prompt_choice(entry, takeover)  # noqa: E731
+            ask = lambda entry: _prompt_choice(
+                homes.respec_home, entry, takeover
+            )  # noqa: E731
         run.ask_about_takeover(ask)
     # Skills added to the profile active now (the one being left, when the
     # switch did not happen; the new one, for takeover entries) get linked.
@@ -532,7 +545,6 @@ def status(ctx: typer.Context, as_json: JsonOption = False) -> None:
     else:
         typer.echo(f"Active profile: {report['active_profile']}")
         typer.echo(f"Targets: {', '.join(report['targets'])}")
-    any_unknown = False
     for folder in report["folders"]:
         typer.echo(f"{folder['target']}  {folder['skills_dir']}")
         if folder["same_as"]:
@@ -541,12 +553,14 @@ def status(ctx: typer.Context, as_json: JsonOption = False) -> None:
         if not folder["skills"]:
             typer.echo("  (no managed skills)")
         for skill in folder["skills"]:
-            typer.echo(f"  {skill['name']}  {skill['mode']}")
-        for entry in folder["unknown"]:
-            any_unknown = True
+            origin = "" if skill["origin"] == "profile" else f"  {skill['origin']}"
+            typer.echo(f"  {skill['name']}  {skill['mode']}{origin}")
+        for entry in report["unresolved"]:
+            if entry["targets"][0] != folder["target"]:
+                continue
             replaced = ", replaced a managed skill" if entry["replaced"] else ""
             typer.echo(f"  {entry['name']}  unknown {entry['kind']}{replaced}")
-    if any_unknown:
+    if report["unresolved"]:
         typer.echo(
             "Unknown entries were not placed by respec. Resolve them with "
             "'respec adopt' (add to the active profile, or back up and remove)."
@@ -566,10 +580,10 @@ SkillArgument = Annotated[str, typer.Argument(help="Skill name.")]
 
 
 def _report_change(
-    change: items.SkillChange, as_json: bool, warnings: list[dict[str, Any]]
+    change: items.SkillChange, as_json: bool, unresolved: list[dict[str, Any]]
 ) -> None:
     if as_json:
-        _print_json({**change.to_dict(), "warnings": warnings})
+        _print_json({**change.to_dict(), "unresolved": unresolved})
         return
     for line in messages.skill_change(change):
         typer.echo(line)
@@ -615,18 +629,18 @@ def add(
             change = items.add(homes.respec_home, homes.user_home, local, profile)
     except RespecError as error:
         _fail(error)
-    warnings = _warn_unresolved(homes)
+    unresolved = _unresolved(homes)
     if from_git:
-        _report_sourced(sourced, as_json, warnings)
+        _report_sourced(sourced, as_json, unresolved)
     else:
-        _report_change(change, as_json, warnings)
+        _report_change(change, as_json, unresolved)
 
 
 def _report_sourced(
-    change: sources.SourceChange, as_json: bool, warnings: list[dict[str, Any]]
+    change: sources.SourceChange, as_json: bool, unresolved: list[dict[str, Any]]
 ) -> None:
     if as_json:
-        _print_json({**change.to_dict(), "warnings": warnings})
+        _print_json({**change.to_dict(), "unresolved": unresolved})
         return
     for line in messages.sourced_change(change):
         typer.echo(line)
@@ -645,7 +659,7 @@ def remove(
         change = items.remove(homes.respec_home, homes.user_home, skill, profile)
     except RespecError as error:
         _fail(error)
-    _report_change(change, as_json, _warn_unresolved(homes))
+    _report_change(change, as_json, _unresolved(homes))
 
 
 def _set_enabled(
@@ -658,7 +672,7 @@ def _set_enabled(
         )
     except RespecError as error:
         _fail(error)
-    _report_change(change, as_json, _warn_unresolved(homes))
+    _report_change(change, as_json, _unresolved(homes))
 
 
 @app.command("enable")
@@ -691,10 +705,10 @@ LayerArgument = Annotated[str, typer.Argument(help="Layer name.")]
 
 
 def _report_layer_change(
-    change: layers.LayerChange, as_json: bool, warnings: list[dict[str, Any]]
+    change: layers.LayerChange, as_json: bool, unresolved: list[dict[str, Any]]
 ) -> None:
     if as_json:
-        _print_json({**change.to_dict(), "warnings": warnings})
+        _print_json({**change.to_dict(), "unresolved": unresolved})
         return
     for line in messages.layer_change(change):
         typer.echo(line)
@@ -786,7 +800,7 @@ def layer_add(
         change = layers.add(homes.respec_home, name, exclusive, description, profile)
     except RespecError as error:
         _fail(error)
-    _report_layer_change(change, as_json, _warn_unresolved(homes))
+    _report_layer_change(change, as_json, _unresolved(homes))
 
 
 @layer_app.command("rm")
@@ -802,7 +816,7 @@ def layer_rm(
         change = layers.remove(homes.respec_home, name, profile)
     except RespecError as error:
         _fail(error)
-    _report_layer_change(change, as_json, _warn_unresolved(homes))
+    _report_layer_change(change, as_json, _unresolved(homes))
 
 
 def _layer_skill_command(ctx, function, name, skill, profile, as_json) -> None:
@@ -811,7 +825,7 @@ def _layer_skill_command(ctx, function, name, skill, profile, as_json) -> None:
         change = function(homes.respec_home, homes.user_home, name, skill, profile)
     except RespecError as error:
         _fail(error)
-    _report_layer_change(change, as_json, _warn_unresolved(homes))
+    _report_layer_change(change, as_json, _unresolved(homes))
 
 
 @layer_app.command("use")
@@ -856,7 +870,7 @@ def _layer_flag_command(ctx, function, name, value, profile, as_json) -> None:
         change = function(homes.respec_home, homes.user_home, name, value, profile)
     except RespecError as error:
         _fail(error)
-    _report_layer_change(change, as_json, _warn_unresolved(homes))
+    _report_layer_change(change, as_json, _unresolved(homes))
 
 
 @layer_app.command("enable")
@@ -945,7 +959,7 @@ def layer_repair(
         )
     except RespecError as error:
         _fail(error)
-    _report_layer_change(change, as_json, _warn_unresolved(homes))
+    _report_layer_change(change, as_json, _unresolved(homes))
 
 
 def _selector_matches(selector: str, entry: unknown.Unknown) -> bool:
@@ -1011,7 +1025,7 @@ def adopt(
                 return chosen[entry.path]
             if all_choice is not None:
                 return all_choice.value
-            return _prompt_choice(entry, active) if prompt else None
+            return _prompt_choice(homes.respec_home, entry, active) if prompt else None
 
         result = adopt_entries.adopt(
             homes.respec_home, homes.user_home, decide, done=done
@@ -1027,13 +1041,19 @@ def adopt(
         )
         return
     except RespecError as error:
-        _fail_after(done, error, as_json)
+        linked = error.linked if isinstance(error, switch.LinkFailed) else []
+        _fail_after(
+            done,
+            error,
+            as_json,
+            {"linked": linked, "unresolved": _unresolved(homes, warn=False)},
+        )
     if as_json:
         _print_json(
             {
                 "resolved": [r.to_dict() for r in result.resolved],
                 "linked": result.linked,
-                "unknown": [e.to_dict() for e in result.unknown],
+                "unresolved": [e.to_dict() for e in result.unknown],
             }
         )
         return
@@ -1110,7 +1130,9 @@ def restore(
         policy = on_unknown.value
         decide = lambda entry: policy  # noqa: E731
     elif interactive and not overwrite:
-        decide = lambda entry: _prompt_choice(entry, profile)  # noqa: E731
+        decide = lambda entry: _prompt_choice(
+            homes.respec_home, entry, profile
+        )  # noqa: E731
 
     handler: switch.UnknownHandler | None = None
     if decide is not None:
@@ -1121,6 +1143,7 @@ def restore(
                 homes.respec_home, entries, chosen, profile, done=resolutions
             )
 
+    progress = restore_backups.RestoreResult(backup=None)
     try:
         result = restore_backups.restore(
             homes.respec_home,
@@ -1128,26 +1151,30 @@ def restore(
             backup,
             on_unknown=handler,
             overwrite=overwrite,
+            progress=progress,
         )
     except PROMPT_ABORTED:
         _fail_after(
             resolutions,
             RespecError("interrupted; nothing was restored"),
             as_json,
+            _restore_payload(progress, _unresolved(homes, warn=False)),
         )
+    except restore_backups.RestoreBlocked as error:
+        blocking = [entry.to_dict() for entry in error.entries]
+        _fail_after(resolutions, error, as_json, _restore_payload(progress, blocking))
     except RespecError as error:
-        _fail_after(resolutions, error, as_json)
+        _fail_after(
+            resolutions,
+            error,
+            as_json,
+            _restore_payload(progress, _unresolved(homes, warn=False)),
+        )
     if as_json:
         _print_json(
             {
-                "backup": result.backup,
-                "restored": result.restored,
-                "removed": [item.path for item in result.removed],
-                "overwritten": [r.to_dict() for r in result.set_aside],
-                "unknown": [r.to_dict() for r in resolutions],
-                "released": result.released,
-                "skipped": result.skipped,
-                "left": result.left,
+                **_restore_payload(result, _unresolved(homes, warn=False)),
+                "resolved": [r.to_dict() for r in resolutions],
             }
         )
         return
@@ -1163,6 +1190,23 @@ def restore(
     for path in result.left:
         typer.echo(f"Left {path} in place: hidden, not in the backup")
     typer.echo("respec released its folders; no profile is active.")
+
+
+def _restore_payload(
+    result: restore_backups.RestoreResult, unresolved: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """What a restore did (or got to before it stopped), as JSON."""
+    data: dict[str, Any] = {"backup": result.backup} if result.backup else {}
+    return {
+        **data,
+        "restored": result.restored,
+        "removed": [item.path for item in result.removed],
+        "overwritten": [r.to_dict() for r in result.set_aside],
+        "released": result.released,
+        "skipped": result.skipped,
+        "left": result.left,
+        "unresolved": unresolved,
+    }
 
 
 @app.command("update")
@@ -1206,9 +1250,9 @@ def update(
     except RespecError as error:
         _fail(error)
     failed = any(row["result"] == "error" for row in result.skills)
-    warnings = _warn_unresolved(homes)
+    unresolved = _unresolved(homes)
     if as_json:
-        _print_json({**result.to_dict(), "warnings": warnings})
+        _print_json({**result.to_dict(), "unresolved": unresolved})
     else:
         if not result.skills:
             typer.echo(f"Profile {result.profile!r} has no skills with a source.")
@@ -1220,14 +1264,11 @@ def update(
         raise typer.Exit(code=1)
 
 
-_short = messages.short
-
-
 def _update_line(row: dict[str, Any]) -> str:
     name = row["skill"]
     outcome = row["result"]
     if outcome == "updated":
-        return f"{name}  updated {_short(row['current'])} -> {_short(row['latest'])}"
+        return f"{name}  updated {messages.short(row['current'])} -> {messages.short(row['latest'])}"
     if outcome == "up-to-date":
         return f"{name}  up to date"
     if outcome == "skipped-local-edits":
@@ -1252,9 +1293,7 @@ def _update_check(
             if row.error:
                 state = f"error: {row.error}"
             elif row.update_available:
-                state = (
-                    f"update available {_short(row.current)} -> {_short(row.latest)}"
-                )
+                state = f"update available {messages.short(row.current)} -> {messages.short(row.latest)}"
             else:
                 state = "up to date"
             typer.echo(f"{row.skill}  {state}{edits}")

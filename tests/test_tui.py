@@ -376,8 +376,7 @@ def test_status_panel_flags_unknown_and_adopt_key_removes_it(
     drive(isolated_homes, scenario)
 
     report = status_json(run)
-    claude = next(f for f in report["folders"] if f["target"] == "claude-code")
-    assert claude["unknown"] == []
+    assert report["unresolved"] == []
     assert not stray.exists()
     backups = list((respec_home / "backups").glob("*/claude-code/stray/SKILL.md"))
     assert [path.read_text() for path in backups] == ["foreign\n"]

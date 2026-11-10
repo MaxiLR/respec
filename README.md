@@ -88,7 +88,7 @@ removed before it is copied into a profile or a backup.
 
 Unknown entries block a command only when they sit exactly where it would
 install or remove a skill. Any other unknown entry is reported as a warning on
-stderr (and in a `warnings` list with `--json`) with a hint to run
+stderr (and in the `unresolved` list with `--json`) with a hint to run
 `respec adopt`; `status` lists them too. For a switch that is blocked, a
 terminal asks per entry; other runs stop unless
 `respec use <profile> --unknown add|remove` gives the choice. During a switch,
@@ -103,8 +103,8 @@ folder up as always and warn. Whatever was already done is always reported,
 with backup paths, also when a switch fails or is interrupted part way: choices
 already made are kept, not undone, and skills added to the profile that is
 still active are linked. That includes any folder the switch already took over
-and backed up: `respec use --json` always gives `backups`, `resolved`, `linked`
-and `warnings`, plus `error` when it failed. An add that replaces the profile's
+and backed up: `respec use --json` always gives `backups`, `resolved`,
+`linked`, `unresolved` and `warnings`, plus `error` when it failed. An add that replaces the profile's
 own copy of a skill says so and names the backup of the previous copy. If an
 earlier run was killed while replacing a copy, its hidden
 `.<skill>.respec-old`/`.respec-new` folder in the profile is removed only when
@@ -195,20 +195,40 @@ Turning a layer off (or on) in the active profile re-applies the profile once it
 has no conflicts left, so skills that a conflict kept out of the target folders
 are linked right away. A change that cannot be applied to the active profile is
 refused with `cannot refresh profile '<name>'` and leaves `profile.yaml` as it
-was.
+was. `respec layer repair` is the one exception: when the entries in the way
+belong only to skills the repair does not change (for example an edited copy
+of another skill), it still disables the skills, unlinks them and links the
+kept one, and leaves those entries for `respec adopt`. So a conflict and an
+edited copy never block each other's fix.
 
-Every `--json` output that is an object has one `warnings` list, empty when
-there is nothing to warn about. Each warning is an object with a `type` and a
-`message`:
+Every `--json` output that is an object uses one vocabulary:
 
-- `layer-conflict`: an exclusive layer has several enabled skills; it also
+- `resolved`: the unknown entries a command resolved, each with its `choice`
+  (`add` or `remove`), and the `profile` it went to or the `backup` it went to.
+- `unresolved`: unknown entries still waiting for a decision, each with
+  `name`, `path`, `kind` (`folder`, `file` or `symlink`), `targets` and
+  `replaced` (an edited or replaced copy of a skill respec installed). `use`,
+  `adopt`, `restore`, `status` and every command that changes skills or
+  layers (`add`, `remove`, `enable`, `disable`, `update` and the `layer`
+  changes) give it. A refused `use` or `restore` also lists the entries in its
+  way there, including ones outside the folders respec owns.
+- `backups`: the folders `use` took over, with their takeover backups.
+- `warnings`: always present, empty when there is nothing to warn about. Each
+  warning is an object with a `type` and a `message`; the one type is
+  `layer-conflict` (an exclusive layer has several enabled skills), which also
   gives `profile`, `layer`, `skills` and `fix`.
-- `unknown-entry`: an entry respec did not place (or an edited or replaced
-  copy) in a folder it owns; it also gives `name`, `path`, `kind` (`folder`,
-  `file` or `symlink`), `targets` and `replaced`. Commands that change skills,
-  layers or the active profile (`use`, `add`, `remove`, `enable`, `disable`,
-  `update` and the `layer` changes) report these; `status` and `adopt` list
-  unknown entries in their own `unknown` field instead.
+- `error`: present only when the command failed. `use`, `adopt` and
+  `restore` then print every other key of their success output too, filled
+  with what was done before the failure. Other commands print their error on
+  stderr only.
+
+A field that does not apply is left out rather than given as `null`: a linked
+skill has no `digest`, and `restore` gives `backup` only when a backup run was
+named. Where `null` remains it means "none": no `active_profile` or
+`previous_profile`, a `restored` folder that did not exist at takeover, a
+`same_as` of a folder that is its own. In `status`, each skill of a folder
+gives its `origin`: `profile`, `shipped` (respec's own skills) or `global`
+(from `config.yaml`).
 
 The same warnings are printed on stderr. `respec restore --list --json` prints a
 bare list of backups instead: it reads no profile, so it has nothing to warn

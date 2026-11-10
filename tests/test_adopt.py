@@ -57,7 +57,10 @@ def status_json(run):
 
 
 def folder_report(report, target):
-    return next(f for f in report["folders"] if f["target"] == target)
+    """A folder of ``respec status --json`` with the unresolved entries in it."""
+    folder = next(f for f in report["folders"] if f["target"] == target)
+    inside = [u for u in report["unresolved"] if u["targets"][0] == target]
+    return {**folder, "unknown": inside}
 
 
 def profile_skills(respec_home, name):
@@ -241,15 +244,17 @@ def test_unknown_entry_elsewhere_warns_but_does_not_block_a_switch(
     assert str(foreign) not in result.stdout
 
 
-def test_switch_json_lists_unknown_entries_as_warnings(run, activated, dirs):
+def test_switch_json_lists_unknown_entries_as_unresolved(run, activated, dirs):
     foreign = drop_skill(dirs["claude-code"], "foreign")
 
-    data = json.loads(ok(run("use", "b", "--json")).stdout)
+    result = ok(run("use", "b", "--json"))
 
-    [warning] = data["warnings"]
-    assert warning["path"] == str(foreign)
-    assert warning["replaced"] is False
-    assert "respec adopt" in warning["message"]
+    data = json.loads(result.stdout)
+    [entry] = data["unresolved"]
+    assert entry["path"] == str(foreign)
+    assert entry["replaced"] is False
+    assert data["warnings"] == []
+    assert "respec adopt" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -273,7 +278,7 @@ def test_unknown_entry_elsewhere_warns_but_does_not_block_profile_edits(
     assert str(foreign) in result.stderr and "respec adopt" in result.stderr
     assert "cannot" not in result.output and "--unknown" not in result.output
     data = json.loads(ok(run(*command, "--json")).stdout)
-    assert [w["path"] for w in data["warnings"]] == [str(foreign)]
+    assert [entry["path"] for entry in data["unresolved"]] == [str(foreign)]
 
 
 def test_add_and_remove_of_a_skill_warn_but_are_not_blocked(
@@ -294,7 +299,8 @@ def test_no_warning_without_unknown_entries(run, activated):
     result = ok(run("use", "b"))
 
     assert result.stderr == ""
-    assert json.loads(ok(run("use", "a", "--json")).stdout)["warnings"] == []
+    data = json.loads(ok(run("use", "a", "--json")).stdout)
+    assert data["warnings"] == [] and data["unresolved"] == []
 
 
 def test_entry_at_an_install_path_blocks_the_switch_and_changes_nothing(
@@ -647,7 +653,7 @@ def test_adopt_json_without_choices_lists_entries_and_changes_nothing(
     data = json.loads(ok(run("adopt", "--json")).stdout)
 
     assert data["resolved"] == []
-    assert [entry["path"] for entry in data["unknown"]] == [str(foreign)]
+    assert [entry["path"] for entry in data["unresolved"]] == [str(foreign)]
     assert (foreign / "SKILL.md").read_text() == "foreign\n"
 
 
@@ -663,7 +669,7 @@ def test_adopt_remove_flag_backs_up_and_removes_only_that_entry(
     assert resolved["name"] == "one" and resolved["choice"] == "remove"
     assert open(os.path.join(resolved["backup"], "SKILL.md")).read() == "one\n"
     assert not os.path.lexists(dirs["claude-code"] / "one")
-    assert [entry["path"] for entry in data["unknown"]] == [str(two)]
+    assert [entry["path"] for entry in data["unresolved"]] == [str(two)]
 
 
 def test_adopt_add_into_active_profile_links_it_at_once(
@@ -832,7 +838,7 @@ def test_adopt_add_json_while_an_edited_copy_waits_lists_the_link(
 
     assert [r["name"] for r in data["resolved"]] == ["foreign"]
     assert data["linked"] == [str(foreign)]
-    assert [u["name"] for u in data["unknown"]] == ["tdd"]
+    assert [u["name"] for u in data["unresolved"]] == ["tdd"]
 
 
 @pytest.mark.parametrize("as_json", [False, True])
@@ -1137,7 +1143,7 @@ def test_failed_switch_reports_the_takeover_backup_and_warns(
     assert active_profile(respec_home) == "a"
 
 
-def test_failed_switch_json_has_backups_resolved_warnings_and_error(
+def test_failed_switch_json_has_backups_resolved_unresolved_and_error(
     run, takeover_then_clash, respec_home, dirs
 ):
     first, foreign = takeover_then_clash
@@ -1149,8 +1155,7 @@ def test_failed_switch_json_has_backups_resolved_warnings_and_error(
     assert data["backups"] == {"agents": str(takeover_backup(respec_home))}
     assert [r["name"] for r in data["resolved"]] == ["first"]
     assert "already has a skill 'lint'" in data["error"]
-    paths = [w["path"] for w in data["warnings"] if w["type"] == "unknown-entry"]
-    assert str(foreign) in paths
+    assert str(foreign) in [entry["path"] for entry in data["unresolved"]]
     # first went into the still-active profile a and is linked again.
     assert first.is_symlink()
     assert (first / "SKILL.md").read_text() == "first\n"

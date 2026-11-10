@@ -148,6 +148,7 @@ def _refresh(
             error.entries,
             lead=f"cannot refresh profile {change.profile!r}",
             note=f"Profile {change.profile!r} was left unchanged.",
+            clashes=error.clashes,
         ) from None
     except switch.SwitchBlocked as error:
         undo()

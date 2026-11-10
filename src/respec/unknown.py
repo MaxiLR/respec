@@ -150,18 +150,3 @@ def find_unknown(respec_home: Path, state: State) -> list[Unknown]:
                 )
             )
     return found
-
-
-def folder_report(respec_home: Path, state: State) -> dict[str, dict[str, object]]:
-    """Per owned target: the target it shares a folder with, and unknown entries."""
-    entries = find_unknown(respec_home, state)
-    report: dict[str, dict[str, object]] = {}
-    for folder, group in folder_groups(state):
-        first, aliases = group[0], group[1:]
-        report[first] = {
-            "same_as": None,
-            "unknown": [e.to_dict() for e in entries if e.targets[0] == first],
-        }
-        for alias in aliases:
-            report[alias] = {"same_as": first, "unknown": []}
-    return report

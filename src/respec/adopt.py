@@ -43,15 +43,6 @@ CHOICES = ("add", "remove")
 Decide = Callable[[unknown.Unknown], str | None]
 
 
-def _reserved(respec_home: Path) -> dict[str, str]:
-    """Names a profile skill may not take (shipped skills at least, even when
-    ``config.yaml`` cannot be read)."""
-    try:
-        return global_skills.reserved(respec_home)
-    except RespecError:
-        return {name: "" for name in global_skills.shipped_names()}
-
-
 def choices(
     profile: str | None,
     entry: unknown.Unknown | None = None,
@@ -65,7 +56,7 @@ def choices(
     if profile is None:
         return ("remove",)
     if entry is not None and respec_home is not None:
-        if entry.name in _reserved(respec_home):
+        if entry.name in global_skills.lasting_or_shipped(respec_home):
             return ("remove",)
     return CHOICES
 
@@ -434,7 +425,7 @@ def resolve(
 
     # Entries named like a shipped or global skill are asked about first, so
     # an ``add`` of one is refused before any entry changes.
-    taken = _reserved(respec_home)
+    taken = global_skills.lasting_or_shipped(respec_home)
     early: dict[str, str | None] = {}
     for entry in entries:
         if entry.name in taken:

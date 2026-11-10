@@ -132,15 +132,57 @@ def load_global(respec_home: Path) -> tuple[str, ...]:
     return tuple(seen)
 
 
+SHIPPED = "shipped"
+GLOBAL = "global"
+
+
+def kinds(global_names: Iterable[str]) -> dict[str, str]:
+    """Skills installed beside every profile: name -> :data:`SHIPPED` or
+    :data:`GLOBAL`, for the given global section and the shipped skills."""
+    found = {name: GLOBAL for name in global_names}
+    found.update((name, SHIPPED) for name in shipped_names())
+    return found
+
+
+def lasting(respec_home: Path) -> dict[str, str]:
+    """:func:`kinds` of the global section and the shipped skills; raises
+    when ``config.yaml`` cannot be read."""
+    return kinds(load_global(respec_home))
+
+
+def lasting_or_shipped(respec_home: Path) -> dict[str, str]:
+    """:func:`lasting`, or only the shipped skills when ``config.yaml`` cannot
+    be read (every switch and Sync report that problem themselves)."""
+    try:
+        return lasting(respec_home)
+    except RespecError:
+        return kinds(())
+
+
 def reserved(respec_home: Path) -> dict[str, str]:
     """Names no profile skill may take, each with the reason."""
-    taken = {
-        name: "respec ships a skill of that name and installs it into every target"
-        for name in shipped_names()
+    return {
+        name: (
+            "respec ships a skill of that name and installs it into every target"
+            if kind == SHIPPED
+            else f"it is a global skill listed in {config_path(respec_home)}"
+        )
+        for name, kind in lasting(respec_home).items()
     }
-    for name in load_global(respec_home):
-        taken[name] = f"it is a global skill listed in {config_path(respec_home)}"
-    return taken
+
+
+def clash(respec_home: Path, name: str) -> str | None:
+    """Why an unknown entry called ``name`` can only be removed, when a shipped
+    or global skill has that name (respec links its own skill there)."""
+    kind = lasting_or_shipped(respec_home).get(name)
+    if kind == SHIPPED:
+        return f"respec ships a skill named {name!r}, so it can only be removed"
+    if kind == GLOBAL:
+        return (
+            f"{name!r} is a global skill listed in {config_path(respec_home)}, "
+            "so it can only be removed"
+        )
+    return None
 
 
 def refuse_reserved(
