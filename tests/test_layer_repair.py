@@ -1,0 +1,826 @@
+"""Hand-edited exclusivity conflicts: warn, repair, refuse to switch."""
+
+import json
+
+import pytest
+import yaml
+
+
+@pytest.fixture
+def claude_dir(isolated_homes):
+    return isolated_homes.home / ".claude" / "skills"
+
+
+@pytest.fixture
+def profiles_root(isolated_homes):
+    return isolated_homes.respec_home / "profiles"
+
+
+def read_yaml(profiles_root, profile="work"):
+    return yaml.safe_load((profiles_root / profile / "profile.yaml").read_text())
+
+
+def write_yaml(profiles_root, data, profile="work"):
+    (profiles_root / profile / "profile.yaml").write_text(yaml.safe_dump(data))
+
+
+def ok(result):
+    assert result.exit_code == 0, result.output
+    return result
+
+
+def fails(result):
+    assert result.exit_code != 0, result.output
+    return result
+
+
+def linked(folder):
+    if not folder.exists():
+        return set()
+    return {entry.name for entry in folder.iterdir()}
+
+
+def enabled_skills(profiles_root, profile="work"):
+    skills = read_yaml(profiles_root, profile)["skills"]
+    return {name for name, entry in skills.items() if entry["enabled"]}
+
+
+def make_skill(tmp_path, name):
+    folder = tmp_path / "src" / name
+    folder.mkdir(parents=True)
+    (folder / "SKILL.md").write_text(f"# {name}\n")
+    return folder
+
+
+@pytest.fixture
+def work(run, tmp_path):
+    """Active profile 'work' on claude-code with skills a, b, c (all enabled)."""
+    ok(run("profile", "new", "work", "-t", "claude-code"))
+    ok(run("use", "work"))
+    for name in ("a", "b", "c"):
+        ok(run("add", str(make_skill(tmp_path, name))))
+
+
+@pytest.fixture
+def conflict(work, profiles_root):
+    """Hand-edit 'work' so the exclusive design-principles layer enables a and b."""
+    data = read_yaml(profiles_root)
+    data["layers"] = {"design-principles": {"skills": ["a", "b"]}}
+    write_yaml(profiles_root, data)
+
+
+def assert_names_conflict(text):
+    assert "'design-principles'" in text
+    assert "(a, b)" in text
+    assert "respec layer repair design-principles" in text
+
+
+# Criterion 1: load warns instead of failing.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("layer", "list"),
+        ("layer", "show", "design-principles"),
+        ("profile", "show", "work"),
+        ("status",),
+    ],
+)
+def test_conflict_loads_and_warns_on_stderr(run, conflict, command):
+    result = ok(run(*command))
+
+    assert "warning" in result.stderr
+    assert_names_conflict(result.stderr)
+    assert "warning" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("layer", "list"),
+        ("layer", "show", "design-principles"),
+        ("profile", "show", "work"),
+        ("status",),
+    ],
+)
+def test_conflict_json_has_structured_warnings_and_clean_stdout(run, conflict, command):
+    result = ok(run(*command, "--json"))
+
+    payload = json.loads(result.stdout)
+    assert payload["warnings"] == [
+        {
+            "type": "layer-conflict",
+            "profile": "work",
+            "layer": "design-principles",
+            "skills": ["a", "b"],
+            "message": payload["warnings"][0]["message"],
+            "fix": "respec layer repair design-principles -p work",
+        }
+    ]
+    assert_names_conflict(payload["warnings"][0]["message"])
+    assert "respec layer repair" in result.stderr
+
+
+def test_json_without_conflict_has_empty_warnings(run, work):
+    payload = json.loads(ok(run("layer", "list", "--json")).stdout)
+
+    assert payload["warnings"] == []
+
+
+def test_profile_list_shows_conflicted_profile_as_valid_with_warning(run, conflict):
+    result = ok(run("profile", "list", "--json"))
+
+    payload = json.loads(result.stdout)
+    assert [entry["name"] for entry in payload["profiles"]] == ["work"]
+    assert "error" not in payload["profiles"][0]
+    assert payload["warnings"][0]["layer"] == "design-principles"
+
+
+# Criterion 2: respec layer repair.
+
+
+def test_repair_keep_disables_the_others_and_relinks(
+    run, conflict, profiles_root, claude_dir
+):
+    result = ok(run("layer", "repair", "design-principles", "--keep", "b"))
+
+    assert enabled_skills(profiles_root) == {"b", "c"}
+    assert linked(claude_dir) == {"b", "c"}
+    assert "disabled 'a'" in result.stdout.lower()
+    assert "warning" not in result.stderr
+    # The conflict is gone: later commands no longer warn.
+    assert ok(run("layer", "list")).stderr == ""
+
+
+def test_repair_without_keep_noninteractive_keeps_first_listed(
+    run, conflict, profiles_root, claude_dir
+):
+    change = json.loads(
+        ok(run("layer", "repair", "design-principles", "--json")).stdout
+    )
+
+    assert change["action"] == "repair"
+    assert change["skill"] == "a"
+    assert change["disabled"] == ["b"]
+    assert enabled_skills(profiles_root) == {"a", "c"}
+    assert linked(claude_dir) == {"a", "c"}
+
+
+def test_repair_without_keep_in_terminal_prompts_for_the_skill(
+    run, conflict, profiles_root, claude_dir, monkeypatch
+):
+    from respec import cli
+
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+
+    result = ok(run("layer", "repair", "design-principles", input="b\n"))
+
+    assert "a" in result.stdout and "b" in result.stdout
+    assert enabled_skills(profiles_root) == {"b", "c"}
+    assert linked(claude_dir) == {"b", "c"}
+    assert "disabled 'a'" in result.stdout.lower()
+
+
+def test_repair_keep_must_be_a_conflicting_skill(run, conflict, profiles_root):
+    before = read_yaml(profiles_root)
+
+    result = fails(run("layer", "repair", "design-principles", "--keep", "c"))
+
+    assert "'c'" in result.output
+    assert read_yaml(profiles_root) == before
+
+
+def test_repair_without_conflict_changes_nothing(run, work, profiles_root):
+    ok(run("layer", "use", "design-principles", "a"))
+    before = read_yaml(profiles_root)
+
+    result = ok(run("layer", "repair", "design-principles"))
+
+    assert "nothing to repair" in result.stdout.lower()
+    assert read_yaml(profiles_root) == before
+
+
+def test_repair_of_named_inactive_profile_does_not_touch_targets(
+    run, tmp_path, profiles_root, claude_dir
+):
+    ok(run("profile", "new", "home", "-t", "claude-code"))
+    for name in ("x", "y"):
+        ok(run("add", str(make_skill(tmp_path, name)), "-p", "home"))
+    data = read_yaml(profiles_root, "home")
+    data["layers"] = {"design-principles": {"skills": ["x", "y"]}}
+    write_yaml(profiles_root, data, "home")
+
+    ok(run("layer", "repair", "design-principles", "--keep", "y", "-p", "home"))
+
+    assert enabled_skills(profiles_root, "home") == {"y"}
+    assert not claude_dir.exists()
+
+
+def test_repair_refused_by_switch_preflight_leaves_profile_unchanged(
+    run, conflict, profiles_root, claude_dir
+):
+    # The enabled skill c lost its folder: the refresh refuses. (Unknown
+    # entries no longer refuse a repair; see the fix-7 tests below.)
+    import shutil
+
+    shutil.rmtree(profiles_root / "work" / "skills" / "c")
+    before = read_yaml(profiles_root)
+
+    result = fails(run("layer", "repair", "design-principles", "--keep", "b"))
+
+    assert "has no folder" in result.output
+    assert read_yaml(profiles_root) == before
+    assert linked(claude_dir) == {"a", "b", "c"}
+
+
+# Criterion 3: respec use refuses an unrepaired conflict.
+
+
+def test_use_refuses_conflicted_profile_and_changes_nothing(
+    run, tmp_path, conflict, profiles_root, claude_dir, isolated_homes
+):
+    ok(run("profile", "new", "home", "-t", "claude-code"))
+    ok(run("add", str(make_skill(tmp_path, "x")), "-p", "home"))
+    ok(run("use", "home"))
+    state_file = isolated_homes.respec_home / "state.json"
+    state_before = state_file.read_text()
+    profile_before = read_yaml(profiles_root)
+
+    result = fails(run("use", "work"))
+
+    assert_names_conflict(result.output)
+    assert linked(claude_dir) == {"x"}
+    assert state_file.read_text() == state_before
+    assert read_yaml(profiles_root) == profile_before
+
+
+def test_use_works_after_repair(run, tmp_path, conflict, claude_dir):
+    ok(run("profile", "new", "home", "-t", "claude-code"))
+    ok(run("use", "home"))
+    ok(run("layer", "repair", "design-principles", "-p", "work"))
+
+    ok(run("use", "work"))
+
+    assert linked(claude_dir) == {"a", "c"}
+
+
+# Criterion 4: the layer key is ``skills:``.
+
+
+def test_layer_writes_use_the_skills_key(run, work, profiles_root):
+    ok(run("layer", "use", "design-principles", "a"))
+
+    layer = read_yaml(profiles_root)["layers"]["design-principles"]
+
+    assert layer == {"skills": ["a"]}
+
+
+def test_legacy_items_key_is_read_and_rewritten_as_skills(run, work, profiles_root):
+    data = read_yaml(profiles_root)
+    data["layers"] = {
+        "review": {"exclusive": False, "description": "Review", "items": ["a"]}
+    }
+    write_yaml(profiles_root, data)
+
+    shown = json.loads(ok(run("layer", "show", "review", "--json")).stdout)
+    assert [skill["name"] for skill in shown["skills"]] == ["a"]
+
+    ok(run("layer", "add-skill", "review", "b"))
+
+    review = read_yaml(profiles_root)["layers"]["review"]
+    assert review["skills"] == ["a", "b"]
+    assert "items" not in review
+
+
+def test_layer_with_both_skills_and_items_is_an_error(run, work, profiles_root):
+    data = read_yaml(profiles_root)
+    data["layers"] = {"design-principles": {"skills": ["a"], "items": ["b"]}}
+    write_yaml(profiles_root, data)
+
+    result = fails(run("layer", "list"))
+
+    assert "layers.design-principles" in result.output
+    assert "'skills'" in result.output and "'items'" in result.output
+
+
+def test_validation_messages_name_the_skills_key(run, work, profiles_root):
+    data = read_yaml(profiles_root)
+    data["layers"] = {
+        "design-principles": {"skills": ["zzz"]},
+        "review": {"exclusive": False, "description": "R", "skills": "a"},
+    }
+    write_yaml(profiles_root, data)
+
+    result = fails(run("layer", "list"))
+
+    assert "layers.design-principles.skills: 'zzz' is not a skill" in result.output
+    assert "layers.review.skills must be a list" in result.output
+
+
+# Review round 1 regressions.
+
+
+def test_repair_fixes_an_inactive_exclusive_layer_that_layer_on_refuses(
+    run, work, profiles_root, claude_dir
+):
+    ok(run("layer", "off", "design-principles"))
+    ok(run("layer", "add-skill", "design-principles", "a"))
+    ok(run("layer", "add-skill", "design-principles", "b"))
+    refused = fails(run("layer", "on", "design-principles"))
+    assert "respec layer repair design-principles" in refused.output
+
+    result = ok(run("layer", "repair", "design-principles", "--keep", "b"))
+
+    assert "disabled 'a'" in result.stdout.lower()
+    assert enabled_skills(profiles_root) == {"b", "c"}
+    assert linked(claude_dir) == {"b", "c"}
+    ok(run("layer", "on", "design-principles"))
+
+
+def test_repair_of_additive_layer_says_nothing_to_repair_accurately(
+    run, work, profiles_root
+):
+    ok(run("layer", "add", "review", "--additive", "-d", "Review"))
+    ok(run("layer", "add-skill", "review", "a"))
+    ok(run("layer", "add-skill", "review", "b"))
+    before = read_yaml(profiles_root)
+
+    result = ok(run("layer", "repair", "review"))
+
+    assert "additive" in result.stdout
+    assert read_yaml(profiles_root) == before
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("disable", "a"),
+        ("layer", "off", "design-principles"),
+        ("layer", "use", "design-principles", "b"),
+    ],
+)
+def test_resolving_the_conflict_another_way_leaves_no_stale_warning(
+    run, conflict, command
+):
+    result = ok(run(*command, "--json"))
+
+    assert json.loads(result.stdout)["warnings"] == []
+    assert "warning" not in result.stderr
+
+
+def test_refused_change_restores_legacy_file_bytes(run, work, profiles_root):
+    data = read_yaml(profiles_root)
+    data["layers"] = {
+        "review": {"exclusive": False, "description": "Review", "items": ["a"]}
+    }
+    write_yaml(profiles_root, data)
+    file = profiles_root / "work" / "profile.yaml"
+    original = file.read_bytes()
+    claude_dir = profiles_root.parent.parent / "home" / ".claude" / "skills"
+    # A hand-made folder replaced c's link: every refresh would remove it.
+    (claude_dir / "c").unlink()
+    (claude_dir / "c").mkdir()
+
+    fails(run("layer", "add-skill", "review", "b"))
+    assert file.read_bytes() == original
+
+    fails(run("disable", "a"))
+    assert file.read_bytes() == original
+
+
+def test_layer_use_json_lists_the_skill_it_disabled(run, work):
+    ok(run("layer", "use", "design-principles", "a"))
+    ok(run("layer", "add-skill", "design-principles", "b"))
+
+    change = json.loads(
+        ok(run("layer", "use", "design-principles", "b", "--json")).stdout
+    )
+
+    assert change["disabled"] == ["a"]
+
+
+def test_restoring_an_edited_copy_writes_the_copy_not_the_loaded_bytes(
+    work, profiles_root, isolated_homes
+):
+    import dataclasses
+
+    from respec import profiles
+
+    loaded = profiles.load_profile(isolated_homes.respec_home, "work")
+    copy = dataclasses.replace(loaded, targets=["agents"])
+
+    profiles.restore_profile(copy)
+
+    assert read_yaml(profiles_root)["targets"] == ["agents"]
+
+
+# Review round 3 regressions.
+
+
+def test_adopt_add_into_conflicted_active_profile_refuses_and_changes_nothing(
+    run, conflict, profiles_root, claude_dir, isolated_homes
+):
+    foreign = claude_dir / "foreign"
+    foreign.mkdir()
+    (foreign / "SKILL.md").write_text("# foreign\n")
+    yaml_file = profiles_root / "work" / "profile.yaml"
+    yaml_before = yaml_file.read_bytes()
+    state_file = isolated_homes.respec_home / "state.json"
+    state_before = state_file.read_bytes()
+
+    result = fails(run("adopt", "--add", "foreign"))
+
+    assert "respec layer repair design-principles" in result.output
+    assert (foreign / "SKILL.md").read_text() == "# foreign\n"
+    assert not (profiles_root / "work" / "skills" / "foreign").exists()
+    assert yaml_file.read_bytes() == yaml_before
+    assert state_file.read_bytes() == state_before
+
+
+def test_adopt_rolls_back_an_add_when_the_relink_is_refused(
+    run, work, profiles_root, claude_dir, isolated_homes, monkeypatch
+):
+    from respec import switch
+
+    foreign = claude_dir / "foreign"
+    foreign.mkdir()
+    (foreign / "SKILL.md").write_text("# foreign\n")
+    target = isolated_homes.home / "elsewhere"
+    target.mkdir()
+    (target / "SKILL.md").write_text("# linked\n")
+    (claude_dir / "pointer").symlink_to(target)
+    yaml_file = profiles_root / "work" / "profile.yaml"
+    yaml_before = yaml_file.read_bytes()
+
+    def refuse(*args, **kwargs):
+        raise switch.SwitchBlocked("linking refused for the test")
+
+    monkeypatch.setattr(switch, "link_skills", refuse)
+
+    result = fails(run("adopt", "--add", "foreign", "--add", "pointer"))
+
+    assert "refused for the test" in result.output
+    assert (foreign / "SKILL.md").read_text() == "# foreign\n"
+    assert not foreign.is_symlink()
+    assert (claude_dir / "pointer").is_symlink()
+    assert (claude_dir / "pointer").resolve() == target.resolve()
+    assert not (profiles_root / "work" / "skills" / "foreign").exists()
+    assert not (profiles_root / "work" / "skills" / "pointer").exists()
+    assert yaml_file.read_bytes() == yaml_before
+
+
+@pytest.mark.parametrize("profile_args", [(), ("-p", "work")])
+def test_layer_off_of_another_layer_is_allowed_on_a_conflicted_profile(
+    run, conflict, profiles_root, profile_args
+):
+    result = ok(run("layer", "off", "output-style", *profile_args))
+
+    assert read_yaml(profiles_root)["layers"]["output-style"]["active"] is False
+    assert "respec layer repair design-principles" in result.stderr
+
+
+def test_two_conflicted_layers_can_each_be_turned_off_on_inactive_profile(
+    run, tmp_path, work, profiles_root
+):
+    ok(run("add", str(make_skill(tmp_path, "d"))))
+    ok(run("profile", "new", "home", "-t", "claude-code"))
+    ok(run("use", "home"))
+    data = read_yaml(profiles_root)
+    data["layers"] = {
+        "design-principles": {"skills": ["a", "b"]},
+        "mine": {"exclusive": True, "description": "Mine", "skills": ["c", "d"]},
+    }
+    write_yaml(profiles_root, data)
+
+    ok(run("layer", "off", "design-principles", "-p", "work"))
+    ok(run("layer", "off", "mine", "-p", "work"))
+
+    layers = read_yaml(profiles_root)["layers"]
+    assert layers["design-principles"]["active"] is False
+    assert layers["mine"]["active"] is False
+
+
+def test_layer_on_is_refused_only_for_its_own_conflict(run, conflict, profiles_root):
+    ok(run("layer", "off", "output-style"))
+    ok(run("layer", "on", "output-style"))
+
+    ok(run("layer", "off", "design-principles"))
+    result = fails(run("layer", "on", "design-principles"))
+
+    assert "cannot turn layer 'design-principles' on" in result.output
+    assert "(a, b)" in result.output
+
+
+# Review round 4 regressions.
+
+
+@pytest.fixture
+def two_targets(run, isolated_homes):
+    """Active profile 'two' on claude-code and agents, with a read-only
+    (empty) agents folder so a relink fails after claude-code is linked."""
+    agents = isolated_homes.home / ".agents" / "skills"
+    agents.mkdir(parents=True)
+    (isolated_homes.home / ".claude" / "skills").mkdir(parents=True)
+    ok(run("profile", "new", "two", "-t", "claude-code", "-t", "agents"))
+    ok(run("use", "two"))
+    agents.chmod(0o555)
+    yield isolated_homes.home / ".claude" / "skills"
+    agents.chmod(0o755)
+
+
+def find_text(root, text):
+    return [
+        path
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink() and text in path.read_text()
+    ]
+
+
+def test_adopt_relink_failing_partway_never_loses_the_content(
+    run, two_targets, profiles_root, isolated_homes, tmp_path
+):
+    foreign = two_targets / "foreign"
+    foreign.mkdir()
+    (foreign / "SKILL.md").write_text("precious\n")
+
+    result = fails(run("adopt", "--add", "foreign"))
+
+    assert "did not complete" in result.output
+    assert find_text(tmp_path, "precious"), "the adopted content was deleted"
+    # The original is back as a real folder with its content.
+    assert not foreign.is_symlink()
+    assert (foreign / "SKILL.md").read_text() == "precious\n"
+    state = json.loads((isolated_homes.respec_home / "state.json").read_text())
+    assert str(foreign) not in [item["path"] for item in state["installed"]]
+    assert "foreign" not in read_yaml(profiles_root, "two")["skills"]
+
+
+def test_adopt_refusal_says_cannot_adopt(run, conflict, claude_dir):
+    foreign = claude_dir / "foreign"
+    foreign.mkdir()
+    (foreign / "SKILL.md").write_text("# foreign\n")
+
+    result = fails(run("adopt", "--add", "foreign"))
+
+    assert "cannot adopt" in result.output
+    assert "cannot switch" not in result.output
+
+
+def test_adopt_failure_reports_backups_made_earlier(run, two_targets, isolated_homes):
+    stray = two_targets / "a-stray"
+    stray.mkdir()
+    (stray / "SKILL.md").write_text("# stray\n")
+    foreign = two_targets / "foreign"
+    foreign.mkdir()
+    (foreign / "SKILL.md").write_text("precious\n")
+
+    result = fails(run("adopt", "--remove", "a-stray", "--add", "foreign"))
+
+    assert str(stray) in result.output
+    assert "backups" in result.output
+
+
+def test_adopt_relink_failing_in_copy_mode_keeps_the_original_unmanaged(
+    run, two_targets, profiles_root, isolated_homes, monkeypatch
+):
+    import os
+
+    foreign = two_targets / "foreign"
+    foreign.mkdir()
+    (foreign / "SKILL.md").write_text("precious\n")
+
+    def no_symlinks(*args, **kwargs):
+        raise OSError("symlinks refused for the test")
+
+    monkeypatch.setattr(os, "symlink", no_symlinks)
+
+    fails(run("adopt", "--add", "foreign"))
+
+    assert not foreign.is_symlink()
+    assert (foreign / "SKILL.md").read_text() == "precious\n"
+    state = json.loads((isolated_homes.respec_home / "state.json").read_text())
+    # Not recorded as respec's, so the next switch never deletes it.
+    assert str(foreign) not in [item["path"] for item in state["installed"]]
+    assert "foreign" not in read_yaml(profiles_root, "two")["skills"]
+    assert not (profiles_root / "two" / "skills" / "foreign").exists()
+
+
+def test_adopt_keeps_the_copy_when_the_original_path_holds_something_else(
+    run, two_targets, profiles_root, monkeypatch
+):
+    from respec import switch
+
+    foreign = two_targets / "foreign"
+    foreign.mkdir()
+    (foreign / "SKILL.md").write_text("precious\n")
+
+    def occupy_then_fail(*args, **kwargs):
+        foreign.mkdir()
+        (foreign / "SKILL.md").write_text("someone else\n")
+        raise switch.SwitchBlocked("linking refused for the test")
+
+    monkeypatch.setattr(switch, "link_skills", occupy_then_fail)
+
+    result = fails(run("adopt", "--add", "foreign"))
+
+    copy = profiles_root / "two" / "skills" / "foreign"
+    assert (copy / "SKILL.md").read_text() == "precious\n"
+    assert str(copy) in result.output
+    assert read_yaml(profiles_root, "two")["skills"]["foreign"] == {"enabled": True}
+    assert (foreign / "SKILL.md").read_text() == "someone else\n"
+
+
+# fix-6 on top of fix-5: unknown entries, refresh wording, merged warnings.
+
+
+def test_unrelated_unknown_entry_does_not_block_layer_repair(
+    run, conflict, profiles_root, claude_dir
+):
+    (claude_dir / "stray").mkdir()
+
+    result = ok(run("layer", "repair", "design-principles", "--keep", "b"))
+
+    assert enabled_skills(profiles_root) == {"b", "c"}
+    assert linked(claude_dir) == {"b", "c", "stray"}
+    assert str(claude_dir / "stray") in result.stderr
+    assert "respec adopt" in result.stderr
+
+
+def test_refused_refresh_says_refresh_not_switch(run, conflict, profiles_root):
+    before = (profiles_root / "work" / "profile.yaml").read_bytes()
+
+    result = fails(run("disable", "c"))
+
+    assert "cannot refresh profile 'work'" in result.stderr
+    assert "cannot switch" not in result.output
+    assert (profiles_root / "work" / "profile.yaml").read_bytes() == before
+
+
+def test_refresh_blocked_by_an_entry_in_the_way_says_refresh(
+    run, work, profiles_root, claude_dir
+):
+    (claude_dir / "a").unlink()
+    (claude_dir / "a").mkdir()
+
+    result = fails(run("layer", "add-skill", "design-principles", "b"))
+
+    assert "cannot refresh profile 'work'" in result.stderr
+    assert "cannot switch" not in result.output
+    assert str(claude_dir / "a") in result.stderr
+
+
+def test_layer_off_that_resolves_a_conflict_links_the_enabled_skills(
+    run, work, profiles_root, claude_dir
+):
+    ok(run("disable", "b"))
+    data = read_yaml(profiles_root)
+    data["skills"]["b"]["enabled"] = True  # hand edit: b enabled, not linked
+    data["layers"] = {"design-principles": {"skills": ["a", "b"]}}
+    write_yaml(profiles_root, data)
+    assert "b" not in linked(claude_dir)
+
+    change = json.loads(ok(run("layer", "off", "design-principles", "--json")).stdout)
+
+    assert "b" in linked(claude_dir)
+    assert (claude_dir / "b").is_symlink()
+    assert change["linked"] == [str(claude_dir / "b")]
+
+
+def test_json_has_layer_conflict_warnings_beside_unresolved_entries(
+    run, conflict, claude_dir
+):
+    (claude_dir / "stray").mkdir()
+
+    result = ok(run("layer", "add", "x", "--additive", "-d", "X", "--json"))
+
+    data = json.loads(result.stdout)
+    [layer] = data["warnings"]
+    [entry] = data["unresolved"]
+    assert layer["type"] == "layer-conflict" and layer["message"]
+    assert layer["layer"] == "design-principles"
+    assert entry["path"] == str(claude_dir / "stray") and entry["kind"] == "folder"
+    assert "design-principles" in result.stderr and "stray" in result.stderr
+
+
+# fix-7: an edited copy and a layer conflict must not refuse each other's fix.
+
+
+def replace_with_edited_copy(claude_dir, name, text="edited by hand\n"):
+    """Swap respec's link for a hand-made folder (an edited or replaced copy)."""
+    (claude_dir / name).unlink()
+    (claude_dir / name).mkdir()
+    (claude_dir / name / "SKILL.md").write_text(text)
+    return claude_dir / name
+
+
+def test_repair_goes_ahead_while_an_unrelated_edited_copy_waits(
+    run, conflict, claude_dir, profiles_root
+):
+    edited = replace_with_edited_copy(claude_dir, "c")
+
+    repaired = ok(run("layer", "repair", "design-principles", "--keep", "b"))
+
+    assert enabled_skills(profiles_root) == {"b", "c"}
+    assert not (claude_dir / "a").exists()
+    assert (claude_dir / "b").is_symlink()
+    assert (edited / "SKILL.md").read_text() == "edited by hand\n"
+    assert "disabled" in repaired.output and "'a'" in repaired.output
+    assert str(edited) in repaired.stderr
+    # With the conflict gone, the edited copy can be added; nothing is stuck.
+    ok(run("adopt", "--add", "c"))
+    assert (claude_dir / "c").is_symlink()
+    copy = profiles_root / "work" / "skills" / "c" / "SKILL.md"
+    assert copy.read_text() == "edited by hand\n"
+    ok(run("use", "work"))
+
+
+def test_repair_json_reports_what_it_unlinked_beside_the_waiting_entry(
+    run, conflict, claude_dir
+):
+    edited = replace_with_edited_copy(claude_dir, "c")
+
+    data = json.loads(ok(run("layer", "repair", "design-principles", "--json")).stdout)
+
+    assert data["disabled"] == ["b"]
+    assert data["unlinked"] == [str(claude_dir / "b")]
+    assert [entry["path"] for entry in data["unresolved"]] == [str(edited)]
+
+
+def test_repair_refused_for_another_reason_beside_an_edited_copy_changes_nothing(
+    run, conflict, claude_dir, profiles_root, isolated_homes
+):
+    edited = replace_with_edited_copy(claude_dir, "a")
+    (isolated_homes.respec_home / "config.yaml").write_text("global: [\n")
+    yaml_before = (profiles_root / "work" / "profile.yaml").read_bytes()
+    state_file = isolated_homes.respec_home / "state.json"
+    state_before = state_file.read_bytes()
+
+    result = fails(run("layer", "repair", "design-principles", "--keep", "b"))
+
+    assert "config.yaml" in result.output
+    assert (edited / "SKILL.md").read_text() == "edited by hand\n"
+    assert (profiles_root / "work" / "profile.yaml").read_bytes() == yaml_before
+    assert state_file.read_bytes() == state_before
+
+
+def test_repair_link_failure_says_the_repair_was_kept(
+    run, conflict, claude_dir, profiles_root, monkeypatch
+):
+    from respec import switch
+
+    replace_with_edited_copy(claude_dir, "c")
+
+    def fail(*args, **kwargs):
+        raise switch.LinkFailed("linking refused for the test", [])
+
+    monkeypatch.setattr(switch, "link_skills", fail)
+
+    result = fails(run("layer", "repair", "design-principles", "--keep", "b"))
+
+    assert "refused for the test" in result.output
+    assert "keeps the repair" in result.output
+    assert enabled_skills(profiles_root) == {"b", "c"}
+
+
+# fix-7 review 1 B2: an edited copy of a member of the conflicted layer.
+
+
+def test_repair_keeping_the_edited_member_goes_ahead_and_the_copy_can_be_added(
+    run, conflict, claude_dir, profiles_root, isolated_homes
+):
+    edited = replace_with_edited_copy(claude_dir, "b")
+
+    ok(run("layer", "repair", "design-principles", "--keep", "b"))
+
+    assert enabled_skills(profiles_root) == {"b", "c"}
+    assert not (claude_dir / "a").exists()
+    assert (edited / "SKILL.md").read_text() == "edited by hand\n"
+    ok(run("adopt", "--add", "b"))
+    assert (claude_dir / "b").is_symlink()
+    copy = profiles_root / "work" / "skills" / "b" / "SKILL.md"
+    assert copy.read_text() == "edited by hand\n"
+    ok(run("use", "work"))
+
+
+def test_repair_disabling_the_edited_member_leaves_the_copy_waiting(
+    run, conflict, claude_dir, profiles_root
+):
+    edited = replace_with_edited_copy(claude_dir, "b")
+
+    data = json.loads(
+        ok(run("layer", "repair", "design-principles", "--keep", "a", "--json")).stdout
+    )
+
+    assert data["disabled"] == ["b"]
+    assert data["unlinked"] == []
+    assert [entry["path"] for entry in data["unresolved"]] == [str(edited)]
+    assert enabled_skills(profiles_root) == {"a", "c"}
+    assert (claude_dir / "a").is_symlink()
+    assert (edited / "SKILL.md").read_text() == "edited by hand\n"
+    # The edit is kept by adding it (to the now disabled skill), or removed.
+    ok(run("adopt", "--add", "b"))
+    copy = profiles_root / "work" / "skills" / "b" / "SKILL.md"
+    assert copy.read_text() == "edited by hand\n"
+    assert not (claude_dir / "b").exists()
+    ok(run("use", "work"))
