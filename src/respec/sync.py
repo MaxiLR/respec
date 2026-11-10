@@ -23,14 +23,17 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import adopt, profiles, switch, unknown
+from respec import global_skills, profiles, switch, trees, unknown
 from respec.errors import RespecError
-from respec.state import load_state
+from respec.state import State, load_state
 
 MISSING = "missing"
 BROKEN = "broken"
 NOT_LINKED = "not linked"
 NOT_ENABLED = "no longer enabled"
+
+
+PROFILE = global_skills.PROFILE
 
 
 @dataclass(frozen=True)
@@ -43,17 +46,41 @@ class LinkProblem:
     # the folder is gone: re-applying cannot work until it is restored or the
     # skill is disabled.
     folder_gone: str | None = None
+    # Where the skill comes from: PROFILE, or global_skills.SHIPPED / GLOBAL.
+    origin: str = PROFILE
+    # For a global skill: the config.yaml that lists (or listed) it, and its
+    # folder there when that folder is missing.
+    config: str | None = None
+    source_gone: str | None = None
 
     def describe(self) -> str:
-        what = {
-            MISSING: "is missing",
-            BROKEN: "is a broken link",
-            NOT_LINKED: "is enabled in the active profile but not linked",
-            NOT_ENABLED: "is linked but no longer enabled in the active profile",
-        }[self.problem]
+        if self.problem == NOT_LINKED:
+            what = {
+                PROFILE: "is enabled in the active profile but not linked",
+                global_skills.SHIPPED: "is a skill respec ships but is not linked",
+                global_skills.GLOBAL: (
+                    f"is a global skill listed in {self.config} but is not linked"
+                ),
+            }[self.origin]
+        elif self.problem == NOT_ENABLED:
+            what = {
+                PROFILE: "is linked but no longer enabled in the active profile",
+                global_skills.SHIPPED: "is linked but respec no longer ships it",
+                global_skills.GLOBAL: (
+                    "is linked but no longer listed as a global skill in "
+                    f"{self.config}"
+                ),
+            }[self.origin]
+        else:
+            what = {MISSING: "is missing", BROKEN: "is a broken link"}[self.problem]
         text = f"{self.skill} ({self.target}) {what}: {self.path}"
         if self.folder_gone:
             text += f"\n  its skill folder {self.folder_gone} is gone"
+        if self.source_gone:
+            text += (
+                f"\n  its folder {self.source_gone} is missing; add it there, or "
+                f"take {self.skill!r} out of {self.config}"
+            )
         return text
 
 
@@ -80,9 +107,11 @@ class SyncReport:
 
 
 def _link_problems(
-    respec_home: Path, user_home: Path, active: profiles.Profile | None
+    respec_home: Path,
+    user_home: Path,
+    active: profiles.Profile | None,
+    state: State,
 ) -> list[LinkProblem]:
-    state = load_state(respec_home)
     problems: list[LinkProblem] = []
     for item in state.installed:
         path = Path(item.path)
@@ -98,20 +127,52 @@ def _link_problems(
         if entry.enabled
         and not (folder := active.path / profiles.SKILLS_DIR / skill).is_dir()
     }
-    recorded = {unknown.real(item.path): item for item in state.installed}
+    config = str(global_skills.config_path(respec_home))
+    lasting = global_skills.lasting_or_shipped(respec_home)
+    recorded = {trees.real(item.path): item for item in state.installed}
     # What the switching engine would install for the active profile.
     expected = {
-        unknown.real(destination): (target, skill)
-        for target, skill, _, destination in switch.plan(respec_home, user_home, active)
+        trees.real(destination): (target, skill, source)
+        for target, skill, source, destination in switch.plan(
+            respec_home, user_home, active
+        )
     }
-    for key, (target, skill) in expected.items():
+    for key, (target, skill, source) in expected.items():
         if key not in recorded and not os.path.lexists(key):
-            problems.append(LinkProblem(target, skill, str(key), NOT_LINKED))
+            origin = lasting.get(skill, PROFILE)
+            problems.append(
+                LinkProblem(
+                    target,
+                    skill,
+                    str(key),
+                    NOT_LINKED,
+                    origin=origin,
+                    config=config if origin == global_skills.GLOBAL else None,
+                    source_gone=(
+                        str(source)
+                        if origin == global_skills.GLOBAL and not source.is_dir()
+                        else None
+                    ),
+                )
+            )
     for key, item in recorded.items():
         if key not in expected and os.path.lexists(key):
-            problems.append(LinkProblem(item.target, item.name, item.path, NOT_ENABLED))
+            origin = global_skills.origin(respec_home, Path(item.path), item.name)
+            problems.append(
+                LinkProblem(
+                    item.target,
+                    item.name,
+                    item.path,
+                    NOT_ENABLED,
+                    origin=origin,
+                    config=config if origin == global_skills.GLOBAL else None,
+                )
+            )
     return [
-        dataclasses.replace(problem, folder_gone=gone.get(problem.skill))
+        dataclasses.replace(
+            problem,
+            folder_gone=gone.get(problem.skill) if problem.origin == PROFILE else None,
+        )
         for problem in problems
     ]
 
@@ -120,7 +181,7 @@ def check(respec_home: Path, user_home: Path) -> SyncReport:
     """Everything that needs a decision now; reads only."""
     state = load_state(respec_home)
     report = SyncReport(active_profile=state.active_profile)
-    report.unknown = adopt.unresolved(respec_home)
+    report.unknown = unknown.find_unknown(respec_home, state)
     active: profiles.Profile | None = None
     for name in profiles.list_profile_names(respec_home):
         try:
@@ -132,7 +193,7 @@ def check(respec_home: Path, user_home: Path) -> SyncReport:
         report.conflicts.extend(profiles.exclusivity_conflicts(profile))
         if name == state.active_profile:
             active = profile
-    report.links = _link_problems(respec_home, user_home, active)
+    report.links = _link_problems(respec_home, user_home, active, state)
     return report
 
 

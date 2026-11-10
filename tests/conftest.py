@@ -83,3 +83,42 @@ def run():
         return runner.invoke(app, list(args), env=env, input=input)
 
     return invoke
+
+
+# The JSON fields the README documents as nullable: no active or previous
+# profile, a folder that is its own (not ``same_as`` another), and a restored
+# folder that did not exist at takeover (a value under ``restored``).
+NULLABLE_KEYS = frozenset({"active_profile", "previous_profile", "same_as"})
+NULLABLE_UNDER = frozenset({"restored"})
+
+
+def null_fields(data, where="$", parent=None):
+    """Every place in a JSON value that holds ``null`` without being documented
+    as nullable, as a path such as ``$.resolved[0].backup``."""
+    found = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            path = f"{where}.{key}"
+            if value is None:
+                if key not in NULLABLE_KEYS and parent not in NULLABLE_UNDER:
+                    found.append(path)
+            else:
+                found += null_fields(value, path, key)
+    elif isinstance(data, list):
+        for index, value in enumerate(data):
+            if value is None:
+                found.append(f"{where}[{index}]")
+            else:
+                found += null_fields(value, f"{where}[{index}]", None)
+    return found
+
+
+@pytest.fixture
+def assert_no_nulls():
+    """Check parsed JSON output for undocumented nulls; returns it."""
+
+    def check(data):
+        assert null_fields(data) == [], data
+        return data
+
+    return check

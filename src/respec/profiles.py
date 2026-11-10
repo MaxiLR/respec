@@ -223,11 +223,6 @@ def exclusivity_conflicts(profile: Profile) -> list[LayerConflict]:
     return conflicts
 
 
-def exclusivity_problems(profile: Profile) -> list[str]:
-    """Messages for :func:`exclusivity_conflicts`."""
-    return [conflict.message for conflict in exclusivity_conflicts(profile)]
-
-
 # Profile folders read or written since the last take_warnings(), in order.
 _touched: dict[tuple[Path, str], None] = {}
 

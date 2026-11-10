@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from respec import global_skills, profiles, targets, unknown
+from respec import global_skills, profiles, targets, trees, unknown
 from respec.errors import RespecError
 from respec.state import Installed, Owned, State, load_state, save_state
 
@@ -66,7 +66,11 @@ def describe(entry: unknown.Unknown) -> str:
 
 
 class UnknownEntries(SwitchBlocked):
-    """Entries respec did not place sit where it would install or remove a skill."""
+    """Entries respec did not place sit where it would install or remove a skill.
+
+    ``clashes`` maps the path of an entry named like a shipped or global skill
+    to why it can only be removed (:func:`respec.global_skills.clash`).
+    """
 
     def __init__(
         self,
@@ -75,10 +79,16 @@ class UnknownEntries(SwitchBlocked):
         lead: str | None = None,
         note: str = "",
         can_add: bool = True,
+        clashes: dict[str, str] | None = None,
     ) -> None:
         self.profile = profile
         self.entries = entries
-        lines = "\n".join(f"  - {describe(entry)}" for entry in entries)
+        self.clashes = dict(clashes or {})
+        lines = "\n".join(
+            f"  - {describe(entry)}"
+            + (f": {self.clashes[entry.path]}" if entry.path in self.clashes else "")
+            for entry in entries
+        )
         lead = lead or f"cannot switch to profile {profile!r}"
         super().__init__(
             f"{lead}: these entries are not managed by respec and sit where it "
@@ -112,11 +122,6 @@ def new_backup_run(respec_home: Path, moment: datetime) -> Path:
             suffix += 1
             continue
         return candidate
-
-
-def _real(path: Path) -> Path:
-    """``path`` with its parent folders' symlinks resolved (not the entry itself)."""
-    return path.parent.resolve() / path.name
 
 
 def _plan(
@@ -163,12 +168,12 @@ def _plan_all(
     """
     registry = targets.registry()
     plan = list(_plan(profile, user_home))
-    seen = {_real(destination) for _, _, _, destination in plan}
+    seen = {trees.real(destination) for _, _, _, destination in plan}
 
     def add(target_names: list[str], skill: str, source: Path) -> None:
         for target in target_names:
             destination = registry[target].skills_dir(user_home) / skill
-            key = _real(destination)
+            key = trees.real(destination)
             if key not in seen:
                 seen.add(key)
                 plan.append((target, skill, source, destination))
@@ -210,16 +215,16 @@ def _check_global(respec_home: Path, profile: profiles.Profile, lead: str) -> No
     except RespecError as error:
         raise SwitchBlocked(f"{lead}: {error}") from None
     problems = global_skills.check_sources(respec_home, names)
-    shipped = set(global_skills.shipped_names())
+    lasting = global_skills.kinds(names)
     for skill, entry in profile.skills.items():
         if not entry.enabled:
             continue
-        if skill in shipped:
+        if lasting.get(skill) == global_skills.SHIPPED:
             problems.append(
                 f"skill {skill!r} has the name of a skill respec ships and "
                 "installs everywhere; rename or remove the profile's skill"
             )
-        elif skill in names:
+        elif lasting.get(skill) == global_skills.GLOBAL:
             problems.append(
                 f"skill {skill!r} is also a global skill in "
                 f"{global_skills.config_path(respec_home)}; rename one of them"
@@ -240,17 +245,17 @@ def conflicts(
     paths in folders respec does not own yet.
     """
     plan = _plan_all(respec_home, user_home, profile)
-    installs = {_real(destination) for _, _, _, destination in plan}
-    recorded = {_real(Path(item.path)) for item in state.installed}
+    installs = {trees.real(destination) for _, _, _, destination in plan}
+    recorded = {trees.real(item.path) for item in state.installed}
     found: list[unknown.Unknown] = []
     seen: set[Path] = set()
     for entry in unknown.find_unknown(respec_home, state):
-        key = _real(Path(entry.path))
+        key = trees.real(entry.path)
         if key in installs or key in recorded:
             found.append(entry)
             seen.add(key)
     managed = {
-        _real(Path(item.path))
+        trees.real(item.path)
         for item in state.installed
         if unknown.is_managed(respec_home, item)
     }
@@ -261,7 +266,7 @@ def conflicts(
             target
         )
     for _, skill, _, destination in plan:
-        key = _real(destination)
+        key = trees.real(destination)
         if key in seen or key in managed or not os.path.lexists(destination):
             continue
         seen.add(key)
@@ -294,7 +299,7 @@ def _record_backed_up_items(
     items = [
         item.to_dict()
         for item in state.installed
-        if unknown.real(item.path).parent == real_folder
+        if trees.real(item.path).parent == real_folder
     ]
     if not items:
         return
@@ -446,8 +451,8 @@ def link_skills(
     for target, skill, source, destination in _plan(profile, user_home):
         if skill not in wanted or destination.parent.resolve() not in owned:
             continue
-        key = _real(destination)
-        record = next((i for i in state.installed if _real(Path(i.path)) == key), None)
+        key = trees.real(destination)
+        record = next((i for i in state.installed if trees.real(i.path) == key), None)
         if os.path.lexists(destination):
             if record is None or not unknown.is_managed(respec_home, record):
                 result.blocked.append(str(destination))
@@ -478,7 +483,7 @@ def link_skills(
                 name=skill,
                 path=str(destination),
                 mode=mode,
-                digest=unknown.digest(destination) if mode == "copy" else None,
+                digest=trees.digest(destination) if mode == "copy" else None,
             )
         )
         save_state(respec_home, state)
@@ -493,8 +498,7 @@ def relink_lasting(respec_home: Path, user_home: Path) -> list[str]:
     state = load_state(respec_home)
     if state.active_profile is None:
         return []
-    lasting = set(global_skills.load_global(respec_home))
-    lasting.update(global_skills.shipped_names())
+    lasting = global_skills.lasting(respec_home)
     if not lasting:
         return []
     profile = profiles.load_profile(respec_home, state.active_profile)
@@ -511,8 +515,8 @@ def relink_lasting(respec_home: Path, user_home: Path) -> list[str]:
             or not source.is_dir()
         ):
             continue
-        key = _real(destination)
-        state.installed = [i for i in state.installed if _real(Path(i.path)) != key]
+        key = trees.real(destination)
+        state.installed = [i for i in state.installed if trees.real(i.path) != key]
         try:
             mode = _install(source, destination)
         except OSError as error:
@@ -528,7 +532,7 @@ def relink_lasting(respec_home: Path, user_home: Path) -> list[str]:
                 name=skill,
                 path=str(destination),
                 mode=mode,
-                digest=unknown.digest(destination) if mode == "copy" else None,
+                digest=trees.digest(destination) if mode == "copy" else None,
             )
         )
         save_state(respec_home, state)
@@ -547,6 +551,16 @@ def new_backups(respec_home: Path, owned_before: set[str]) -> dict[str, str]:
         for target, entry in load_state(respec_home).owned.items()
         if target not in owned_before and entry.backup
     }
+
+
+def _clashes(respec_home: Path, entries: list[unknown.Unknown]) -> dict[str, str]:
+    """Why each entry named like a shipped or global skill can only be removed."""
+    found = {}
+    for entry in entries:
+        reason = global_skills.clash(respec_home, entry.name)
+        if reason is not None:
+            found[entry.path] = reason
+    return found
 
 
 def refuse_layer_conflicts(
@@ -586,7 +600,11 @@ def use(
     found = conflicts(respec_home, user_home, profile, state)
     if found and on_unknown is None:
         raise UnknownEntries(
-            profile.name, found, lead=lead, can_add=state.active_profile is not None
+            profile.name,
+            found,
+            lead=lead,
+            can_add=state.active_profile is not None,
+            clashes=_clashes(respec_home, found),
         )
     result = SwitchResult(profile=profile.name, previous=state.active_profile)
 
@@ -607,18 +625,22 @@ def use(
         left = conflicts(respec_home, user_home, profile, state)
         if left:
             raise UnknownEntries(
-                profile.name, left, lead=lead, can_add=state.active_profile is not None
+                profile.name,
+                left,
+                lead=lead,
+                can_add=state.active_profile is not None,
+                clashes=_clashes(respec_home, left),
             )
     plan = _plan_all(respec_home, user_home, profile)
     kept = _kept(respec_home, state, plan)
-    plan = [entry for entry in plan if _real(entry[3]) not in kept]
+    plan = [entry for entry in plan if trees.real(entry[3]) not in kept]
 
     # state.json is saved after every removal and every install, so it always
     # lists each path respec has created and a later switch can remove it.
     state.active_profile = None
     try:
         for item in list(state.installed):
-            if _real(Path(item.path)) in kept:
+            if trees.real(item.path) in kept:
                 continue
             if remove_installed(respec_home, item):
                 result.removed.append(item)
@@ -632,7 +654,7 @@ def use(
                 name=skill,
                 path=str(destination),
                 mode=mode,
-                digest=unknown.digest(destination) if mode == "copy" else None,
+                digest=trees.digest(destination) if mode == "copy" else None,
             )
             state.installed.append(record)
             result.installed.append(record)
@@ -659,13 +681,13 @@ def _kept(
     they match the current files.
     """
     sources = {
-        _real(destination): (skill, source) for _, skill, source, destination in plan
+        trees.real(destination): (skill, source)
+        for _, skill, source, destination in plan
     }
-    lasting = set(global_skills.load_global(respec_home))
-    lasting.update(global_skills.shipped_names())
+    lasting = global_skills.lasting(respec_home)
     kept: set[Path] = set()
     for item in state.installed:
-        key = _real(Path(item.path))
+        key = trees.real(item.path)
         planned = sources.get(key)
         if (
             item.mode == "symlink"
@@ -680,7 +702,9 @@ def _kept(
 
 
 def status(respec_home: Path) -> dict[str, object]:
-    """Active profile, its targets and the skills respec placed in each folder."""
+    """Active profile, its targets, the skills respec placed in each folder
+    (each with its ``origin``: ``profile``, ``shipped`` or ``global``) and the
+    unknown entries still waiting for a decision (``unresolved``)."""
     state = load_state(respec_home)
     active_targets: list[str] = []
     if state.active_profile is not None:
@@ -689,30 +713,44 @@ def status(respec_home: Path) -> dict[str, object]:
             active_targets = list(profile.targets)
         except RespecError:
             active_targets = sorted({item.target for item in state.installed})
-    order = list(targets.registry())
-    owned = sorted(
-        state.owned.items(),
-        key=lambda pair: (order.index(pair[0]) if pair[0] in order else len(order)),
-    )
-    extra = unknown.folder_report(respec_home, state)
     # Targets sharing one real folder list its items once, under the first.
-    sharing = {group[0]: group for _, group in unknown.folder_groups(state)}
-    folders = [
-        {
-            "target": target,
-            "skills_dir": entry.skills_dir,
-            "skills": [
-                {"name": item.name, "path": item.path, "mode": item.mode}
-                for item in sorted(state.installed, key=lambda i: i.name)
-                if item.target in sharing.get(target, ())
-                and unknown.is_managed(respec_home, item)
-            ],
-            **extra[target],
-        }
-        for target, entry in owned
-    ]
+    first_of = {
+        target: group[0]
+        for _, group in unknown.folder_groups(state)
+        for target in group
+    }
+    order = list(targets.registry())
+    folders = []
+    for target in sorted(
+        state.owned, key=lambda t: order.index(t) if t in order else len(order)
+    ):
+        first = first_of[target]
+        folders.append(
+            {
+                "target": target,
+                "skills_dir": state.owned[target].skills_dir,
+                "same_as": None if target == first else first,
+                "skills": [
+                    {
+                        "name": item.name,
+                        "path": item.path,
+                        "mode": item.mode,
+                        "origin": global_skills.origin(
+                            respec_home, Path(item.path), item.name
+                        ),
+                    }
+                    for item in sorted(state.installed, key=lambda i: i.name)
+                    if target == first
+                    and first_of.get(item.target) == first
+                    and unknown.is_managed(respec_home, item)
+                ],
+            }
+        )
     return {
         "active_profile": state.active_profile,
         "targets": active_targets,
         "folders": folders,
+        "unresolved": [
+            entry.to_dict() for entry in unknown.find_unknown(respec_home, state)
+        ],
     }

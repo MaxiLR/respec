@@ -17,9 +17,14 @@ every path it creates, and hand edits make its record disagree with disk.
 
 - Pass `--json` to read results. Every command except `tui` accepts it. JSON
   objects carry a `warnings` list; each warning has a `type`
-  (`layer-conflict` or `unknown-entry`) and a `message`.
-- Exit code 0 means done; 1 means refused or failed, with the reason in
-  `error` (JSON) or on stderr. A refused command changes nothing unless its
+  (`layer-conflict`) and a `message`. Unknown entries still waiting for a
+  decision are listed under `unresolved`; entries a command resolved are
+  under `resolved`. Fields that do not apply are left out; only
+  `active_profile`, `previous_profile`, `same_as` and values under `restored`
+  can be `null` (meaning none).
+- Exit code 0 means done; 1 means refused or failed. `use`, `adopt` and
+  `restore` then print their usual JSON keys plus `error`; other commands
+  print the reason on stderr. A refused command changes nothing unless its
   output reports what it already did.
 - Commands that change a profile take `-p <profile>`; without it they change
   the active profile.
@@ -51,8 +56,9 @@ Every enabled skill of a profile goes to all of that profile's targets.
   copy a whole profile folder (with `profile.yaml`) from a git repository
   once. It is then owned locally; respec does not track it upstream.
 - `respec use <profile> [--unknown add|remove]`: activate a profile.
-- `respec status`: active profile, its targets, and the managed skills and
-  unknown entries in each folder respec owns.
+- `respec status`: active profile, its targets, and the managed skills in
+  each folder respec owns (each marked by `origin`: `profile`, `shipped` or
+  `global`), plus the unknown entries (`unresolved`).
 - `respec tui` (or `respec` alone on a terminal): the terminal UI.
 
 ### Skills
@@ -100,7 +106,9 @@ yet). Skills outside layers, and skills of a layer turned off, are additive.
   exclusive layer with several enabled skills (for example after a hand edit):
   keep one, disable the rest. Without `--keep`, a terminal asks; other runs
   keep the first listed skill. `respec use` refuses a profile with such a
-  conflict until it is repaired.
+  conflict until it is repaired. A repair goes ahead while unknown entries
+  (even an edited copy of a skill in that layer) wait for `respec adopt`; it
+  never touches them.
 
 ### Unknown entries (adopt)
 

@@ -279,6 +279,7 @@ def test_status_json_before_any_switch(run):
         "active_profile": None,
         "targets": [],
         "folders": [],
+        "unresolved": [],
     }
 
 
@@ -307,7 +308,6 @@ def test_status_json_shows_profile_targets_and_items_per_folder(
                 "skills_dir": str(dirs["claude-code"]),
                 "skills": [],
                 "same_as": None,
-                "unknown": [],
             },
             {
                 "target": "agents",
@@ -317,17 +317,19 @@ def test_status_json_shows_profile_targets_and_items_per_folder(
                         "name": "lint",
                         "path": str(dirs["agents"] / "lint"),
                         "mode": "symlink",
+                        "origin": "profile",
                     },
                     {
                         "name": "review",
                         "path": str(dirs["agents"] / "review"),
                         "mode": "symlink",
+                        "origin": "profile",
                     },
                 ],
                 "same_as": None,
-                "unknown": [],
             },
         ],
+        "unresolved": [],
     }
 
 

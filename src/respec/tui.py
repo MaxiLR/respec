@@ -303,21 +303,11 @@ def _profile_rows(respec_home: Path) -> list[tuple[str, str]]:
     return rows
 
 
-def _lasting_kinds(respec_home: Path) -> dict[str, str]:
-    """Skills respec installs beside every profile: name -> shipped or global."""
-    kinds = {name: "shipped" for name in global_skills.shipped_names()}
-    try:
-        kinds.update(
-            (name, "global") for name in global_skills.load_global(respec_home)
-        )
-    except RespecError:
-        pass  # Sync and every switch report an unreadable config.yaml
-    return kinds
-
-
-def _folder_text(folder: dict[str, Any], kinds: dict[str, str] | None = None) -> Text:
-    """One target folder of :func:`respec.switch.status` as styled text."""
-    kinds = kinds or {}
+def _folder_text(
+    folder: dict[str, Any], unresolved: Sequence[dict[str, Any]] = ()
+) -> Text:
+    """One target folder of :func:`respec.switch.status` as styled text, with
+    the report's unresolved entries that live in it."""
     text = Text()
     text.append(folder["target"], style="bold")
     text.append(f"  {folder['skills_dir']}\n", style=MUTED)
@@ -326,15 +316,18 @@ def _folder_text(folder: dict[str, Any], kinds: dict[str, str] | None = None) ->
         return text
     lines: list[Text] = []
     for skill in folder["skills"]:
+        origin = skill["origin"]
         lines.append(
             Text.assemble(
                 ("● ", SUCCESS),
                 skill["name"],
                 (f"  {skill['mode']}", MUTED),
-                (f"  {kinds[skill['name']]}" if skill["name"] in kinds else "", ACCENT),
+                ("" if origin == "profile" else f"  {origin}", ACCENT),
             )
         )
-    for entry in folder["unknown"]:
+    for entry in unresolved:
+        if entry["targets"][0] != folder["target"]:
+            continue
         replaced = ", edited or replaced copy" if entry["replaced"] else ""
         lines.append(
             Text.assemble(
@@ -690,7 +683,7 @@ class ProfileScreen(Screen[None]):
             for skill in loose:
                 group.compose_add_child(self._skill_row(profile, skill))
             groups.append(group)
-        kinds = _lasting_kinds(self.respec_home)
+        kinds = global_skills.lasting_or_shipped(self.respec_home)
         if kinds:
             lines = [
                 Text.assemble(
@@ -1408,7 +1401,12 @@ class RespecApp(App[None]):
         try:
             report = switch.status(self.respec_home)
         except RespecError as error:
-            report = {"active_profile": None, "targets": [], "folders": []}
+            report = {
+                "active_profile": None,
+                "targets": [],
+                "folders": [],
+                "unresolved": [],
+            }
             self.show_feedback(f"error: {error}", ok=False)
         self.active = report["active_profile"]
         if self.active is None:
@@ -1423,7 +1421,7 @@ class RespecApp(App[None]):
                 )
             )
         await self._render_profiles()
-        await self._render_status(report["folders"])
+        await self._render_status(report)
 
     async def _render_profiles(self) -> None:
         rows = _profile_rows(self.respec_home)
@@ -1443,7 +1441,8 @@ class RespecApp(App[None]):
         listing.display = bool(rows)
         self._update_activate()
 
-    async def _render_status(self, folders: list[dict[str, Any]]) -> None:
+    async def _render_status(self, report: dict[str, Any]) -> None:
+        folders = report["folders"]
         panel = self.query_one("#status", VerticalScroll)
         await panel.remove_children()
         if not folders:
@@ -1455,10 +1454,9 @@ class RespecApp(App[None]):
                 )
             )
             return
-        kinds = _lasting_kinds(self.respec_home)
         await panel.mount_all(
             Static(
-                _folder_text(f, kinds),
+                _folder_text(f, report["unresolved"]),
                 id=_dom_id("folder", f["target"]),
                 classes="folder",
             )

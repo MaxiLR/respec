@@ -19,9 +19,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import items, profiles
+from respec import items, profiles, switch
 from respec.errors import RespecError
-from respec.state import load_state
+from respec.state import load_state, save_state
 
 
 @dataclass
@@ -185,9 +185,7 @@ def add_skill(
     after, layer = _with_member(before, name, item)
     if layer.exclusive and layer.active:
         others = [
-            other
-            for other in layer.items
-            if other != item and after.skills[other].enabled
+            other for other in profiles.enabled_members(after, name) if other != item
         ]
         if others and after.skills[item].enabled:
             after = profiles.with_enabled(after, [item], False)
@@ -339,4 +337,49 @@ def repair(
         skill=keep,
         disabled=disabled,
     )
-    return _apply(respec_home, user_home, before, after, change)
+    try:
+        return _apply(respec_home, user_home, before, after, change)
+    except switch.UnknownEntries:
+        # The full refresh is refused by unknown entries (profile.yaml is back
+        # as it was). A repair only disables skills, so it goes ahead without
+        # the refresh: it changes only links respec manages and never touches
+        # an unknown entry, which keeps waiting for 'respec adopt' (an edited
+        # copy of a layer skill included).
+        if not change.active:
+            raise
+    return _repair_links(respec_home, user_home, after, change)
+
+
+def _repair_links(
+    respec_home: Path,
+    user_home: Path,
+    after: profiles.Profile,
+    change: LayerChange,
+) -> LayerChange:
+    """Save a repair of the active profile and change only the links of its
+    skills: unlink the disabled ones and link the kept one. Only paths that
+    still hold what respec placed are removed, and only free paths are linked;
+    unknown entries (also at those skills' paths) are left for 'respec adopt'.
+    """
+    profiles.save_profile(after)
+    state = load_state(respec_home)
+    try:
+        for item in list(state.installed):
+            if item.name in change.disabled and switch.remove_installed(
+                respec_home, item
+            ):
+                state.installed.remove(item)
+                change.unlinked.append(item.path)
+                save_state(respec_home, state)
+        assert change.skill is not None
+        change.linked = switch.link_skills(
+            respec_home, user_home, after.name, [change.skill]
+        ).linked
+    except (OSError, RespecError) as error:
+        raise RespecError(
+            f"repair of layer {change.layer!r} did not complete: {error}\n"
+            f"Profile {change.profile!r} keeps the repair; the links changed so "
+            "far are recorded, and the next 'respec use' puts the rest in line."
+        ) from None
+    change.unlinked.sort()
+    return change

@@ -1089,7 +1089,7 @@ def test_file_url_under_the_configured_base_url_is_allowed(run, sourced):
 def test_update_in_copy_mode_refreshes_copies_and_records_their_digest(
     run, sourced, claude_dir, isolated_homes, monkeypatch
 ):
-    from respec import unknown
+    from respec import trees
 
     def refuse(*args, **kwargs):
         raise OSError("symlinks not permitted")
@@ -1107,7 +1107,7 @@ def test_update_in_copy_mode_refreshes_copies_and_records_their_digest(
     state = json.loads((isolated_homes.respec_home / "state.json").read_text())
     recorded = {Path(item["path"]).name: item for item in state["installed"]}
     assert recorded["tdd"]["mode"] == "copy"
-    assert recorded["tdd"]["digest"] == unknown.digest(copy)
+    assert recorded["tdd"]["digest"] == trees.digest(copy)
     # The refreshed copy counts as managed: a later switch is not blocked.
     ok(run("use", "work"))
 
@@ -1424,3 +1424,17 @@ def test_git_can_be_cancelled_and_nothing_is_added(run, silent_server, profiles_
             )
 
     assert read_yaml(profiles_root, "work")["skills"] == {}
+
+
+def test_git_commands_print_no_undocumented_nulls(run, upstream, assert_no_nulls):
+    repo = upstream("acme/skills")
+    repo.write("skills/tdd/SKILL.md", "# tdd v1\n")
+    repo.commit()
+    new_profile(run)
+    ok(run("use", "work"))
+    assert_no_nulls(json.loads(ok(run("add", "acme/skills", "--json")).stdout))
+    repo.write("skills/tdd/SKILL.md", "# tdd v2\n")
+    repo.commit()
+
+    for args in (("update", "--check"), ("update",), ("update", "--check")):
+        assert_no_nulls(json.loads(ok(run(*args, "--json")).stdout))

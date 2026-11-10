@@ -180,8 +180,7 @@ def test_unknown_entry_added_to_the_active_profile_through_sync(
 
     assert "stray" in enabled(respec_home, "work")
     assert (claude_dir / "stray").is_symlink()
-    claude = status_json(run)["folders"][0]
-    assert claude["unknown"] == []
+    assert status_json(run)["unresolved"] == []
 
 
 def test_unknown_entry_removed_through_sync_is_backed_up_and_reported(
@@ -282,6 +281,43 @@ def test_layer_conflict_is_listed_and_repaired_keeping_the_chosen_skill(
     drive(isolated_homes, scenario)
 
     assert enabled(respec_home, "work") == {"d2"}
+
+
+def test_sync_repairs_a_conflict_while_an_edited_copy_waits_then_adds_it(
+    isolated_homes, respec_home, run, claude_dir
+):
+    skills = {"d1": True, "d2": False, "s1": True}
+    layers = {"design-principles": {"skills": ["d1", "d2"]}}
+    make_profile(respec_home, "work", ["claude-code"], skills, layers)
+    ok(run("use", "work"))
+    write_yaml(
+        respec_home,
+        "work",
+        ["claude-code"],
+        {"d1": True, "d2": True, "s1": True},
+        layers,
+    )
+    (claude_dir / "s1").unlink()
+    drop_skill(claude_dir, "s1")
+
+    async def scenario(app, pilot):
+        await open_sync(app, pilot)
+        await pilot.click("#sync-conflict-0-repair")
+        await pilot.pause()
+        assert "Repaired layer 'design-principles'" in log(app)
+        assert "1 unknown" in summary(app)
+        await pilot.click("#sync-unknown-0-add")
+        await pilot.click("#sync-resolve")
+        await pilot.pause()
+        assert "Replaced the copy of 's1'" in log(app)
+        assert "All in sync" in summary(app)
+
+    drive(isolated_homes, scenario)
+
+    assert enabled(respec_home, "work") == {"d1", "s1"}
+    skill_file = respec_home / "profiles" / "work" / "skills" / "s1" / "SKILL.md"
+    assert skill_file.read_text() == "foreign\n"
+    assert (claude_dir / "s1").is_symlink()
 
 
 def test_conflict_in_an_inactive_profile_is_found_too(
@@ -517,3 +553,36 @@ def test_shipped_and_global_skills_are_marked_in_the_tui(
         assert "respec" in lasting and "gnotes" in lasting
 
     drive(isolated_homes, scenario)
+
+
+@pytest.mark.shipped
+def test_link_row_of_a_global_skill_without_a_folder_points_to_config_yaml(
+    isolated_homes, respec_home, with_everything
+):
+    from respec import sync
+
+    (respec_home / "config.yaml").write_text(
+        yaml.safe_dump({"global": {"skills": ["gnotes", "ghost"]}})
+    )
+
+    report = sync.check(respec_home, isolated_homes.home)
+
+    [row] = [p.describe() for p in report.links if p.skill == "ghost"]
+    assert "enabled in the active profile" not in row
+    assert "global skill" in row and "config.yaml" in row
+    assert str(respec_home / "global" / "skills" / "ghost") in row
+
+
+@pytest.mark.shipped
+def test_link_row_of_a_global_skill_dropped_from_config_yaml_says_so(
+    isolated_homes, respec_home, with_everything
+):
+    from respec import sync
+
+    (respec_home / "config.yaml").write_text(yaml.safe_dump({"global": {}}))
+
+    report = sync.check(respec_home, isolated_homes.home)
+
+    [row] = [p.describe() for p in report.links if p.skill == "gnotes"]
+    assert "active profile" not in row
+    assert "config.yaml" in row

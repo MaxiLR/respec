@@ -22,7 +22,6 @@ need the same entry in a target folder, so the switch refuses.
 
 from __future__ import annotations
 
-import filecmp
 import shutil
 from collections.abc import Iterable
 from importlib import resources
@@ -31,7 +30,7 @@ from typing import Any
 
 import yaml
 
-from respec import profiles
+from respec import profiles, trees
 from respec.errors import RespecError
 
 CONFIG_FILE = "config.yaml"
@@ -53,13 +52,15 @@ def shipped_dir(respec_home: Path) -> Path:
     return respec_home / SHIPPED_DIR
 
 
-def source_roots(respec_home: Path) -> list[Path]:
-    """Folders that respec's links point into (resolved)."""
-    return [
-        profiles.profiles_dir(respec_home).resolve(),
-        (respec_home / GLOBAL_DIR).resolve(),
-        shipped_dir(respec_home).resolve(),
+def source_roots(respec_home: Path, resolve: bool = True) -> list[Path]:
+    """Folders that respec's links point into (resolved unless ``resolve`` is
+    false)."""
+    roots = [
+        profiles.profiles_dir(respec_home),
+        respec_home / GLOBAL_DIR,
+        shipped_dir(respec_home),
     ]
+    return [root.resolve() for root in roots] if resolve else roots
 
 
 def _bundled():
@@ -132,15 +133,74 @@ def load_global(respec_home: Path) -> tuple[str, ...]:
     return tuple(seen)
 
 
+SHIPPED = "shipped"
+GLOBAL = "global"
+PROFILE = "profile"
+
+
+def kinds(global_names: Iterable[str]) -> dict[str, str]:
+    """Skills installed beside every profile: name -> :data:`SHIPPED` or
+    :data:`GLOBAL`, for the given global section and the shipped skills."""
+    found = {name: GLOBAL for name in global_names}
+    found.update((name, SHIPPED) for name in shipped_names())
+    return found
+
+
+def lasting(respec_home: Path) -> dict[str, str]:
+    """:func:`kinds` of the global section and the shipped skills; raises
+    when ``config.yaml`` cannot be read."""
+    return kinds(load_global(respec_home))
+
+
+def lasting_or_shipped(respec_home: Path) -> dict[str, str]:
+    """:func:`lasting`, or only the shipped skills when ``config.yaml`` cannot
+    be read (every switch and Sync report that problem themselves)."""
+    try:
+        return lasting(respec_home)
+    except RespecError:
+        return kinds(())
+
+
 def reserved(respec_home: Path) -> dict[str, str]:
     """Names no profile skill may take, each with the reason."""
-    taken = {
-        name: "respec ships a skill of that name and installs it into every target"
-        for name in shipped_names()
+    return {
+        name: (
+            "respec ships a skill of that name and installs it into every target"
+            if kind == SHIPPED
+            else f"it is a global skill listed in {config_path(respec_home)}"
+        )
+        for name, kind in lasting(respec_home).items()
     }
-    for name in load_global(respec_home):
-        taken[name] = f"it is a global skill listed in {config_path(respec_home)}"
-    return taken
+
+
+def origin(respec_home: Path, path: Path, name: str) -> str:
+    """Where an installed entry comes from: :data:`SHIPPED`, :data:`GLOBAL`
+    or ``"profile"``. A link is judged by what it points into; a copy, which
+    does not say, by its name."""
+    if path.is_symlink():
+        linked = path.resolve()
+        for root, kind in (
+            (shipped_dir(respec_home).resolve(), SHIPPED),
+            (global_skills_dir(respec_home).resolve(), GLOBAL),
+        ):
+            if linked == root or root in linked.parents:
+                return kind
+        return PROFILE
+    return lasting_or_shipped(respec_home).get(name, PROFILE)
+
+
+def clash(respec_home: Path, name: str) -> str | None:
+    """Why an unknown entry called ``name`` can only be removed, when a shipped
+    or global skill has that name (respec links its own skill there)."""
+    kind = lasting_or_shipped(respec_home).get(name)
+    if kind == SHIPPED:
+        return f"respec ships a skill named {name!r}, so it can only be removed"
+    if kind == GLOBAL:
+        return (
+            f"{name!r} is a global skill listed in {config_path(respec_home)}, "
+            "so it can only be removed"
+        )
+    return None
 
 
 def refuse_reserved(
@@ -178,18 +238,6 @@ def check_sources(respec_home: Path, names: tuple[str, ...]) -> list[str]:
     ]
 
 
-def _same_tree(left: Path, right: Path) -> bool:
-    compared = filecmp.dircmp(left, right, ignore=[])
-    if compared.left_only or compared.right_only or compared.funny_files:
-        return False
-    _, mismatch, errors = filecmp.cmpfiles(
-        left, right, compared.common_files, shallow=False
-    )
-    if mismatch or errors:
-        return False
-    return all(_same_tree(left / sub, right / sub) for sub in compared.common_dirs)
-
-
 def refresh_shipped(respec_home: Path) -> None:
     """Bring ``<respec home>/shipped/<name>/`` in line with the bundled files.
 
@@ -202,7 +250,8 @@ def refresh_shipped(respec_home: Path) -> None:
         destination = root / name
         with resources.as_file(_bundled().joinpath(name)) as bundled:
             if destination.is_dir() and not destination.is_symlink():
-                if _same_tree(Path(bundled), destination):
+                # Exact: every name counts, hidden files included.
+                if trees.same_content(Path(bundled), destination, ignore=()):
                     continue
             staged = root / f".{name}.new"
             shutil.rmtree(staged, ignore_errors=True)

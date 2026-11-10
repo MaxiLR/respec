@@ -220,14 +220,16 @@ def test_repair_of_named_inactive_profile_does_not_touch_targets(
 def test_repair_refused_by_switch_preflight_leaves_profile_unchanged(
     run, conflict, profiles_root, claude_dir
 ):
-    # A hand-made folder replaced c's link: the refresh would remove it.
-    (claude_dir / "c").unlink()
-    (claude_dir / "c").mkdir()
+    # The enabled skill c lost its folder: the refresh refuses. (Unknown
+    # entries no longer refuse a repair; see the fix-7 tests below.)
+    import shutil
+
+    shutil.rmtree(profiles_root / "work" / "skills" / "c")
     before = read_yaml(profiles_root)
 
     result = fails(run("layer", "repair", "design-principles", "--keep", "b"))
 
-    assert "not managed by respec" in result.output
+    assert "has no folder" in result.output
     assert read_yaml(profiles_root) == before
     assert linked(claude_dir) == {"a", "b", "c"}
 
@@ -685,18 +687,140 @@ def test_layer_off_that_resolves_a_conflict_links_the_enabled_skills(
     assert change["linked"] == [str(claude_dir / "b")]
 
 
-def test_json_warnings_hold_layer_conflicts_and_unknown_entries_together(
+def test_json_has_layer_conflict_warnings_beside_unresolved_entries(
     run, conflict, claude_dir
 ):
     (claude_dir / "stray").mkdir()
 
     result = ok(run("layer", "add", "x", "--additive", "-d", "X", "--json"))
 
-    warnings = json.loads(result.stdout)["warnings"]
-    assert sorted(w["type"] for w in warnings) == ["layer-conflict", "unknown-entry"]
-    layer = next(w for w in warnings if w["type"] == "layer-conflict")
-    entry = next(w for w in warnings if w["type"] == "unknown-entry")
+    data = json.loads(result.stdout)
+    [layer] = data["warnings"]
+    [entry] = data["unresolved"]
+    assert layer["type"] == "layer-conflict" and layer["message"]
     assert layer["layer"] == "design-principles"
     assert entry["path"] == str(claude_dir / "stray") and entry["kind"] == "folder"
-    assert all(w["message"] for w in warnings)
     assert "design-principles" in result.stderr and "stray" in result.stderr
+
+
+# fix-7: an edited copy and a layer conflict must not refuse each other's fix.
+
+
+def replace_with_edited_copy(claude_dir, name, text="edited by hand\n"):
+    """Swap respec's link for a hand-made folder (an edited or replaced copy)."""
+    (claude_dir / name).unlink()
+    (claude_dir / name).mkdir()
+    (claude_dir / name / "SKILL.md").write_text(text)
+    return claude_dir / name
+
+
+def test_repair_goes_ahead_while_an_unrelated_edited_copy_waits(
+    run, conflict, claude_dir, profiles_root
+):
+    edited = replace_with_edited_copy(claude_dir, "c")
+
+    repaired = ok(run("layer", "repair", "design-principles", "--keep", "b"))
+
+    assert enabled_skills(profiles_root) == {"b", "c"}
+    assert not (claude_dir / "a").exists()
+    assert (claude_dir / "b").is_symlink()
+    assert (edited / "SKILL.md").read_text() == "edited by hand\n"
+    assert "disabled" in repaired.output and "'a'" in repaired.output
+    assert str(edited) in repaired.stderr
+    # With the conflict gone, the edited copy can be added; nothing is stuck.
+    ok(run("adopt", "--add", "c"))
+    assert (claude_dir / "c").is_symlink()
+    copy = profiles_root / "work" / "skills" / "c" / "SKILL.md"
+    assert copy.read_text() == "edited by hand\n"
+    ok(run("use", "work"))
+
+
+def test_repair_json_reports_what_it_unlinked_beside_the_waiting_entry(
+    run, conflict, claude_dir
+):
+    edited = replace_with_edited_copy(claude_dir, "c")
+
+    data = json.loads(ok(run("layer", "repair", "design-principles", "--json")).stdout)
+
+    assert data["disabled"] == ["b"]
+    assert data["unlinked"] == [str(claude_dir / "b")]
+    assert [entry["path"] for entry in data["unresolved"]] == [str(edited)]
+
+
+def test_repair_refused_for_another_reason_beside_an_edited_copy_changes_nothing(
+    run, conflict, claude_dir, profiles_root, isolated_homes
+):
+    edited = replace_with_edited_copy(claude_dir, "a")
+    (isolated_homes.respec_home / "config.yaml").write_text("global: [\n")
+    yaml_before = (profiles_root / "work" / "profile.yaml").read_bytes()
+    state_file = isolated_homes.respec_home / "state.json"
+    state_before = state_file.read_bytes()
+
+    result = fails(run("layer", "repair", "design-principles", "--keep", "b"))
+
+    assert "config.yaml" in result.output
+    assert (edited / "SKILL.md").read_text() == "edited by hand\n"
+    assert (profiles_root / "work" / "profile.yaml").read_bytes() == yaml_before
+    assert state_file.read_bytes() == state_before
+
+
+def test_repair_link_failure_says_the_repair_was_kept(
+    run, conflict, claude_dir, profiles_root, monkeypatch
+):
+    from respec import switch
+
+    replace_with_edited_copy(claude_dir, "c")
+
+    def fail(*args, **kwargs):
+        raise switch.LinkFailed("linking refused for the test", [])
+
+    monkeypatch.setattr(switch, "link_skills", fail)
+
+    result = fails(run("layer", "repair", "design-principles", "--keep", "b"))
+
+    assert "refused for the test" in result.output
+    assert "keeps the repair" in result.output
+    assert enabled_skills(profiles_root) == {"b", "c"}
+
+
+# fix-7 review 1 B2: an edited copy of a member of the conflicted layer.
+
+
+def test_repair_keeping_the_edited_member_goes_ahead_and_the_copy_can_be_added(
+    run, conflict, claude_dir, profiles_root, isolated_homes
+):
+    edited = replace_with_edited_copy(claude_dir, "b")
+
+    ok(run("layer", "repair", "design-principles", "--keep", "b"))
+
+    assert enabled_skills(profiles_root) == {"b", "c"}
+    assert not (claude_dir / "a").exists()
+    assert (edited / "SKILL.md").read_text() == "edited by hand\n"
+    ok(run("adopt", "--add", "b"))
+    assert (claude_dir / "b").is_symlink()
+    copy = profiles_root / "work" / "skills" / "b" / "SKILL.md"
+    assert copy.read_text() == "edited by hand\n"
+    ok(run("use", "work"))
+
+
+def test_repair_disabling_the_edited_member_leaves_the_copy_waiting(
+    run, conflict, claude_dir, profiles_root
+):
+    edited = replace_with_edited_copy(claude_dir, "b")
+
+    data = json.loads(
+        ok(run("layer", "repair", "design-principles", "--keep", "a", "--json")).stdout
+    )
+
+    assert data["disabled"] == ["b"]
+    assert data["unlinked"] == []
+    assert [entry["path"] for entry in data["unresolved"]] == [str(edited)]
+    assert enabled_skills(profiles_root) == {"a", "c"}
+    assert (claude_dir / "a").is_symlink()
+    assert (edited / "SKILL.md").read_text() == "edited by hand\n"
+    # The edit is kept by adding it (to the now disabled skill), or removed.
+    ok(run("adopt", "--add", "b"))
+    copy = profiles_root / "work" / "skills" / "b" / "SKILL.md"
+    assert copy.read_text() == "edited by hand\n"
+    assert not (claude_dir / "b").exists()
+    ok(run("use", "work"))

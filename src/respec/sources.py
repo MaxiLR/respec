@@ -35,10 +35,9 @@ from pathlib import Path
 
 import yaml
 
-from respec import global_skills, items, profiles, unknown
+from respec import global_skills, items, profiles, trees
 from respec.errors import RespecError
 
-BASE_URL_ENV = profiles.GIT_BASE_URL_ENV
 SHORTHAND = profiles.REPO_SHORTHAND
 SCP_LIKE = profiles.REPO_SCP_LIKE
 # Transports git may use: no remote helpers such as ``fd::`` or ``ext::``.
@@ -323,7 +322,7 @@ def inside(tree: Path, path: str | None) -> Path:
 def _label(root: Path, entry: Path) -> str:
     """``entry`` relative to the repository root, for messages."""
     try:
-        return unknown.real(entry).relative_to(root).as_posix()
+        return trees.real(entry).relative_to(root).as_posix()
     except ValueError:
         return entry.name
 
