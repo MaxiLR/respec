@@ -37,6 +37,7 @@ from textual.widgets import (
 
 from respec import (
     adopt,
+    global_skills,
     items,
     layers,
     messages,
@@ -302,8 +303,21 @@ def _profile_rows(respec_home: Path) -> list[tuple[str, str]]:
     return rows
 
 
-def _folder_text(folder: dict[str, Any]) -> Text:
+def _lasting_kinds(respec_home: Path) -> dict[str, str]:
+    """Skills respec installs beside every profile: name -> shipped or global."""
+    kinds = {name: "shipped" for name in global_skills.shipped_names()}
+    try:
+        kinds.update(
+            (name, "global") for name in global_skills.load_global(respec_home)
+        )
+    except RespecError:
+        pass  # Sync and every switch report an unreadable config.yaml
+    return kinds
+
+
+def _folder_text(folder: dict[str, Any], kinds: dict[str, str] | None = None) -> Text:
     """One target folder of :func:`respec.switch.status` as styled text."""
+    kinds = kinds or {}
     text = Text()
     text.append(folder["target"], style="bold")
     text.append(f"  {folder['skills_dir']}\n", style=MUTED)
@@ -313,7 +327,12 @@ def _folder_text(folder: dict[str, Any]) -> Text:
     lines: list[Text] = []
     for skill in folder["skills"]:
         lines.append(
-            Text.assemble(("● ", SUCCESS), skill["name"], (f"  {skill['mode']}", MUTED))
+            Text.assemble(
+                ("● ", SUCCESS),
+                skill["name"],
+                (f"  {skill['mode']}", MUTED),
+                (f"  {kinds[skill['name']]}" if skill["name"] in kinds else "", ACCENT),
+            )
         )
     for entry in folder["unknown"]:
         replaced = ", edited or replaced copy" if entry["replaced"] else ""
@@ -411,7 +430,9 @@ class AdoptDialog(ModalScreen[dict[str, str] | None]):
                         yield Static(entry.path, classes="unknown-path")
                         yield Static(_unknown_meta(entry), classes="unknown-meta")
                         with RadioSet(id=f"unknown-{index}-choice"):
-                            for choice in adopt.choices(self.profile):
+                            for choice in adopt.choices(
+                                self.profile, entry, self.app.respec_home
+                            ):
                                 yield RadioButton(
                                     labels[choice], id=f"unknown-{index}-{choice}"
                                 )
@@ -668,6 +689,31 @@ class ProfileScreen(Screen[None]):
             )
             for skill in loose:
                 group.compose_add_child(self._skill_row(profile, skill))
+            groups.append(group)
+        kinds = _lasting_kinds(self.respec_home)
+        if kinds:
+            lines = [
+                Text.assemble(
+                    (name, "bold"),
+                    (
+                        "  shipped with respec, in every target"
+                        if kind == "shipped"
+                        else "  global (config.yaml), in this profile's targets"
+                    ),
+                )
+                for name, kind in kinds.items()
+            ]
+            group = Vertical(id="lasting", classes="group")
+            group.compose_add_child(
+                Static(
+                    Text("Also installed", style="bold")
+                    + Text("  whenever a profile is active", style=SECONDARY),
+                    classes="group-title",
+                )
+            )
+            group.compose_add_child(
+                Static(Text("\n").join(lines), classes="section-intro")
+            )
             groups.append(group)
         if not profile.skills:
             groups.insert(
@@ -1082,7 +1128,7 @@ class SyncScreen(ModalScreen[None]):
                 RadioSet(
                     *(
                         RadioButton(labels[choice], id=f"sync-unknown-{index}-{choice}")
-                        for choice in adopt.choices(profile)
+                        for choice in adopt.choices(profile, entry, self.respec_home)
                     ),
                     id=f"sync-unknown-{index}-choice",
                 )
@@ -1409,8 +1455,13 @@ class RespecApp(App[None]):
                 )
             )
             return
+        kinds = _lasting_kinds(self.respec_home)
         await panel.mount_all(
-            Static(_folder_text(f), id=_dom_id("folder", f["target"]), classes="folder")
+            Static(
+                _folder_text(f, kinds),
+                id=_dom_id("folder", f["target"]),
+                classes="folder",
+            )
             for f in folders
         )
 

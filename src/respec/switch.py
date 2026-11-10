@@ -184,6 +184,16 @@ def _plan_all(
     return plan
 
 
+def plan(
+    respec_home: Path, user_home: Path, profile: profiles.Profile
+) -> list[tuple[str, str, Path, Path]]:
+    """Everything :func:`use` installs for ``profile``, as (target, skill,
+    source, destination): its enabled skills, global skills and respec's
+    shipped skills. The public seam for checks that compare against a switch.
+    """
+    return _plan_all(respec_home, user_home, profile)
+
+
 def _switch_targets(profile: profiles.Profile) -> list[str]:
     """Targets a switch to ``profile`` writes into, in registry order."""
     wanted = set(profile.targets)

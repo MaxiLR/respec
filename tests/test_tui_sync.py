@@ -391,3 +391,129 @@ def test_skill_enabled_by_hand_but_not_linked_is_found(
     drive(isolated_homes, scenario)
 
     assert (claude_dir / "s2").is_symlink()
+
+
+# --- shipped and global skills -----------------------------------------------
+
+
+def make_global(respec_home, *names):
+    for name in names:
+        folder = respec_home / "global" / "skills" / name
+        folder.mkdir(parents=True)
+        (folder / "SKILL.md").write_text(f"# global {name}\n")
+    (respec_home / "config.yaml").write_text(
+        yaml.safe_dump({"global": {"skills": list(names)}})
+    )
+
+
+@pytest.fixture
+def with_everything(respec_home, run):
+    """Profile ``work`` (claude-code) with a global skill, shipped skills on."""
+    make_global(respec_home, "gnotes")
+    make_profile(respec_home, "work", ["claude-code"], {"s1": True})
+    ok(run("use", "work"))
+
+
+@pytest.mark.shipped
+def test_clean_use_with_shipped_and_global_skills_is_in_sync(
+    isolated_homes, with_everything, claude_dir
+):
+    from respec import sync
+
+    assert {"respec", "profile-maker", "gnotes", "s1"} <= set(os.listdir(claude_dir))
+    report = sync.check(isolated_homes.respec_home, isolated_homes.home)
+    assert report.clean, report
+
+    async def scenario(app, pilot):
+        await open_sync(app, pilot)
+        assert "All in sync" in summary(app)
+
+    drive(isolated_homes, scenario)
+
+
+@pytest.mark.shipped
+@pytest.mark.parametrize("gone", ["respec", "gnotes"])
+def test_reapply_puts_back_a_removed_shipped_or_global_link(
+    isolated_homes, with_everything, claude_dir, gone
+):
+    (claude_dir / gone).unlink()
+
+    async def scenario(app, pilot):
+        await open_sync(app, pilot)
+        assert "1 link problem" in summary(app)
+        assert gone in text_of(app.screen.query_one("#sync-links"))
+        await pilot.click("#sync-relink")
+        await pilot.pause()
+        assert "All in sync" in summary(app)
+
+    drive(isolated_homes, scenario)
+
+    assert (claude_dir / gone).is_symlink()
+
+
+@pytest.mark.shipped
+def test_global_skill_listed_by_hand_but_not_linked_is_found(
+    isolated_homes, respec_home, with_everything, claude_dir
+):
+    (respec_home / "global" / "skills" / "later").mkdir()
+    (respec_home / "global" / "skills" / "later" / "SKILL.md").write_text("# l\n")
+    (respec_home / "config.yaml").write_text(
+        yaml.safe_dump({"global": {"skills": ["gnotes", "later"]}})
+    )
+
+    async def scenario(app, pilot):
+        await open_sync(app, pilot)
+        links = text_of(app.screen.query_one("#sync-links"))
+        assert "later" in links and "not linked" in links
+        await pilot.click("#sync-relink")
+        await pilot.pause()
+        assert "All in sync" in summary(app)
+
+    drive(isolated_homes, scenario)
+
+    assert (claude_dir / "later").is_symlink()
+
+
+@pytest.mark.shipped
+@pytest.mark.parametrize("name", ["respec", "gnotes"])
+def test_entry_named_like_a_shipped_or_global_skill_can_only_be_removed(
+    isolated_homes, with_everything, claude_dir, name
+):
+    (claude_dir / name).unlink()
+    drop_skill(claude_dir, name)
+
+    async def scenario(app, pilot):
+        await open_sync(app, pilot)
+        assert app.screen.query("#sync-unknown-0-remove")
+        assert not app.screen.query("#sync-unknown-0-add")
+        await pilot.press("escape")
+        await pilot.pause()
+        await pilot.press("a")  # the adopt dialog offers the same
+        await pilot.pause()
+        assert app.screen.query("#unknown-0-remove")
+        assert not app.screen.query("#unknown-0-add")
+        await pilot.click("#unknown-0-remove")
+        await pilot.click("#apply")
+        await pilot.pause()
+
+    drive(isolated_homes, scenario)
+
+    # respec links its own skill there again.
+    assert (claude_dir / name).is_symlink()
+
+
+@pytest.mark.shipped
+def test_shipped_and_global_skills_are_marked_in_the_tui(
+    isolated_homes, with_everything
+):
+    async def scenario(app, pilot):
+        panel = text_of(app.query_one("#folder-claude-code"))
+        lines = {line.split()[1]: line for line in panel.splitlines()[1:]}
+        assert "shipped" in lines["respec"] and "global" in lines["gnotes"]
+        assert "shipped" not in lines["s1"] and "global" not in lines["s1"]
+        await pilot.press("e")
+        await pilot.pause()
+        lasting = text_of(app.screen.query_one("#lasting .section-intro"))
+        assert "respec" in lasting and "gnotes" in lasting
+
+    drive(isolated_homes, scenario)

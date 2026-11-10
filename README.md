@@ -157,7 +157,9 @@ copies (add to the active profile, or back up and remove, as `respec adopt`),
 exclusive layers with several enabled skills (keep one, as `respec layer
 repair`), and links respec placed that are missing, broken or out of line with
 the active profile (re-apply it). Each fix is listed with its backups; with
-nothing found it says everything is in sync.
+nothing found it says everything is in sync. Shipped and global skills are marked
+in the status panel and the editor; Sync expects them where `respec use` puts
+them, and an entry in their place can only be removed.
 
 ### Layers
 

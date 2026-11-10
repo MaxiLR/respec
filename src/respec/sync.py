@@ -102,7 +102,7 @@ def _link_problems(
     # What the switching engine would install for the active profile.
     expected = {
         unknown.real(destination): (target, skill)
-        for target, skill, _, destination in switch._plan(active, user_home)
+        for target, skill, _, destination in switch.plan(respec_home, user_home, active)
     }
     for key, (target, skill) in expected.items():
         if key not in recorded and not os.path.lexists(key):
