@@ -15,10 +15,10 @@ import typer
 from respec import adopt as adopt_entries
 from respec import global_skills, items, journal, layers, messages, paths, profiles
 from respec import sources
-from respec import switch, targets, trees, unknown
+from respec import switch, takeovers, targets, trees, unknown
 from respec import restore as restore_backups
 from respec.errors import RespecError
-from respec.state import StateInvalid, load_state
+from respec.state import StateInvalid, active_or_none, load_state
 
 app = typer.Typer(
     help="Switchable global profiles of agent skills. Without a command, opens the TUI.",
@@ -43,6 +43,7 @@ def main(ctx: typer.Context) -> None:
     ctx.obj = Homes(respec_home=paths.respec_home(), user_home=paths.user_home())
     profiles.take_warnings()  # start clean; one process may run several commands
     restore_backups.take_unreadable()
+    takeovers.take_problems()
     _failure.clear()
     # A change that was cut short is finished (or rolled back) by the next
     # command that changes skills, and reported as a warning.
@@ -98,6 +99,8 @@ def _print_warnings() -> None:
             typer.echo(f"warning: {conflict.message}", err=True)
     for path in restore_backups.take_unreadable():
         typer.echo(f"warning: {_manifest_note(path)}", err=True)
+    for problem in takeovers.take_problems():
+        typer.echo(f"warning: {problem.message}", err=True)
     for report in _journal_reports(take=True):
         if report.message not in explained:
             typer.echo(f"warning: {report.message}", err=True)
@@ -141,10 +144,17 @@ def _print_json(data: Any) -> None:
     - ``layer-conflict``: an exclusive layer of a profile the command read
       has several enabled skills, as the command left it (``profile``,
       ``layer``, ``skills``, ``fix``);
+    - ``unreadable-manifest``: a backup run's ``manifest.json`` could not be
+      read during a restore, so every entry of that run was put back as the
+      user's (``path``);
+    - ``unreadable-takeover-log``: ``takeovers.json`` could not be read
+      (``path``: where it is now, in a backup run once respec wrote a new log);
     - ``interrupted-operation``: a change that was cut short, which this
-      command finished or rolled back, or which still waits (``operation``,
-      ``outcome``: ``finished``, ``rolled-back`` or ``pending``,
-      ``set_aside``, and ``profile`` when it concerns one).
+      command finished or rolled back, or which still waits (``operation``:
+      a journaled operation, or ``state`` for a rebuilt ``state.json``;
+      ``outcome``: ``finished``, ``rolled-back``, ``rebuilt`` or ``pending``;
+      ``set_aside``; ``profile`` when it concerns one; ``in_flight`` when it
+      waits and the entry its step in flight was changing exists).
 
     Unknown entries are not warnings: commands list them under ``unresolved``.
     """
@@ -153,8 +163,8 @@ def _print_json(data: Any) -> None:
             {"type": "layer-conflict", **conflict.to_dict()}
             for conflict in profiles.peek_warnings()
         ]
-        interrupted = [report.to_warning() for report in _journal_reports()]
-        interrupted += [
+        others = [report.to_warning() for report in _journal_reports()]
+        others += [
             {
                 "type": "unreadable-manifest",
                 "path": path,
@@ -162,9 +172,10 @@ def _print_json(data: Any) -> None:
             }
             for path in restore_backups.peek_unreadable()
         ]
+        others += [problem.to_warning() for problem in takeovers.peek_problems()]
         data = {
             **data,
-            "warnings": layer_conflicts + interrupted + list(data.get("warnings", [])),
+            "warnings": layer_conflicts + others + list(data.get("warnings", [])),
         }
     typer.echo(json.dumps(_without_nulls(data), indent=2))
 
@@ -474,13 +485,6 @@ class _SwitchRun:
             self.errors.append(str(error))
             return dict(self.result.backups) if self.result else {}
 
-    def _active(self) -> str | None:
-        """The profile active on disk now (a refused switch leaves it as is)."""
-        try:
-            return load_state(self.homes.respec_home).active_profile
-        except RespecError:
-            return None
-
     def finish(self, as_json: bool) -> None:
         """Report everything, then exit 1 unless the switch and its choices
         all went through (an interrupted takeover prompt still exits 0)."""
@@ -511,7 +515,10 @@ class _SwitchRun:
         unresolved = _unresolved(self.homes, self.blocking)
         if as_json:
             data: dict[str, Any] = {
-                "active_profile": result.profile if result else self._active(),
+                # A refused switch leaves the profile active on disk as is.
+                "active_profile": (
+                    result.profile if result else active_or_none(self.homes.respec_home)
+                ),
                 "previous_profile": result.previous if result else None,
                 "backups": backups,
                 "removed": [item.path for item in result.removed] if result else [],
@@ -688,7 +695,7 @@ def recover(
         if as_json:
             _print_json(
                 {
-                    "active_profile": _active_or_none(homes),
+                    "active_profile": active_or_none(homes.respec_home),
                     "recovered": False,
                     "error": str(error),
                 }
@@ -703,13 +710,6 @@ def recover(
         return
     journal.take_reports()  # printed here, not again as a warning
     typer.echo(report.message)
-
-
-def _active_or_none(homes: Homes) -> str | None:
-    try:
-        return load_state(homes.respec_home).active_profile
-    except RespecError:
-        return None
 
 
 ProfileOption = Annotated[
@@ -1258,6 +1258,7 @@ def restore(
 ) -> None:
     """Put a backup back and release every folder respec owns."""
     homes = _homes(ctx)
+    _refuse_mixed_restore_options(list_only, release_only, on_unknown, overwrite)
     if release_only:
         _release_only(homes, backup, as_json)
         return
@@ -1281,16 +1282,10 @@ def restore(
         # Running the same restore again finishes the interrupted one.
         finished = waiting is not None and waiting.get("operation") == "restore"
         if finished and _check_same_restore(homes, waiting, backup):
-            journal.recover(homes.respec_home, homes.user_home)
+            _finish_restore(homes, waiting, as_json)
+            return
     except RespecError as error:
         _fail(error)
-    if finished:
-        if as_json:
-            empty = restore_backups.RestoreResult(backup=None)
-            _print_json({**_restore_payload(empty, []), "resolved": []})
-        else:
-            typer.echo("respec released its folders; no profile is active.")
-        return
     interactive = _interactive() and not as_json
     resolutions: list[adopt_entries.Resolution] = []
     try:
@@ -1342,6 +1337,15 @@ def restore(
             as_json,
             _restore_payload(progress, _unresolved(homes, warn=False)),
         )
+    _report_restore(homes, result, resolutions, as_json)
+
+
+def _report_restore(
+    homes: Homes,
+    result: restore_backups.RestoreResult,
+    resolutions: list[adopt_entries.Resolution],
+    as_json: bool,
+) -> None:
     if as_json:
         _print_json(
             {
@@ -1362,6 +1366,53 @@ def restore(
     for path in result.left:
         typer.echo(f"Left {path} in place: hidden, not in the backup")
     typer.echo("respec released its folders; no profile is active.")
+
+
+def _finish_restore(homes: Homes, waiting: dict[str, Any], as_json: bool) -> None:
+    """Finish the interrupted restore (``waiting``) and report what this run
+    did, as that restore would have."""
+    report = journal.recover(homes.respec_home, homes.user_home)
+    result = report.result if report is not None else None
+    if not isinstance(result, restore_backups.RestoreResult):
+        result = restore_backups.RestoreResult(backup=None)
+    if waiting.get("release_only"):
+        _report_release(homes, result, as_json)
+    else:
+        _report_restore(homes, result, [], as_json)
+
+
+def _refuse_mixed_restore_options(
+    list_only: bool,
+    release_only: bool,
+    on_unknown: UnknownChoice | None,
+    overwrite: bool,
+) -> None:
+    """``--list`` only reads and ``--release-only`` puts nothing back: options
+    of another kind of restore are refused before anything happens."""
+    given = [
+        option
+        for option, used in (
+            ("--release-only", release_only),
+            ("--unknown", on_unknown is not None),
+            ("--overwrite", overwrite),
+        )
+        if used
+    ]
+    if list_only and given:
+        _fail(
+            RespecError(
+                f"'--list' only lists backups and cannot be combined with "
+                f"{', '.join(repr(o) for o in given)}; nothing was changed."
+            )
+        )
+    if release_only and len(given) > 1:
+        _fail(
+            RespecError(
+                "'--release-only' puts no backup back, so it overwrites nothing "
+                "and cannot be combined with "
+                f"{', '.join(repr(o) for o in given[1:])}; nothing was changed."
+            )
+        )
 
 
 def _check_same_restore(
@@ -1387,6 +1438,14 @@ def _check_same_restore(
 def _release_only(homes: Homes, backup: str | None, as_json: bool) -> None:
     if backup is not None:
         _fail(RespecError("'--release-only' puts no backup back; name none"))
+    try:
+        waiting = load_state(homes.respec_home).journal
+        if waiting is not None and waiting.get("release_only"):
+            # Running it again finishes the interrupted one.
+            _finish_restore(homes, waiting, as_json)
+            return
+    except RespecError as error:
+        _fail(error)
     progress = restore_backups.RestoreResult(backup=None)
     try:
         result = restore_backups.release_only(
@@ -1404,6 +1463,12 @@ def _release_only(homes: Homes, backup: str | None, as_json: bool) -> None:
             )
             raise typer.Exit(code=1)
         _fail(error)
+    _report_release(homes, result, as_json)
+
+
+def _report_release(
+    homes: Homes, result: restore_backups.RestoreResult, as_json: bool
+) -> None:
     if as_json:
         _print_json(
             {

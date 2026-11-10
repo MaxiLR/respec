@@ -17,14 +17,18 @@ every path it creates, and hand edits make its record disagree with disk.
 
 - Pass `--json` to read results. Every command except `tui` accepts it. JSON
   objects carry a `warnings` list; each warning has a `type`
-  (`layer-conflict` or `interrupted-operation`) and a `message`. Unknown entries still waiting for a
+  (`layer-conflict`, `unreadable-manifest`, `unreadable-takeover-log` or
+  `interrupted-operation`) and a `message`. An `interrupted-operation`
+  warning's `outcome` is `finished`, `rolled-back`, `pending` or `rebuilt`
+  (with `operation` `state`: `respec recover` rebuilt `state.json`). Unknown entries still waiting for a
   decision are listed under `unresolved`; entries a command resolved are
   under `resolved`. Fields that do not apply are left out; only
   `active_profile`, `previous_profile`, `same_as` and values under `restored`
   can be `null` (meaning none).
-- Exit code 0 means done; 1 means refused or failed. `use`, `adopt` and
-  `restore` then print their usual JSON keys plus `error`; other commands
-  print the reason on stderr. A refused command changes nothing unless its
+- Exit code 0 means done; 1 means refused or failed. `use`, `adopt`,
+  `restore` (also `--release-only`) and `recover` then print their usual
+  JSON keys plus `error`; other commands, and a refused combination of
+  options, print the reason on stderr. A refused command changes nothing unless its
   output reports what it already did.
 - Commands that change a profile take `-p <profile>`; without it they change
   the active profile.
@@ -145,7 +149,9 @@ short (killed, crashed), `respec status` reports it with an
 `interrupted-operation` warning whose `outcome` is `pending`, and the next
 command that changes skills finishes or rolls it back first (`outcome`
 `finished` or `rolled-back`, with anything half made moved to a backup and
-listed in `set_aside`).
+listed in `set_aside`). While it waits, the entry its step in flight was
+changing is listed under the warning's `in_flight`, not as an unknown entry;
+recovering settles it.
 
 - `respec recover`: finish the interrupted change now.
 - `respec recover --rollback`: undo it instead where possible (a switch
@@ -159,7 +165,10 @@ listed in `set_aside`).
   `respec restore <backup>` (`respec restore --list` marks takeover runs), or
   run `respec restore --release-only` to let go of the folders without putting
   anything back (only what it can verify as respec's is removed).
-  A `state.json` from a newer respec is never rebuilt.
+  A `state.json` or `takeovers.json` from a newer respec is never rebuilt or
+  rewritten. An unreadable `takeovers.json` is reported
+  (`unreadable-takeover-log`) and moved to a backup run before respec writes a
+  new one.
 
 The first `respec use` that touches a folder backs up its full contents to
 `~/.respec/backups/<timestamp>/<target>/` before taking it over. Folders respec

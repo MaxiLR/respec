@@ -12,7 +12,7 @@ step was making, in which case it is recorded.
 
 Journal fields (``pending`` and the optional fields are left out when unset)::
 
-    {"operation": "use",              # see OPERATIONS
+    {"operation": "use",              # one of the keys of _HANDLERS
      "started_at": "2026-11-10T12:00:00+00:00",
      "profile": "work",               # the profile the change is about
      "previous": "home",              # use: the profile active before
@@ -86,7 +86,6 @@ from respec.state import (
     state_path,
 )
 
-OPERATIONS = ("use", "restore", "adopt", "links", "update", "add", "install")
 WARNING = "interrupted-operation"
 FINISHED = "finished"
 REBUILT = "rebuilt"
@@ -168,40 +167,42 @@ def take_reports() -> list[Recovery]:
 # --- describing ----------------------------------------------------------------
 
 
+# How :func:`describe` names each operation: on its own, or of its profile.
+_NAMES = {"restore": "the restore", "adopt": "the resolution of unknown entries"}
+_NAMES_OF_PROFILE = {
+    "links": "the link changes of profile {!r}",
+    "update": "the update of profile {!r}",
+    "add": "the add from git to profile {!r}",
+    "install": "the install of profile {!r}",
+}
+
+
 def describe(journal: dict[str, Any]) -> str:
     """The interrupted change in a few words: "the switch to profile 'work'"."""
     operation = journal.get("operation")
     profile = journal.get("profile")
-    if operation != "use" and profile is None:
-        return {
-            "restore": "the restore",
-            "adopt": "the resolution of unknown entries",
-        }.get(str(operation), f"an interrupted {operation!r} change")
     if operation == "use":
         if profile is None:
             return "the removal of respec's skills"
         if journal.get("action") == "refresh":
             return f"the re-apply of profile {profile!r}"
         return f"the switch to profile {profile!r}"
-    return {
-        "restore": "the restore",
-        "adopt": "the resolution of unknown entries",
-        "links": f"the link changes of profile {profile!r}",
-        "update": f"the update of profile {profile!r}",
-        "add": f"the add from git to profile {profile!r}",
-        "install": f"the install of profile {profile!r}",
-    }.get(str(operation), f"an operation {operation!r}")
+    if operation in _NAMES:
+        return _NAMES[str(operation)]
+    if operation in _NAMES_OF_PROFILE and profile is not None:
+        return _NAMES_OF_PROFILE[str(operation)].format(profile)
+    return f"a {operation!r} change"
 
 
 def pending_message(journal: dict[str, Any]) -> str:
-    started = journal.get("started_at", "an earlier run")
     what = describe(journal)
+    started = journal.get("started_at")
+    when = f" (started {started})" if started else ""
     return (
-        f"{what[0].upper()}{what[1:]} (started "
-        f"{started}) was interrupted and did not complete. Run 'respec recover' "
-        "to finish it, or 'respec recover --rollback' to roll it back (Sync in "
-        "the TUI offers both); any respec command that changes skills finishes "
-        "it first."
+        f"{what[0].upper()}{what[1:]}{when} was interrupted and did not "
+        "complete. Run 'respec recover' to finish it, or 'respec recover "
+        "--rollback' to roll it back (Sync in the TUI offers both); any respec "
+        "command that changes skills finishes it first."
     )
 
 
@@ -214,6 +215,11 @@ class Recovery:
     message: str
     profile: str | None = None
     set_aside: list[str] = field(default_factory=list)
+    # pending: the path of the step in flight, part of this change (not an
+    # unknown entry) until it is recovered.
+    in_flight: list[str] = field(default_factory=list)
+    # A finished restore: its RestoreResult, so a rerun reports what it did.
+    result: Any = None
 
     def to_warning(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -225,7 +231,24 @@ class Recovery:
         }
         if self.profile is not None:
             data["profile"] = self.profile
+        if self.in_flight:
+            data["in_flight"] = list(self.in_flight)
         return data
+
+
+# Steps whose path is an entry in a target folder that the step makes,
+# removes or puts back.
+_FOLDER_STEPS = frozenset({"install", "remove", "put-back"})
+
+
+def in_flight(journal: dict[str, Any] | None) -> list[str]:
+    """The entry the step in flight was changing, when it exists: part of the
+    interrupted change, which settles it, not an unknown entry."""
+    step = (journal or {}).get("pending")
+    if not isinstance(step, dict) or step.get("step") not in _FOLDER_STEPS:
+        return []
+    path = step.get("path")
+    return [str(path)] if path and os.path.lexists(path) else []
 
 
 def pending(respec_home: Path) -> Recovery | None:
@@ -233,11 +256,18 @@ def pending(respec_home: Path) -> Recovery | None:
     journal = load_state(respec_home).journal
     if journal is None:
         return None
+    paths = in_flight(journal)
     return Recovery(
         operation=str(journal.get("operation")),
         outcome=PENDING,
-        message=pending_message(journal),
+        message=pending_message(journal)
+        + "".join(
+            f"\n  {path} is the entry it was changing when it stopped; "
+            "recovering the change settles it."
+            for path in paths
+        ),
         profile=journal.get("profile"),
+        in_flight=paths,
     )
 
 
@@ -621,6 +651,7 @@ def recover(
     aside = _Aside(respec_home)
     _local.aside = aside
     _local.undone = False
+    _local.result = None
     _local.recovering = True
     if str(journal.get("operation")) not in _HANDLERS:
         _local.recovering = False
@@ -640,6 +671,12 @@ def recover(
             _recover_use(respec_home, user_home, {"operation": "use", **inner}, False)
         handler = _HANDLERS[str(journal.get("operation"))]
         outcome, message = handler(respec_home, user_home, journal, rollback)
+        if journal.get("operation") == "use" or isinstance(inner, dict):
+            # A switch cut between logging its takeovers and recording them in
+            # state.json: those folders were not taken over after all.
+            from respec import takeovers
+
+            takeovers.release_unowned(respec_home, load_state(respec_home).owned)
         _clear(respec_home)
     except (KeyError, TypeError, ValueError) as error:
         if rollback:
@@ -669,6 +706,7 @@ def recover(
         message=message,
         profile=journal.get("profile"),
         set_aside=aside.moved,
+        result=_local.result,
     )
     _policy.reports.append(report)
     return report
@@ -708,14 +746,14 @@ def rebuild_state(respec_home: Path, user_home: Path) -> Recovery:
     ``respec adopt`` or ``respec use --unknown``. No profile is active.
     """
     from respec import global_skills, switch, targets
+    from respec import takeovers as takeover_log
 
+    # Read first: a log from a newer respec refuses before anything changes.
+    takeovers = takeover_log.current(respec_home)
     run = switch.new_backup_run(respec_home, switch.utc_now())
     kept = run / STATE_FILE
     shutil.move(str(state_path(respec_home)), str(kept))
     roots = global_skills.source_roots(respec_home)
-    from respec import takeovers as takeover_log
-
-    takeovers = takeover_log.current(respec_home)
     state = State()
     owned_folders: set[Path] = set()
     recorded: set[Path] = set()
@@ -761,7 +799,8 @@ def rebuild_state(respec_home: Path, user_home: Path) -> Recovery:
         "--list' shows them), or 'respec restore --release-only' lets go of "
         "the folders without putting anything back."
         if unknown_takeover
-        else " Each folder's takeover backup was found again in its run's " "manifest."
+        else " Each folder's takeover (its backup run, or that the folder did "
+        "not exist) was found again in the takeover log, takeovers.json."
     )
     report = Recovery(
         operation="state",
@@ -872,13 +911,24 @@ def _recover_restore(
             "it set aside stay in their backup run."
         )
     if journal.get("release_only"):
+        result = restore.RestoreResult(backup=None)
         if load_state(respec_home).owned:
-            restore.release_only(respec_home, user_home)
+            restore.release_only(respec_home, user_home, progress=result)
+        # Items kept before the interruption were already dropped from the
+        # records; the journal named them.
+        result.kept = list(journal.get("kept", [])) + result.kept
+        _local.result = result
         return FINISHED, (
             "Finished letting go of respec's folders: what respec could verify "
             "as its own was removed, nothing was put back."
+            + "".join(
+                f"\n  kept {path}: respec cannot verify it as its own"
+                for path in result.kept
+            )
         )
-    restore.restore(respec_home, user_home, journal.get("backup"), overwrite=True)
+    _local.result = restore.restore(
+        respec_home, user_home, journal.get("backup"), overwrite=True
+    )
     return FINISHED, (
         "Finished the restore: respec released its folders (entries in the "
         "way were backed up first)."

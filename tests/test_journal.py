@@ -1181,3 +1181,296 @@ def test_a_released_takeover_is_not_reused_by_a_rebuild(run, isolated_homes):
 
     assert result.exit_code == 0, result.output
     assert not (home / ".claude").exists()  # 'mine' does not come back
+
+
+# --- final polish (fix-8) --------------------------------------------------------
+
+
+def test_tui_banner_clears_once_sync_resolved_the_interrupted_change(cut_switch):
+    home, respec_home = cut_switch
+
+    async def scenario(app, pilot):
+        assert "interrupted" in str(app.query_one("#feedback").render())
+        await pilot.press("s")
+        await pilot.pause()
+        await pilot.click("#sync-finish")
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert "interrupted" not in str(app.query_one("#feedback").render())
+
+    drive(respec_home, home, scenario)
+    assert load_state(respec_home).journal is None
+
+
+@pytest.fixture
+def half_installed(run, isolated_homes, monkeypatch):
+    """A switch from 'a' to 'b' cut right after it made its first link, before
+    recording it."""
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    two_profiles(respec_home, home)
+    assert run("use", "a").exit_code == 0
+    points = count_points(monkeypatch, lambda: switch.use(respec_home, home, "b"))
+    assert run("use", "a").exit_code == 0
+    crash_at(monkeypatch, points.index("installed") + 1)
+    with pytest.raises(Crash):
+        switch.use(respec_home, home, "b")
+    no_faults(monkeypatch)
+    step = load_state(respec_home).journal["pending"]
+    assert step["step"] == "install" and os.path.islink(step["path"])
+    return home, respec_home, step["path"]
+
+
+def test_status_shows_the_half_made_link_as_part_of_the_interrupted_change(
+    run, half_installed
+):
+    home, respec_home, link = half_installed
+
+    data = payload(run("status", "--json"))
+
+    assert link not in [entry["path"] for entry in data["unresolved"]]
+    (warning,) = interrupted_warnings(data)
+    assert warning["in_flight"] == [link]
+    text = run("status").output
+    assert "unknown symlink" not in text
+    assert link in text
+
+
+def test_rerunning_an_interrupted_restore_reports_what_it_did(
+    run, isolated_homes, monkeypatch
+):
+    from respec import restore
+
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    two_profiles(respec_home, home)
+    assert run("use", "a").exit_code == 0
+    points = count_points(monkeypatch, lambda: None)
+    crash_at(monkeypatch, 4)  # after the first removal
+    with pytest.raises(Crash):
+        restore.restore(respec_home, home)
+    no_faults(monkeypatch)
+    cut = load_state(respec_home)
+    # The removal in flight was done by the interrupted run.
+    left = [i.path for i in cut.installed if i.path != cut.journal["pending"]["path"]]
+    assert left and points == []
+
+    data = payload(run("restore", "--json"))
+
+    assert data["released"] == ["agents", "claude-code"]
+    assert sorted(data["removed"]) == sorted(left)
+    assert set(data["restored"]) == {"agents", "claude-code"}
+    text = run("status").output
+    assert "No active profile" in text
+
+
+def test_rerunning_an_interrupted_restore_names_what_it_did_in_text(
+    run, isolated_homes, monkeypatch
+):
+    from respec import restore
+
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    two_profiles(respec_home, home)
+    assert run("use", "a").exit_code == 0
+    crash_at(monkeypatch, 4)
+    with pytest.raises(Crash):
+        restore.restore(respec_home, home)
+    no_faults(monkeypatch)
+
+    result = run("restore")
+
+    assert result.exit_code == 0, result.output
+    assert "Removed" in result.output
+    assert "Restored claude-code from" in result.output
+
+
+def test_list_with_release_only_is_refused_and_changes_nothing(run, isolated_homes):
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    two_profiles(respec_home, home)
+    assert run("use", "a").exit_code == 0
+    before = (respec_home / "state.json").read_text()
+    claude = entries(home / ".claude" / "skills")
+
+    result = run("restore", "--list", "--release-only")
+
+    assert result.exit_code != 0
+    assert "--list" in result.output and "--release-only" in result.output
+    assert (respec_home / "state.json").read_text() == before
+    assert entries(home / ".claude" / "skills") == claude
+
+
+def takeover_log(respec_home):
+    return respec_home / "takeovers.json"
+
+
+def test_a_corrupt_takeover_log_is_kept_and_reported_before_a_new_takeover(
+    run, isolated_homes
+):
+    respec_home = isolated_homes.respec_home
+    make_profile(respec_home, "one", ["claude-code"], ["tdd"])
+    make_profile(respec_home, "both", ["claude-code", "agents"], ["tdd"])
+    assert run("use", "one").exit_code == 0
+    takeover_log(respec_home).write_text("{ damaged")
+
+    data = payload(run("use", "both", "--json"))
+
+    (warning,) = [w for w in data["warnings"] if w["type"] == "unreadable-takeover-log"]
+    kept = Path(warning["path"])
+    assert kept.read_text() == "{ damaged"
+    assert respec_home / "backups" in kept.parents
+    assert str(kept) in warning["message"]
+    log = json.loads(takeover_log(respec_home).read_text())
+    assert [r["target"] for r in log["records"]] == ["agents"]
+
+
+def test_a_corrupt_takeover_log_is_kept_before_a_restore_rewrites_it(
+    run, isolated_homes
+):
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    two_profiles(respec_home, home)
+    assert run("use", "a").exit_code == 0
+    takeover_log(respec_home).write_text("[]")
+
+    result = run("restore")
+
+    assert result.exit_code == 0, result.output
+    assert "takeovers.json" in result.output
+    assert found_with(respec_home / "backups", "[]")
+
+
+def test_a_takeover_log_from_a_newer_respec_is_never_rewritten(run, isolated_homes):
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    make_profile(respec_home, "one", ["claude-code"], ["tdd"])
+    make_profile(respec_home, "both", ["claude-code", "agents"], ["tdd"])
+    assert run("use", "one").exit_code == 0
+    newer = json.dumps({"version": 2, "records": [], "more": True})
+    takeover_log(respec_home).write_text(newer)
+    state_before = (respec_home / "state.json").read_text()
+
+    for command in (("use", "both"), ("restore",), ("restore", "--release-only")):
+        result = run(*command)
+        assert result.exit_code == 1, command
+        assert "newer respec" in result.output, command
+    (respec_home / "state.json").write_text("")
+    rebuilt = run("recover")
+    assert rebuilt.exit_code == 1 and "newer respec" in rebuilt.output
+
+    assert takeover_log(respec_home).read_text() == newer
+    (respec_home / "state.json").write_text(state_before)
+    assert load_state(respec_home).active_profile == "one"
+    assert not (home / ".agents" / "skills").exists()
+
+
+def test_release_only_does_not_call_a_missing_path_kept(run, isolated_homes):
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    two_profiles(respec_home, home)
+    assert run("use", "a").exit_code == 0
+    gone = home / ".claude" / "skills" / "tdd"
+    gone.unlink()
+
+    data = payload(run("restore", "--release-only", "--json"))
+    assert str(gone) not in data["kept"]
+
+    assert run("use", "a").exit_code == 0
+    gone.unlink()
+    text = run("restore", "--release-only").output
+    assert f"Kept {gone}" not in text
+
+
+def cut_release(run, isolated_homes, monkeypatch):
+    """A release-only cut at its first removal, after it kept an edited 'tdd'."""
+    from respec import restore
+
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    two_profiles(respec_home, home)
+    assert run("use", "a").exit_code == 0
+    edited = home / ".claude" / "skills" / "tdd"
+    edited.unlink()
+    edited.symlink_to(home / ".claude" / "skills" / "mine")  # not respec's now
+    seen: list[str] = []
+
+    def fault(name):
+        seen.append(name)
+        if name == "removed":
+            raise Crash(name)
+
+    monkeypatch.setattr(journal, "_fault", fault)
+    with pytest.raises(Crash):
+        restore.release_only(respec_home, home)
+    no_faults(monkeypatch)
+    return edited
+
+
+def test_recovered_release_only_names_what_it_kept(run, isolated_homes, monkeypatch):
+    edited = cut_release(run, isolated_homes, monkeypatch)
+
+    data = payload(run("recover", "--json"))
+
+    (warning,) = interrupted_warnings(data)
+    assert warning["outcome"] == "finished"
+    assert str(edited) in warning["message"]
+    assert edited.is_symlink()
+
+
+def test_rerunning_an_interrupted_release_reports_what_it_kept(
+    run, isolated_homes, monkeypatch
+):
+    edited = cut_release(run, isolated_homes, monkeypatch)
+
+    data = payload(run("restore", "--release-only", "--json"))
+
+    assert data["kept"] == [str(edited)]
+    assert data["released"] == ["agents", "claude-code"]
+    assert load_state(isolated_homes.respec_home).owned == {}
+
+
+def test_release_only_refuses_options_of_a_full_restore(run, isolated_homes):
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    two_profiles(respec_home, home)
+    assert run("use", "a").exit_code == 0
+    before = (respec_home / "state.json").read_text()
+
+    result = run("restore", "--release-only", "--overwrite")
+
+    assert result.exit_code != 0 and "--overwrite" in result.output
+    assert (respec_home / "state.json").read_text() == before
+
+
+def test_a_rolled_back_first_use_leaves_no_takeover_on_record(
+    run, killed, isolated_homes
+):
+    from respec import takeovers
+
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    two_profiles(respec_home, home)
+
+    assert killed("takeover-logged", 1, "use", "a")
+    data = payload(run("recover", "--json"))
+
+    assert interrupted_warnings(data)[0]["outcome"] == "rolled-back"
+    assert load_state(respec_home).owned == {}
+    assert takeovers.current(respec_home) == {}
+
+
+def test_the_unknown_journal_message_says_interrupted_once(run, isolated_homes):
+    from respec.state import State, save_state
+
+    respec_home = isolated_homes.respec_home
+    save_state(respec_home, State(journal={"operation": "teleport"}))
+
+    message = interrupted_warnings(payload(run("status", "--json")))[0]["message"]
+
+    assert message.count("interrupted") == 1
+    assert "started an earlier run" not in message
+    assert "'teleport'" in message
+
+
+def test_the_rebuild_note_names_the_takeover_log(run, isolated_homes):
+    respec_home = isolated_homes.respec_home
+    make_profile(respec_home, "a", ["claude-code"], ["tdd"])
+    assert run("use", "a").exit_code == 0  # nothing existed: no backup run
+    (respec_home / "state.json").write_text("")
+
+    message = interrupted_warnings(payload(run("recover", "--json")))[0]["message"]
+
+    assert "manifest" not in message
+    assert "takeovers.json" in message

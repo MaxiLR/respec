@@ -192,6 +192,15 @@ def load_state(respec_home: Path) -> State:
     )
 
 
+def active_or_none(respec_home: Path) -> str | None:
+    """The active profile on disk; None also when ``state.json`` cannot be
+    read (for reports that must not fail on that)."""
+    try:
+        return load_state(respec_home).active_profile
+    except RespecError:
+        return None
+
+
 def save_state(respec_home: Path, state: State, durable: bool = False) -> None:
     """Write state atomically (a temporary file, then a rename), so a crash or
     kill never leaves a truncated file.

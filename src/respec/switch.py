@@ -342,6 +342,7 @@ def _take_over(
     new_targets = [t for t in _switch_targets(profile) if t not in state.owned]
     if not new_targets:
         return {}
+    takeovers.check(respec_home)  # a newer respec's log: refuse, nothing changed
     moment = now()
     run_dir: Path | None = None
     backups: dict[str, str] = {}
@@ -380,6 +381,7 @@ def _take_over(
     # Kept apart from state.json, so a rebuilt one finds every takeover again,
     # also of a folder that did not exist (respec.takeovers).
     takeovers.record(respec_home, owned)
+    journal.checkpoint("takeover-logged")
     if run_dir is not None:
         journal.mark(respec_home, None, state)
     return backups
@@ -827,6 +829,8 @@ def status(respec_home: Path) -> dict[str, object]:
         for _, group in unknown.folder_groups(state)
         for target in group
     }
+    # The entry a cut-short step was changing belongs to that change.
+    changing = {trees.real(path) for path in journal.in_flight(state.journal)}
     order = list(targets.registry())
     folders = []
     for target in sorted(
@@ -859,6 +863,8 @@ def status(respec_home: Path) -> dict[str, object]:
         "targets": active_targets,
         "folders": folders,
         "unresolved": [
-            entry.to_dict() for entry in unknown.find_unknown(respec_home, state)
+            entry.to_dict()
+            for entry in unknown.find_unknown(respec_home, state)
+            if trees.real(entry.path) not in changing
         ],
     }

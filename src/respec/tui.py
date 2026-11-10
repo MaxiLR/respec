@@ -50,7 +50,7 @@ from respec import (
     unknown,
 )
 from respec.errors import RespecError
-from respec.state import load_state
+from respec.state import active_or_none, load_state
 
 # Semantic colour tokens from the default design language (Bencho, dark theme),
 # shared by the stylesheet and the styled text below.
@@ -660,10 +660,7 @@ class ProfileScreen(Screen[None]):
         await panel.remove_children()
         if profile is None:
             return
-        try:
-            active = load_state(self.respec_home).active_profile == profile.name
-        except RespecError:
-            active = False
+        active = active_or_none(self.respec_home) == profile.name
         title = Text.assemble(
             ("Profile ", SECONDARY),
             (profile.name, "bold"),
@@ -1378,6 +1375,12 @@ class SyncScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+WAITING = (
+    "An interrupted change waits; open Sync (s) to finish it or roll it back. "
+    "Until then respec changes nothing else."
+)
+
+
 class RespecApp(App[None]):
     """Profiles on the left, the status of every owned folder on the right."""
 
@@ -1399,6 +1402,8 @@ class RespecApp(App[None]):
         self.user_home = user_home
         self.selected: str | None = None
         self.active: str | None = None
+        # Whether the feedback line holds WAITING (cleared once resolved).
+        self.waiting_shown = False
 
     # Actions of the profile list; elsewhere their keys do nothing.
     LIST_ACTIONS = frozenset({"edit", "new_profile", "adopt", "refresh"})
@@ -1462,11 +1467,10 @@ class RespecApp(App[None]):
         except RespecError:
             waiting = None
         if waiting is not None:
-            self.show_feedback(
-                "An interrupted change waits; open Sync (s) to finish it or roll "
-                "it back. Until then respec changes nothing else.",
-                ok=False,
-            )
+            self.show_feedback(WAITING, ok=False)
+        elif self.waiting_shown:
+            self.show_feedback("", ok=True)  # resolved since (in Sync)
+        self.waiting_shown = waiting is not None
         if self.active is None:
             self.query_one("#active", Static).update("No active profile")
         else:
@@ -1589,13 +1593,6 @@ class RespecApp(App[None]):
 
         self.push_screen(SyncScreen(self.respec_home, self.user_home), closed)
 
-    def _active_now(self) -> str | None:
-        """The active profile on disk: where ``add`` goes."""
-        try:
-            return load_state(self.respec_home).active_profile
-        except RespecError:
-            return None
-
     def activate(
         self,
         name: str,
@@ -1611,7 +1608,7 @@ class RespecApp(App[None]):
         anything is resolved, and the dialog opens again. Entries that were
         already in a folder the switch took over are asked about right after.
         """
-        previous = self._active_now()
+        previous = active_or_none(self.respec_home)  # where ``add`` goes
         if owned_before is None:
             # Kept across a re-asked dialog, so every takeover is reported.
             try:

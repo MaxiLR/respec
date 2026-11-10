@@ -451,6 +451,7 @@ def restore(
     returned, so a caller can report what was done when it fails part way.
     """
     journal.ready(respec_home, user_home)
+    takeovers.check(respec_home)
     state = load_state(respec_home)
     if backup is None and not state.owned:
         raise RespecError(
@@ -489,10 +490,13 @@ def release_only(
 
     Removes only the recorded items that are verifiably respec's (a link into
     its own folders, or a copy whose digest matches) and lists the others
-    under ``kept``; removes only folders respec recorded creating, once
-    empty. Backup runs stay. The way out when a takeover backup is unknown.
+    under ``kept`` (also in the journal, so a recovery still names them); a
+    record whose path is gone is only dropped. Removes only folders respec
+    recorded creating, once empty. Backup runs stay. The way out when a
+    takeover backup is unknown.
     """
     journal.ready(respec_home, user_home)
+    takeovers.check(respec_home)
     state = load_state(respec_home)
     if not state.owned:
         raise RespecError("respec owns no folders; nothing to release.")
@@ -506,8 +510,11 @@ def release_only(
                 if switch.remove_step(respec_home, state, item):
                     result.removed.append(item)
             else:
-                result.kept.append(item.path)
                 state.installed.remove(item)
+                if os.path.lexists(item.path):
+                    result.kept.append(item.path)
+                    if state.journal is not None:
+                        state.journal.setdefault("kept", []).append(item.path)
                 save_state(respec_home, state)
         result.released = sorted(state.owned)
         _remove_created(state, [])
