@@ -16,6 +16,11 @@ Order of a switch:
 4. Remove every path recorded in ``state.json`` (any folder, any target).
 5. Link each enabled skill into each of the profile's targets (symlink, or copy
    when symlinking fails) and record every created path.
+
+Global skills (``config.yaml``) join the profile's skills in its targets, and
+the skills respec ships go into every registered target (see
+:mod:`respec.global_skills`); a shipped or global skill whose link is already
+in place is kept rather than removed and linked again.
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from respec import profiles, targets, unknown
+from respec import global_skills, profiles, targets, unknown
 from respec.errors import RespecError
 from respec.state import Installed, Owned, State, load_state, save_state
 
@@ -148,6 +153,73 @@ def _check_sources(profile: profiles.Profile, lead: str) -> None:
         )
 
 
+def _plan_all(
+    respec_home: Path, user_home: Path, profile: profiles.Profile
+) -> list[tuple[str, str, Path, Path]]:
+    """Every install of a switch: the profile's enabled skills and global
+    skills into its targets, respec's shipped skills into every target.
+
+    A folder shared by several targets gets each skill once.
+    """
+    registry = targets.registry()
+    plan = list(_plan(profile, user_home))
+    seen = {_real(destination) for _, _, _, destination in plan}
+
+    def add(target_names: list[str], skill: str, source: Path) -> None:
+        for target in target_names:
+            destination = registry[target].skills_dir(user_home) / skill
+            key = _real(destination)
+            if key not in seen:
+                seen.add(key)
+                plan.append((target, skill, source, destination))
+
+    for skill in global_skills.load_global(respec_home):
+        add(
+            list(profile.targets),
+            skill,
+            global_skills.global_source(respec_home, skill),
+        )
+    for skill in global_skills.shipped_names():
+        add(list(registry), skill, global_skills.shipped_source(respec_home, skill))
+    return plan
+
+
+def _switch_targets(profile: profiles.Profile) -> list[str]:
+    """Targets a switch to ``profile`` writes into, in registry order."""
+    wanted = set(profile.targets)
+    if global_skills.shipped_names():
+        wanted.update(targets.registry())
+    return [target for target in targets.registry() if target in wanted]
+
+
+def _check_global(respec_home: Path, profile: profiles.Profile, lead: str) -> None:
+    """Refuse when a global skill has no folder or a profile skill takes the
+    name of a global or shipped skill."""
+    try:
+        names = global_skills.load_global(respec_home)
+    except RespecError as error:
+        raise SwitchBlocked(f"{lead}: {error}") from None
+    problems = global_skills.check_sources(respec_home, names)
+    shipped = set(global_skills.shipped_names())
+    for skill, entry in profile.skills.items():
+        if not entry.enabled:
+            continue
+        if skill in shipped:
+            problems.append(
+                f"skill {skill!r} has the name of a skill respec ships and "
+                "installs everywhere; rename or remove the profile's skill"
+            )
+        elif skill in names:
+            problems.append(
+                f"skill {skill!r} is also a global skill in "
+                f"{global_skills.config_path(respec_home)}; rename one of them"
+            )
+    if problems:
+        raise SwitchBlocked(
+            f"{lead}:\n" + "\n".join(f"  - {problem}" for problem in problems)
+        )
+
+
 def conflicts(
     respec_home: Path, user_home: Path, profile: profiles.Profile, state: State
 ) -> list[unknown.Unknown]:
@@ -157,7 +229,7 @@ def conflicts(
     sitting exactly at a path the switch installs to or removes, including
     paths in folders respec does not own yet.
     """
-    plan = _plan(profile, user_home)
+    plan = _plan_all(respec_home, user_home, profile)
     installs = {_real(destination) for _, _, _, destination in plan}
     recorded = {_real(Path(item.path)) for item in state.installed}
     found: list[unknown.Unknown] = []
@@ -174,7 +246,7 @@ def conflicts(
     }
     registry = targets.registry()
     sharing: dict[Path, list[str]] = {}
-    for target in profile.targets:
+    for target in _switch_targets(profile):
         sharing.setdefault(registry[target].skills_dir(user_home).resolve(), []).append(
             target
         )
@@ -232,7 +304,7 @@ def _take_over(
 ) -> dict[str, str]:
     """Back up and record every target folder respec has not owned before."""
     registry = targets.registry()
-    new_targets = [t for t in profile.targets if t not in state.owned]
+    new_targets = [t for t in _switch_targets(profile) if t not in state.owned]
     if not new_targets:
         return {}
     moment = now()
@@ -280,10 +352,12 @@ def remove_installed(respec_home: Path, item: Installed) -> bool:
     if path.is_symlink():
         path.unlink()
         return True
-    profiles_root = profiles.profiles_dir(respec_home).resolve()
     resolved = path.resolve()
-    if resolved == profiles_root or profiles_root in resolved.parents:
-        raise RespecError(f"refusing to delete {path}: it is inside a profile folder")
+    for root in global_skills.source_roots(respec_home):
+        if resolved == root or root in resolved.parents:
+            raise RespecError(
+                f"refusing to delete {path}: it is inside respec's own folder {root}"
+            )
     if path.is_dir():
         shutil.rmtree(path)
     else:
@@ -435,6 +509,7 @@ def use(
     lead = f"cannot {action} profile {profile.name!r}"
     state = load_state(respec_home)
     _check_sources(profile, lead)
+    _check_global(respec_home, profile, lead)
     found = conflicts(respec_home, user_home, profile, state)
     if found and on_unknown is None:
         raise UnknownEntries(
@@ -442,6 +517,10 @@ def use(
         )
     result = SwitchResult(profile=profile.name, previous=state.active_profile)
 
+    try:
+        global_skills.refresh_shipped(respec_home)
+    except RespecError as error:
+        raise SwitchBlocked(f"{lead}: {error}") from None
     result.backups = _take_over(respec_home, user_home, profile, state, now)
     save_state(respec_home, state)
 
@@ -451,18 +530,23 @@ def use(
         refuse_layer_conflicts(profile, action)
         state = load_state(respec_home)
         _check_sources(profile, lead)
+        _check_global(respec_home, profile, lead)
         left = conflicts(respec_home, user_home, profile, state)
         if left:
             raise UnknownEntries(
                 profile.name, left, lead=lead, can_add=state.active_profile is not None
             )
-    plan = _plan(profile, user_home)
+    plan = _plan_all(respec_home, user_home, profile)
+    kept = _kept(respec_home, state, plan)
+    plan = [entry for entry in plan if _real(entry[3]) not in kept]
 
     # state.json is saved after every removal and every install, so it always
     # lists each path respec has created and a later switch can remove it.
     state.active_profile = None
     try:
         for item in list(state.installed):
+            if _real(Path(item.path)) in kept:
+                continue
             if remove_installed(respec_home, item):
                 result.removed.append(item)
             state.installed.remove(item)
@@ -491,6 +575,35 @@ def use(
     state.active_profile = profile.name
     save_state(respec_home, state)
     return result
+
+
+def _kept(
+    respec_home: Path, state: State, plan: list[tuple[str, str, Path, Path]]
+) -> set[Path]:
+    """Destinations of global and shipped skills already linked as planned.
+
+    These survive the switch untouched. Copies are always reinstalled, so
+    they match the current files.
+    """
+    sources = {
+        _real(destination): (skill, source) for _, skill, source, destination in plan
+    }
+    lasting = set(global_skills.load_global(respec_home))
+    lasting.update(global_skills.shipped_names())
+    kept: set[Path] = set()
+    for item in state.installed:
+        key = _real(Path(item.path))
+        planned = sources.get(key)
+        if (
+            item.mode == "symlink"
+            and item.name in lasting
+            and planned is not None
+            and planned[0] == item.name
+            and unknown.is_managed(respec_home, item)
+            and Path(item.path).resolve() == planned[1].resolve()
+        ):
+            kept.add(key)
+    return kept
 
 
 def status(respec_home: Path) -> dict[str, object]:
