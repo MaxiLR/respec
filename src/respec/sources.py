@@ -37,6 +37,7 @@ import yaml
 
 from respec import global_skills, items, journal, profiles, trees
 from respec.errors import RespecError
+from respec.state import load_state
 
 SHORTHAND = profiles.REPO_SHORTHAND
 SCP_LIKE = profiles.REPO_SCP_LIKE
@@ -687,7 +688,10 @@ def _update(
     overwrite_edits: Confirm,
 ) -> UpdateResult:
     """The changing part of :func:`update`, inside its journal."""
-    result = UpdateResult(profile=profile.name)
+    # Whether the profile is the active one, also when nothing is swapped
+    # (a refresh below fills it in again).
+    active = load_state(respec_home).active_profile == profile.name
+    result = UpdateResult(profile=profile.name, active=active)
     skills = dict(profile.skills)
     replaced: list[tuple[Path, Path]] = []  # (live folder, kept old folder)
     cache: dict[tuple[str, str | None], str] = {}

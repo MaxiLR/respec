@@ -374,6 +374,30 @@ def test_update_refreshes_links_of_active_profile(
     assert recorded == ["lint", "mine", "tdd"]
 
 
+def test_update_json_says_the_profile_is_active_also_when_nothing_changed(
+    run, sourced, profiles_root
+):
+    ok(run("use", "work"))
+    (profiles_root / "work" / "skills" / "tdd" / "SKILL.md").write_text("# edit\n")
+    sourced.write("tdd/SKILL.md", "# tdd v2\n")
+    sourced.commit()
+
+    skipped = json.loads(ok(run("update", "tdd", "--json")).output)
+    ok(run("update", "lint"))
+    current = json.loads(ok(run("update", "lint", "--json")).output)
+
+    assert skipped["skills"][0]["result"] == "skipped-local-edits"
+    assert skipped["active"] is True
+    assert current["skills"][0]["result"] == "up-to-date"
+    assert current["active"] is True
+
+
+def test_update_json_says_an_inactive_profile_is_not_active(run, sourced):
+    data = json.loads(ok(run("update", "-p", "work", "--json")).output)
+
+    assert data["active"] is False
+
+
 def test_check_reports_local_edits(run, sourced, profiles_root):
     (profiles_root / "work" / "skills" / "tdd" / "SKILL.md").write_text("# edited\n")
 

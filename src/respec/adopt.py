@@ -127,13 +127,6 @@ def unresolved(respec_home: Path) -> list[unknown.Unknown]:
     return unknown.find_unknown(respec_home, load_state(respec_home))
 
 
-def _delete(path: Path) -> None:
-    if path.is_symlink() or not path.is_dir():
-        path.unlink()
-    else:
-        shutil.rmtree(path)
-
-
 def _settle(respec_home: Path, entry: unknown.Unknown) -> None:
     """Record the outcome: the path no longer holds anything of respec's."""
     state = load_state(respec_home)
@@ -301,7 +294,7 @@ def _add(
     if Path(entry.path).is_symlink():
         resolution.link = os.readlink(entry.path)
     journal.mark(respec_home, {**step, "stage": "delete"})
-    _delete(Path(entry.path))
+    trees.delete_entry(Path(entry.path))
     journal.checkpoint("deleted")
     _settle(respec_home, entry)
     journal.mark(respec_home, None)
@@ -415,7 +408,7 @@ def _remove(respec_home: Path, entry: unknown.Unknown, run_dir: Path) -> str:
         raise
     journal.checkpoint("backed-up")
     journal.mark(respec_home, {**step, "stage": "delete"})
-    _delete(source)
+    trees.delete_entry(source)
     journal.checkpoint("deleted")
     _settle(respec_home, entry)
     journal.mark(respec_home, None)

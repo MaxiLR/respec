@@ -41,6 +41,7 @@ from respec import (
     items,
     journal,
     layers,
+    lock,
     messages,
     profiles,
     sources,
@@ -256,6 +257,12 @@ def _plural(count: int, one: str, many: str) -> str:
 # What a user's input or the file system can make a core call raise. The TUI
 # shows these and keeps running; anything else is a bug and surfaces as one.
 FAILURES = (RespecError, OSError, RuntimeError, ValueError)
+
+
+def _changing(respec_home: Path, job: Callable[[], Any]) -> Any:
+    """Run ``job``, a change, holding respec's lock (:mod:`respec.lock`)."""
+    with lock.exclusive(respec_home):
+        return job()
 
 
 def _one_line(error: Exception) -> str:
@@ -558,7 +565,8 @@ class NewProfileDialog(ModalScreen[profiles.Profile | None]):
             error.update("Choose at least one target folder.")
             return
         try:
-            profile = profiles.create_profile(self.respec_home, name, chosen)
+            with lock.exclusive(self.respec_home):
+                profile = profiles.create_profile(self.respec_home, name, chosen)
         except FAILURES as problem:
             error.update(f"error: {_one_line(problem)}")
             return
@@ -805,13 +813,14 @@ class ProfileScreen(Screen[None]):
         if profile.skills[switch_.skill].enabled == event.value:
             return  # already so (for example the initial value)
         try:
-            change = items.set_enabled(
-                self.respec_home,
-                self.user_home,
-                switch_.skill,
-                event.value,
-                self.profile_name,
-            )
+            with lock.exclusive(self.respec_home):
+                change = items.set_enabled(
+                    self.respec_home,
+                    self.user_home,
+                    switch_.skill,
+                    event.value,
+                    self.profile_name,
+                )
         except FAILURES as error:
             self._failed(error)
         else:
@@ -833,22 +842,23 @@ class ProfileScreen(Screen[None]):
         if (skill is None and not on) or (skill is not None and on == [skill]):
             return  # already so
         try:
-            if skill is None:
-                change = layers.set_enabled(
-                    self.respec_home,
-                    self.user_home,
-                    radio.layer_name,
-                    False,
-                    self.profile_name,
-                )
-            else:
-                change = layers.use(
-                    self.respec_home,
-                    self.user_home,
-                    radio.layer_name,
-                    skill,
-                    self.profile_name,
-                )
+            with lock.exclusive(self.respec_home):
+                if skill is None:
+                    change = layers.set_enabled(
+                        self.respec_home,
+                        self.user_home,
+                        radio.layer_name,
+                        False,
+                        self.profile_name,
+                    )
+                else:
+                    change = layers.use(
+                        self.respec_home,
+                        self.user_home,
+                        radio.layer_name,
+                        skill,
+                        self.profile_name,
+                    )
         except FAILURES as error:
             self._failed(error)
         else:
@@ -875,8 +885,15 @@ class ProfileScreen(Screen[None]):
                 self._run_git(
                     f"Fetching {text}…",
                     "Cancelled; nothing was added.",
-                    lambda: sources.add(
-                        self.respec_home, self.user_home, text, self.profile_name, ref
+                    lambda: _changing(
+                        self.respec_home,
+                        lambda: sources.add(
+                            self.respec_home,
+                            self.user_home,
+                            text,
+                            self.profile_name,
+                            ref,
+                        ),
                     ),
                     lambda change: self.show_feedback(
                         messages.sourced_change(change), ok=True
@@ -884,12 +901,13 @@ class ProfileScreen(Screen[None]):
                 )
                 return
             try:
-                added = items.add(
-                    self.respec_home,
-                    self.user_home,
-                    items.user_path(text),
-                    self.profile_name,
-                )
+                with lock.exclusive(self.respec_home):
+                    added = items.add(
+                        self.respec_home,
+                        self.user_home,
+                        items.user_path(text),
+                        self.profile_name,
+                    )
             except FAILURES as error:
                 self._failed(error)
             else:
@@ -1273,12 +1291,13 @@ class SyncScreen(ModalScreen[None]):
         choices = dict(self.choices)
         done: list[adopt.Resolution] = []
         try:
-            adopt.adopt(
-                self.respec_home,
-                self.user_home,
-                lambda entry: choices.get(entry.path),
-                done=done,
-            )
+            with lock.exclusive(self.respec_home):
+                adopt.adopt(
+                    self.respec_home,
+                    self.user_home,
+                    lambda entry: choices.get(entry.path),
+                    done=done,
+                )
         except FAILURES as error:
             for resolution in done:
                 self._log(resolution.describe(), ok=True)
@@ -1297,13 +1316,14 @@ class SyncScreen(ModalScreen[None]):
             keep_set.pressed_index if keep_set.pressed_index >= 0 else 0
         ]
         try:
-            change = layers.repair(
-                self.respec_home,
-                self.user_home,
-                conflict.layer,
-                keep=keep,
-                profile_name=conflict.profile,
-            )
+            with lock.exclusive(self.respec_home):
+                change = layers.repair(
+                    self.respec_home,
+                    self.user_home,
+                    conflict.layer,
+                    keep=keep,
+                    profile_name=conflict.profile,
+                )
         except FAILURES as error:
             self._log_error(error)
         else:
@@ -1335,7 +1355,8 @@ class SyncScreen(ModalScreen[None]):
     @on(Button.Pressed, "#sync-relink")
     async def _relink(self) -> None:
         try:
-            result = sync.reapply(self.respec_home, self.user_home)
+            with lock.exclusive(self.respec_home):
+                result = sync.reapply(self.respec_home, self.user_home)
         except FAILURES as error:
             self._log_error(error)
         else:
@@ -1352,13 +1373,14 @@ class SyncScreen(ModalScreen[None]):
         index = int((event.button.id or "").rsplit("-", 1)[1])
         skill = list(self.report.folders_gone)[index]
         try:
-            change = items.set_enabled(
-                self.respec_home,
-                self.user_home,
-                skill,
-                False,
-                self.report.active_profile,
-            )
+            with lock.exclusive(self.respec_home):
+                change = items.set_enabled(
+                    self.respec_home,
+                    self.user_home,
+                    skill,
+                    False,
+                    self.report.active_profile,
+                )
         except FAILURES as error:
             self._log_error(error)
         else:
@@ -1633,9 +1655,10 @@ class RespecApp(App[None]):
                 )
 
         try:
-            result = switch.use(
-                self.respec_home, self.user_home, name, on_unknown=handler
-            )
+            with lock.exclusive(self.respec_home):
+                result = switch.use(
+                    self.respec_home, self.user_home, name, on_unknown=handler
+                )
         except switch.UnknownEntries as blocked:
             self._ask_then_activate(
                 name, blocked.entries, previous, owned_before, again=choices is not None
@@ -1700,14 +1723,15 @@ class RespecApp(App[None]):
                 return
             resolved: list[adopt.Resolution] = []
             try:
-                adopt.resolve(
-                    self.respec_home,
-                    entries,
-                    lambda e: choices.get(e.path),
-                    profile,
-                    done=resolved,
-                )
-                adopt.link_added(self.respec_home, self.user_home, resolved)
+                with lock.exclusive(self.respec_home):
+                    adopt.resolve(
+                        self.respec_home,
+                        entries,
+                        lambda e: choices.get(e.path),
+                        profile,
+                        done=resolved,
+                    )
+                    adopt.link_added(self.respec_home, self.user_home, resolved)
             except RespecError as error:
                 self._failed(error, resolved)
                 return
@@ -1730,9 +1754,10 @@ class RespecApp(App[None]):
         resolved: list[adopt.Resolution],
         backups: dict[str, str],
     ) -> None:
-        parts = [f"Switched to {result.profile}: installed {len(result.installed)}"]
+        installed = messages.skills_placed(result.installed)
+        parts = [f"Switched to {result.profile}: installed {installed}"]
         if result.removed:
-            parts.append(f"removed {len(result.removed)}")
+            parts.append(f"removed {messages.skills_placed(result.removed)}")
         self.selected = result.profile
         lines = [
             *(resolution.describe() for resolution in resolved),
@@ -1771,12 +1796,13 @@ class RespecApp(App[None]):
                 return
             done: list[adopt.Resolution] = []
             try:
-                result = adopt.adopt(
-                    self.respec_home,
-                    self.user_home,
-                    lambda e: choices.get(e.path),
-                    done=done,
-                )
+                with lock.exclusive(self.respec_home):
+                    result = adopt.adopt(
+                        self.respec_home,
+                        self.user_home,
+                        lambda e: choices.get(e.path),
+                        done=done,
+                    )
             except RespecError as error:
                 self._failed(error, done)
                 return

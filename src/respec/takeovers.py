@@ -126,6 +126,15 @@ def _load(respec_home: Path) -> list[dict[str, Any]]:
     return records
 
 
+def inspect(respec_home: Path) -> None:
+    """Report a log that cannot be read (:func:`take_problems`), for commands
+    that only read, such as ``respec status``. Changes nothing."""
+    try:
+        _load(respec_home)
+    except TakeoversNewer:
+        pass  # refused by every command that uses the log
+
+
 def _load_for_rewrite(respec_home: Path) -> list[dict[str, Any]]:
     """The records to rewrite; a log that cannot be read is first moved to a
     fresh backup run (never overwritten) and reported."""

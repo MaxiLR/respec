@@ -517,3 +517,13 @@ def test_hidden_leftover_is_named_in_human_output(run, dirs, taken_over):
         line.startswith("Left ") and ".hidden" in line and "not in the backup" in line
         for line in out.splitlines()
     )
+
+
+def test_restore_counts_the_removed_skills_and_their_links(run, respec_home, dirs):
+    make_profile(respec_home, "a", ["claude-code", "agents"], ["tdd"])
+    assert run("use", "a").exit_code == 0
+
+    result = run("restore")
+
+    assert result.exit_code == 0, result.output
+    assert "Removed 1 skill (2 links) placed by respec" in result.stdout

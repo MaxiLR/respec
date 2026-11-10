@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 
 try:
     import fcntl
@@ -216,16 +217,21 @@ def save_state(respec_home: Path, state: State, durable: bool = False) -> None:
     """
     path = state_path(respec_home)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{STATE_FILE}.tmp")
     text = json.dumps(state.to_dict(), indent=2) + "\n"
-    if durable:
-        write_durably(temporary, text)
-    else:
-        with open(temporary, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    # A name of its own for each write, so two writers never share one.
+    temporary = path.with_name(f".{STATE_FILE}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        if durable:
+            write_durably(temporary, text)
+        else:
+            with open(temporary, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
     if durable:
         sync_folder(path.parent)
 

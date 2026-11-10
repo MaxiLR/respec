@@ -74,7 +74,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from respec import trees
+from respec import lock, trees
 from respec.errors import RespecError
 from respec.state import (
     STATE_FILE,
@@ -252,9 +252,12 @@ def in_flight(journal: dict[str, Any] | None) -> list[str]:
 
 
 def pending(respec_home: Path) -> Recovery | None:
-    """The interrupted change waiting in ``state.json``, if any (reads only)."""
+    """The interrupted change waiting in ``state.json``, if any (reads only).
+
+    A journal of a change that another respec process is still running (it
+    holds the lock, :func:`respec.lock.busy`) is not interrupted: None."""
     journal = load_state(respec_home).journal
-    if journal is None:
+    if journal is None or lock.busy(respec_home):
         return None
     paths = in_flight(journal)
     return Recovery(
@@ -287,15 +290,19 @@ def ready(respec_home: Path, user_home: Path | None = None) -> None:
     """
     if _depth() or _recovering():
         return
-    journal = load_state(respec_home).journal
-    if journal is None:
-        return
-    if _policy.auto:
-        from respec import paths
+    # Under the lock: a journal of a change another process is running is
+    # not an interrupted one (that process holds the lock: Busy).
+    with lock.exclusive(respec_home):
+        journal = load_state(respec_home).journal
+        if journal is None:
+            return
+        if _policy.auto:
+            from respec import paths
 
-        recover(respec_home, user_home or _policy.user_home or paths.user_home())
-        return
-    raise Pending(pending_message(journal))
+            home = user_home or _policy.user_home or paths.user_home()
+            recover(respec_home, home)
+            return
+        raise Pending(pending_message(journal))
 
 
 @contextmanager
@@ -317,6 +324,13 @@ def begin(
     if _depth():
         yield from _nested(respec_home, operation, state, fields)
         return
+    with lock.exclusive(respec_home):
+        yield from _outermost(respec_home, operation, state, fields)
+
+
+def _outermost(
+    respec_home: Path, operation: str, state: State | None, fields: dict[str, Any]
+) -> Iterator[None]:
     current = state if state is not None else load_state(respec_home)
     if current.journal is not None and not _recovering():
         raise Pending(pending_message(current.journal))
@@ -510,13 +524,6 @@ def _drop_records(state: State, path: str | Path) -> None:
     state.installed = [i for i in state.installed if trees.real(i.path) != key]
 
 
-def _delete(path: Path) -> None:
-    if path.is_symlink() or not path.is_dir():
-        path.unlink()
-    else:
-        shutil.rmtree(path)
-
-
 def _settle_pending(
     respec_home: Path, journal: dict[str, Any], aside: _Aside
 ) -> list[str]:
@@ -595,7 +602,7 @@ def _settle_adopt(
         backup = Path(step["backup"])
         if stage == "copy":
             if os.path.lexists(backup):
-                _delete(backup)
+                trees.delete_entry(backup)
             _local.undone = True
             return notes
     else:
@@ -626,11 +633,11 @@ def _settle_adopt(
                     return notes  # the profile keeps its previous copy
             elif step["name"] not in profile.skills:
                 if os.path.lexists(live):
-                    _delete(live)  # a copy cut short; the original is whole
+                    trees.delete_entry(live)  # a copy cut short; the original is whole
                 _local.undone = True
                 return notes
     if os.path.lexists(original):
-        _delete(original)
+        trees.delete_entry(original)
     _drop_records(state, original)
     return notes
 
@@ -642,7 +649,14 @@ def recover(
 
     ``rollback`` asks to undo it where that is possible (see the module
     docstring). Returns what was done, also kept for :func:`take_reports`.
+    Holds respec's lock (:mod:`respec.lock`), so a change another process is
+    running is never taken for an interrupted one (:class:`lock.Busy`).
     """
+    with lock.exclusive(respec_home):
+        return _recover(respec_home, user_home, rollback)
+
+
+def _recover(respec_home: Path, user_home: Path, rollback: bool) -> Recovery | None:
     state = load_state(respec_home)
     journal = state.journal
     if journal is None:
@@ -745,6 +759,11 @@ def rebuild_state(respec_home: Path, user_home: Path) -> Recovery:
     those folders (copies included) becomes an unknown entry for
     ``respec adopt`` or ``respec use --unknown``. No profile is active.
     """
+    with lock.exclusive(respec_home):
+        return _rebuild_state(respec_home, user_home)
+
+
+def _rebuild_state(respec_home: Path, user_home: Path) -> Recovery:
     from respec import global_skills, switch, targets
     from respec import takeovers as takeover_log
 
@@ -962,11 +981,11 @@ def _recover_links(
         for skill in journal.get("created", []):
             # A local add: its copy goes unless profile.yaml lists it.
             if skill not in profile.skills and os.path.lexists(folders / skill):
-                _delete(folders / skill)  # a copy; its source is untouched
+                trees.delete_entry(folders / skill)  # a copy; its source is untouched
         for skill in journal.get("removing", []):
             # A remove: the folder goes once profile.yaml no longer lists it.
             if skill not in profile.skills and os.path.lexists(folders / skill):
-                _delete(folders / skill)
+                trees.delete_entry(folders / skill)
     unchanged = (
         profile is not None
         and "profile_digest" in journal
@@ -1062,7 +1081,7 @@ def _recover_update(
             # This run's own .old: an update starts only when there is none,
             # and the journal kept every other writer out since. It holds the
             # previous files, which profile.yaml no longer records.
-            _delete(old)
+            trees.delete_entry(old)
             if not ours:
                 notes.append(
                     f"removed the rest of {old}: this update's previous files "
@@ -1071,25 +1090,31 @@ def _recover_update(
         elif ours:
             if os.path.lexists(live):
                 if fetched.get(skill) and _digest_or_none(live) == fetched[skill]:
-                    _delete(live)  # fetched upstream files; fetched again later
+                    trees.delete_entry(
+                        live
+                    )  # fetched upstream files; fetched again later
                 else:
                     aside(live, f"profiles/{name}")
             os.replace(old, live)
         if os.path.lexists(incoming):
-            _delete(incoming)  # fetched by this run (an older one was removed)
+            trees.delete_entry(
+                incoming
+            )  # fetched by this run (an older one was removed)
     ours_dropping = {Path(path) for path in journal.get("dropping", [])}
     for dropping in sorted(skills_dir.glob(".*.dropping")):
         if not dropping.is_dir() or dropping.is_symlink():
             continue
         if dropping in ours_dropping:
-            _delete(dropping)  # this run verified it redundant before the delete
+            trees.delete_entry(
+                dropping
+            )  # this run verified it redundant before the delete
             continue
         skill = dropping.name[1 : -len(".dropping")]
         live = skills_dir / skill
         if (os.path.lexists(live) and trees.same_content(dropping, live)) or (
             adopt._backed_up(respec_home, name, skill, dropping)
         ):
-            _delete(dropping)  # its content is held elsewhere
+            trees.delete_entry(dropping)  # its content is held elsewhere
         else:
             notes.append(
                 f"left {dropping} in place: no update recorded it and its "
@@ -1137,7 +1162,9 @@ def _recover_add(
     for skill in sorted(created):
         folder = profile.path / profiles.SKILLS_DIR / skill
         if os.path.lexists(folder):
-            _delete(folder)  # made by this run from git; nothing of the user's
+            trees.delete_entry(
+                folder
+            )  # made by this run from git; nothing of the user's
     return ROLLED_BACK, (
         f"Rolled back {describe(journal)}: none of its skills were added; run "
         "'respec add' again."
@@ -1155,7 +1182,7 @@ def _recover_install(
         profiles.load_profile(respec_home, name)
     except RespecError:
         if os.path.lexists(folder):
-            _delete(folder)  # fetched from git; nothing of the user's
+            trees.delete_entry(folder)  # fetched from git; nothing of the user's
         return ROLLED_BACK, (
             f"Rolled back {describe(journal)}: the half-copied profile was "
             "removed; run 'respec profile install' again."

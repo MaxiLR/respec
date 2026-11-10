@@ -13,7 +13,8 @@ import click
 import typer
 
 from respec import adopt as adopt_entries
-from respec import global_skills, items, journal, layers, messages, paths, profiles
+from respec import global_skills, items, journal, layers, lock, messages, paths
+from respec import profiles
 from respec import sources
 from respec import switch, takeovers, targets, trees, unknown
 from respec import restore as restore_backups
@@ -49,6 +50,8 @@ def main(ctx: typer.Context) -> None:
     # command that changes skills, and reported as a warning.
     journal.auto_recover(ctx.obj.user_home)
     _current[:] = [ctx.obj]
+    # Registered first, so it runs last: the warnings below still hold it.
+    ctx.call_on_close(lock.release_all)
     ctx.call_on_close(_print_warnings)
     if ctx.invoked_subcommand is None:
         if not _interactive():
@@ -136,6 +139,21 @@ def _fail(error: RespecError) -> NoReturn:
     raise typer.Exit(code=1)
 
 
+def _hold_lock(
+    homes: Homes, as_json: bool = False, payload: dict[str, Any] | None = None
+) -> None:
+    """Hold respec's lock for the rest of this command (a command that
+    changes things). When another respec keeps it, fail: with ``--json``,
+    ``payload`` (the command's keys, as nothing was done) plus ``error``."""
+    try:
+        lock.acquire(homes.respec_home)
+    except lock.Busy as error:
+        if as_json:
+            _print_json({**(payload or {}), "error": str(error)})
+            raise typer.Exit(code=1)
+        _fail(error)
+
+
 def _print_json(data: Any) -> None:
     """Print ``data``; an object always carries one ``warnings`` list.
 
@@ -217,6 +235,7 @@ def profile_new(
 ) -> None:
     """Create an empty profile for the given targets."""
     homes = _homes(ctx)
+    _hold_lock(homes, as_json)
     try:
         profile = profiles.create_profile(homes.respec_home, name, target)
     except RespecError as error:
@@ -502,10 +521,11 @@ class _SwitchRun:
             if result is not None:
                 if result.removed:
                     left = f" of profile {result.previous!r}" if result.previous else ""
-                    typer.echo(f"Removed {len(result.removed)} skills{left}")
+                    removed = messages.skills_placed(result.removed)
+                    typer.echo(f"Removed {removed}{left}")
                 typer.echo(
                     f"Switched to profile {result.profile!r}: "
-                    f"installed {len(result.installed)} skills"
+                    f"installed {messages.skills_placed(result.installed)}"
                 )
         for error in self.errors:
             _failure.append(error)
@@ -559,6 +579,17 @@ def use(
 ) -> None:
     """Activate a profile: remove the previous profile's skills, install this one."""
     homes = _homes(ctx)
+    _hold_lock(
+        homes,
+        as_json,
+        {
+            "active_profile": active_or_none(homes.respec_home),
+            "previous_profile": None,
+            **{key: [] for key in ("removed", "installed", "resolved", "linked")},
+            "backups": {},
+            "unresolved": [],
+        },
+    )
     interactive = _interactive() and not as_json
     try:
         state = load_state(homes.respec_home)
@@ -684,6 +715,11 @@ def recover(
 ) -> None:
     """Finish (or roll back) a change that was interrupted part way."""
     homes = _homes(ctx)
+    _hold_lock(
+        homes,
+        as_json,
+        {"active_profile": active_or_none(homes.respec_home), "recovered": False},
+    )
     try:
         try:
             report = journal.recover(homes.respec_home, homes.user_home, rollback)
@@ -761,6 +797,7 @@ def add(
 ) -> None:
     """Add a skill from a local folder or a git repository and enable it."""
     homes = _homes(ctx)
+    _hold_lock(homes, as_json)
     try:
         local = items.user_path(source)
         from_git = not local.exists() and sources.is_git_spec(source)
@@ -800,6 +837,7 @@ def remove(
 ) -> None:
     """Remove a skill from a profile and delete its files."""
     homes = _homes(ctx)
+    _hold_lock(homes, as_json)
     try:
         change = items.remove(homes.respec_home, homes.user_home, skill, profile)
     except RespecError as error:
@@ -811,6 +849,7 @@ def _set_enabled(
     ctx: typer.Context, skill: str, enabled: bool, profile: str | None, as_json: bool
 ) -> None:
     homes = _homes(ctx)
+    _hold_lock(homes, as_json)
     try:
         change = items.set_enabled(
             homes.respec_home, homes.user_home, skill, enabled, profile
@@ -941,6 +980,7 @@ def layer_add(
 ) -> None:
     """Create a custom layer."""
     homes = _homes(ctx)
+    _hold_lock(homes, as_json)
     try:
         change = layers.add(homes.respec_home, name, exclusive, description, profile)
     except RespecError as error:
@@ -957,6 +997,7 @@ def layer_rm(
 ) -> None:
     """Remove a custom layer; its skills stay in the profile."""
     homes = _homes(ctx)
+    _hold_lock(homes, as_json)
     try:
         change = layers.remove(homes.respec_home, name, profile)
     except RespecError as error:
@@ -966,6 +1007,7 @@ def layer_rm(
 
 def _layer_skill_command(ctx, function, name, skill, profile, as_json) -> None:
     homes = _homes(ctx)
+    _hold_lock(homes, as_json)
     try:
         change = function(homes.respec_home, homes.user_home, name, skill, profile)
     except RespecError as error:
@@ -1011,6 +1053,7 @@ def layer_remove_skill(
 
 def _layer_flag_command(ctx, function, name, value, profile, as_json) -> None:
     homes = _homes(ctx)
+    _hold_lock(homes, as_json)
     try:
         change = function(homes.respec_home, homes.user_home, name, value, profile)
     except RespecError as error:
@@ -1097,6 +1140,7 @@ def layer_repair(
 ) -> None:
     """Fix an exclusive layer with several enabled skills: keep one, disable the rest."""
     homes = _homes(ctx)
+    _hold_lock(homes, as_json)
     choose = _prompt_keep if _interactive() and not as_json else None
     try:
         change = layers.repair(
@@ -1147,6 +1191,7 @@ def adopt(
     choices, a terminal asks per entry; other runs only list them.
     """
     homes = _homes(ctx)
+    _hold_lock(homes, as_json, {"resolved": [], "linked": [], "unresolved": []})
     done: list[adopt_entries.Resolution] = []
     try:
         entries = adopt_entries.unresolved(homes.respec_home)
@@ -1259,6 +1304,17 @@ def restore(
     """Put a backup back and release every folder respec owns."""
     homes = _homes(ctx)
     _refuse_mixed_restore_options(list_only, release_only, on_unknown, overwrite)
+    if not list_only:
+        nothing = restore_backups.RestoreResult(backup=None)
+        _hold_lock(
+            homes,
+            as_json,
+            {
+                **_restore_payload(nothing, []),
+                "resolved": [],
+                **({"kept": []} if release_only else {}),
+            },
+        )
     if release_only:
         _release_only(homes, backup, as_json)
         return
@@ -1357,7 +1413,7 @@ def _report_restore(
     for resolution in resolutions + result.set_aside:
         _report_resolution(resolution)
     if result.removed:
-        typer.echo(f"Removed {len(result.removed)} respec skills")
+        typer.echo(f"Removed {messages.skills_placed(result.removed)} placed by respec")
     for target, source in result.restored.items():
         origin = source if source else "nothing (folder did not exist)"
         typer.echo(f"Restored {target} from {origin}")
@@ -1479,7 +1535,7 @@ def _report_release(
         )
         return
     if result.removed:
-        typer.echo(f"Removed {len(result.removed)} respec skills")
+        typer.echo(f"Removed {messages.skills_placed(result.removed)} placed by respec")
     for path in result.kept:
         typer.echo(f"Kept {path}: respec cannot verify it as its own")
     typer.echo(
@@ -1527,6 +1583,7 @@ def update(
     if check_only:
         _update_check(homes, profile, skill, as_json)
         return
+    _hold_lock(homes, as_json)
 
     def confirm(name: str) -> bool:
         if yes:
@@ -1620,6 +1677,7 @@ def profile_install(
 ) -> None:
     """Copy a whole profile from a repository once; it is then owned locally."""
     homes = _homes(ctx)
+    _hold_lock(homes, as_json)
     try:
         installed = sources.install_profile(homes.respec_home, source, name, ref)
     except RespecError as error:

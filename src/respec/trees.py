@@ -99,3 +99,11 @@ def copy_entry(source: Path, destination: Path) -> None:
         if destination.is_dir() and not destination.is_symlink():
             shutil.rmtree(destination, ignore_errors=True)
         raise OSError(str(error)) from None
+
+
+def delete_entry(path: Path) -> None:
+    """Delete one entry: a link or file is unlinked, a folder removed whole."""
+    if path.is_symlink() or not path.is_dir():
+        path.unlink()
+    else:
+        shutil.rmtree(path)
