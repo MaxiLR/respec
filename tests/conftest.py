@@ -55,6 +55,21 @@ def isolated_homes(tmp_path, monkeypatch):
     return SimpleNamespace(home=home, respec_home=respec_home)
 
 
+@pytest.fixture(autouse=True)
+def shipped_skills(request, monkeypatch):
+    """Leave respec's shipped skills out unless a test is marked ``shipped``.
+
+    respec installs its own skills into every target on each switch. Tests of
+    the profile engine assert exact folder contents, so they run without them;
+    ``tests/test_global_skills.py`` and the tests marked ``shipped`` cover the
+    real behaviour, including how it combines with takeover, adopt and restore.
+    """
+    if request.node.get_closest_marker("shipped") is None:
+        from respec import global_skills
+
+        monkeypatch.setattr(global_skills, "shipped_names", lambda: ())
+
+
 @pytest.fixture
 def run():
     """Invoke the respec CLI in-process and return the click Result."""

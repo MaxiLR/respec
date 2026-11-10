@@ -15,7 +15,8 @@ Order of a restore:
 
 0. Plan (nothing changes): pick the backup for each folder and the entries to
    put back. Entries respec itself created never come back, judged only by
-   facts from backup time: a symlink into the profiles folder, or a copy whose
+   facts from backup time: a symlink into the profiles folder (or respec's
+   global or shipped skill folders), or a copy whose
    digest matches one the backup run's ``manifest.json`` says respec had
    installed there. Skipped entries are reported.
 1. Conflicts: an entry in a folder being restored that respec does not manage
@@ -41,7 +42,7 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import adopt, profiles, switch, targets, unknown
+from respec import adopt, global_skills, profiles, switch, targets, unknown
 from respec.errors import RespecError
 from respec.state import Installed, State, load_state, save_state
 
@@ -136,15 +137,22 @@ def _within(path: Path, root: Path) -> bool:
 
 
 def _respec_link(respec_home: Path, entry: Path, folder: Path) -> bool:
-    """Whether a backed-up entry is a symlink into respec's profiles folder."""
+    """Whether a backed-up entry is a symlink into respec's profiles folder
+    (or its global or shipped skill folders)."""
     if not entry.is_symlink():
         return False
     target = Path(os.readlink(entry))
     if not target.is_absolute():
         target = folder / target
-    root = profiles.profiles_dir(respec_home)
-    return _within(Path(os.path.normpath(target)), Path(os.path.normpath(root))) or (
-        _within(target.resolve(), root.resolve())
+    roots = [
+        profiles.profiles_dir(respec_home),
+        respec_home / global_skills.GLOBAL_DIR,
+        global_skills.shipped_dir(respec_home),
+    ]
+    return any(
+        _within(Path(os.path.normpath(target)), Path(os.path.normpath(root)))
+        or _within(target.resolve(), root.resolve())
+        for root in roots
     )
 
 
@@ -328,6 +336,30 @@ def _restore_folder(plan: FolderPlan) -> None:
         _put_back(source, destination)
 
 
+def _remove_created(state: State, plans: list[FolderPlan]) -> None:
+    """Remove the folders respec created at takeover that are empty again.
+
+    Only folders of targets left without a backup to restore (it did not exist
+    at takeover, or a named backup does not hold it) are considered; a folder
+    that holds anything, or is a symlink, stays.
+    """
+    restored = {
+        target for plan in plans if plan.source is not None for target in plan.targets
+    }
+    folders = {
+        Path(path)
+        for target, entry in state.owned.items()
+        if target not in restored
+        for path in entry.created
+    }
+    for folder in sorted(folders, key=lambda p: len(p.parts), reverse=True):
+        try:
+            if folder.is_dir() and not folder.is_symlink():
+                folder.rmdir()
+        except OSError:
+            pass  # not empty: something else lives there now
+
+
 def _apply(
     respec_home: Path,
     plans: list[FolderPlan],
@@ -362,6 +394,7 @@ def _apply(
             f"owns its folders. Run 'respec restore{again}' again to finish."
         ) from None
     result.released = sorted(state.owned)
+    _remove_created(state, plans)
     save_state(respec_home, State())
 
 

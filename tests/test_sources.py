@@ -1332,3 +1332,37 @@ def test_profile_install_of_conflicted_profile_warns(run, upstream):
     assert [(w["profile"], w["layer"], w["skills"]) for w in payload["warnings"]] == [
         ("imp2", "design-principles", ["a", "b"])
     ]
+
+
+@pytest.mark.shipped
+def test_git_add_of_a_skill_named_like_a_shipped_skill_is_refused(
+    run, upstream, profiles_root
+):
+    repo = upstream("acme/tools")
+    repo.write("skills/respec/SKILL.md", "# mine\n")
+    repo.write("skills/lint/SKILL.md", "# lint\n")
+    repo.commit()
+    ok(run("profile", "new", "work", "-t", "agents"))
+
+    result = fails(run("add", "acme/tools", "-p", "work"))
+
+    assert "'respec'" in result.output and "ships" in result.output
+    assert read_yaml(profiles_root, "work").get("skills") in (None, {})
+    assert list((profiles_root / "work" / "skills").iterdir()) == []
+
+
+@pytest.mark.shipped
+def test_profile_install_with_a_skill_named_like_a_shipped_skill_is_refused(
+    run, upstream, profiles_root
+):
+    pack = upstream("acme/pack")
+    pack.write(
+        "profile.yaml", "targets: [agents]\nskills:\n  respec: {enabled: false}\n"
+    )
+    pack.write("skills/respec/SKILL.md", "# mine\n")
+    pack.commit()
+
+    result = fails(run("profile", "install", "acme/pack"))
+
+    assert "'respec'" in result.output and "ships" in result.output
+    assert not (profiles_root / "pack").exists()

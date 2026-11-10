@@ -1,7 +1,8 @@
 """Unknown entries: anything in a folder respec owns that respec did not put there.
 
 An entry is *managed* when ``state.json`` records it and it is still what respec
-created: a recorded symlink must still be a symlink into the profiles folder,
+created: a recorded symlink must still be a symlink into the profiles folder
+(or into respec's global or shipped skill folders),
 a recorded copy must still exist. A recorded path that now holds something
 else (for example a link replaced by a hand-made folder, or a
 copy another tool replaced or someone edited) is unknown again and
@@ -22,7 +23,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from respec import profiles, targets
+from respec import global_skills, targets
 from respec.state import Installed, State
 
 IGNORED_FILES = frozenset({".DS_Store"})
@@ -86,9 +87,11 @@ def is_managed(respec_home: Path, item: Installed) -> bool:
     if item.mode == "symlink":
         if not path.is_symlink():
             return False
-        root = profiles.profiles_dir(respec_home).resolve()
         linked = path.resolve()
-        return linked == root or root in linked.parents
+        return any(
+            linked == root or root in linked.parents
+            for root in global_skills.source_roots(respec_home)
+        )
     if item.digest is None or not os.path.lexists(path):
         return False
     try:

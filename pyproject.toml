@@ -30,3 +30,6 @@ packages = ["src/respec"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "shipped: install respec's own shipped skills (left out by default in tests)",
+]

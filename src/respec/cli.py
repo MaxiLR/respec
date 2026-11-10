@@ -257,8 +257,14 @@ def _interactive() -> bool:
 def _prompt_choice(entry: unknown.Unknown, profile: str | None) -> str:
     """Ask what to do with one unknown entry; ``add`` goes to ``profile``."""
     typer.echo(f"Unknown entry {switch.describe(entry)} in {', '.join(entry.targets)}")
-    available = adopt_entries.choices(profile)
-    if profile is None:
+    available = adopt_entries.choices(profile, entry, paths.respec_home())
+    if profile is not None and available == ("remove",):
+        question = (
+            f"  {entry.name!r} is the name of a skill respec ships or a global "
+            "skill, so it cannot be added; remove: back up and remove (respec "
+            "links its own skill there again) [remove]"
+        )
+    elif profile is None:
         question = (
             "  no active profile to add it to; remove: back up and remove [remove]"
         )

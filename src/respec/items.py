@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import profiles, switch
+from respec import global_skills, profiles, switch
 from respec.errors import RespecError
 from respec.state import load_state
 
@@ -84,6 +84,7 @@ def add_local(
             f"skill folder name {item!r} is not a valid skill name: "
             f"{profiles.NAME_RULE}"
         )
+    global_skills.refuse_reserved(respec_home, [item], profile.name)
     if item in profile.skills:
         raise RespecError(
             f"profile {profile.name!r} already has a skill {item!r}; "

@@ -51,6 +51,28 @@ folder, then installs the new profile into its own targets. The first time
 respec takes over a target folder it copies the folder's full contents to
 `~/.respec/backups/<timestamp>/<target>/`. Installing respec changes nothing.
 
+Some skills survive every switch. respec ships two of its own: `respec` (a
+reference of this CLI for agents) and `profile-maker` (a guided interview that
+builds a profile through the CLI). Whenever a profile is active they are linked
+into every registered target, whatever the profile's targets, so any agent can
+edit profiles; a switch therefore takes over all target folders. There is no
+opt-out, and `respec restore` removes them with everything else, along with
+any folders respec created for them that are empty again. Your own
+global skills are listed in `~/.respec/config.yaml`, each in
+`~/.respec/global/skills/<skill>/`, and are linked only into the active
+profile's targets:
+
+```yaml
+global:
+  skills: [my-notes]
+```
+
+No profile skill may take the name of a global or shipped skill: `add`,
+`profile install` and adopt's add refuse such a name before changing
+anything. An unknown entry with such a name (for example a replaced
+shipped link) can only be removed; it is backed up and respec links its
+own skill there again.
+
 Entries in an owned folder that respec did not create are _unknown_. So is a
 recorded path that no longer holds what respec put there: a symlink replaced by
 something else, or a copy whose content was edited or replaced. Each unknown

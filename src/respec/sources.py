@@ -29,7 +29,7 @@ from pathlib import Path
 
 import yaml
 
-from respec import items, profiles, unknown
+from respec import global_skills, items, profiles, unknown
 from respec.errors import RespecError
 
 BASE_URL_ENV = profiles.GIT_BASE_URL_ENV
@@ -420,6 +420,7 @@ def add(
     before = profiles.load_profile(respec_home, name)
     with checkout(spec.url, ref, spec.repo) as (tree, commit):
         found = _find_skills(tree, spec)
+        global_skills.refuse_reserved(respec_home, [item for item, _ in found], name)
         clashes = [item for item, _ in found if item in before.skills]
         if clashes:
             raise RespecError(
@@ -679,6 +680,7 @@ def install_profile(
         profile = dataclasses.replace(
             profiles.parse_profile(name, folder, data), path=destination
         )
+        global_skills.refuse_reserved(respec_home, profile.skills, name)
         missing = [
             item
             for item in profile.skills
