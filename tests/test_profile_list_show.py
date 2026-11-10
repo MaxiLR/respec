@@ -36,7 +36,7 @@ def test_list_json_with_no_profiles(run):
     result = run("profile", "list", "--json")
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout) == {"profiles": []}
+    assert json.loads(result.stdout) == {"profiles": [], "warnings": []}
 
 
 def test_list_human_with_no_profiles_explains_how_to_create(run):
@@ -58,6 +58,7 @@ def test_list_json_summarises_profiles_in_name_order(run):
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout) == {
+        "warnings": [],
         "profiles": [
             {
                 "name": "alpha",
@@ -66,7 +67,7 @@ def test_list_json_summarises_profiles_in_name_order(run):
                 "enabled": 0,
             },
             {"name": "zeta", "targets": ["oh-my-pi"], "skills": 0, "enabled": 0},
-        ]
+        ],
     }
 
 
@@ -105,6 +106,7 @@ def test_show_json_includes_resolved_target_dirs_and_skills(
     assert result.exit_code == 0, result.output
     home = isolated_homes.home
     assert json.loads(result.stdout) == {
+        "warnings": [],
         "name": "work",
         "path": str(sourced_profile),
         "targets": [

@@ -94,6 +94,7 @@ respec layer add review --additive -d "Code review helpers"
 respec layer add-skill review my-review         # group skills; enable/disable as one
 respec layer disable review
 respec layer off design-principles              # its rules lapse; skills stay
+respec layer repair design-principles --keep my-design  # fix a hand-edited conflict
 ```
 
 A layer is a named group inside one profile that only decides which skills are
@@ -103,6 +104,14 @@ only, never component libraries or project tokens) and `output-style`, which
 accepts no skills until output styles are supported. Built-ins cannot be
 removed, only turned off. Skills outside layers, and skills of a layer that is
 off, are plain additive skills.
+
+In `profile.yaml` a layer lists its members under `skills:` (the older `items:`
+key is still read; respec always writes `skills:`). If a hand edit leaves an
+exclusive layer with several enabled skills, every command that reads the profile
+warns on stderr (and in a `warnings` field of `--json` output), and `respec use`
+refuses the profile. `respec layer repair <layer>` keeps one skill and disables
+the rest: `--keep <skill>` picks it, a terminal asks, and other runs keep the
+first listed skill.
 
 ## Development
 

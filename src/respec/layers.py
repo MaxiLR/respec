@@ -15,6 +15,7 @@ active profile is re-applied through the switching engine (via
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,6 +30,7 @@ class LayerChange:
     layer: str
     action: str
     skill: str | None = None
+    disabled: list[str] = field(default_factory=list)
     active: bool = False
     linked: list[str] = field(default_factory=list)
     unlinked: list[str] = field(default_factory=list)
@@ -131,7 +133,7 @@ def remove(respec_home: Path, name: str, profile_name: str | None = None):
     return LayerChange(profile=profile.name, layer=name, action="rm")
 
 
-def _check_accepts_items(name: str) -> None:
+def _check_accepts_skills(name: str) -> None:
     if name == profiles.OUTPUT_STYLE:
         raise RespecError(profiles.OUTPUT_STYLE_UNSUPPORTED)
 
@@ -141,7 +143,7 @@ def _with_member(
 ) -> tuple[profiles.Profile, profiles.Layer]:
     """``profile`` with ``item`` listed in layer ``name`` (validated)."""
     layer = _layer(profile, name)
-    _check_accepts_items(name)
+    _check_accepts_skills(name)
     if item not in profile.skills:
         known = ", ".join(profile.skills) or "none"
         raise RespecError(
@@ -270,3 +272,48 @@ def set_active(
         profile=before.name, layer=name, action="on" if active else "off"
     )
     return _apply(respec_home, user_home, before, after, change)
+
+
+def repair(
+    respec_home: Path,
+    user_home: Path,
+    name: str,
+    keep: str | None = None,
+    choose: Callable[[list[str]], str] | None = None,
+    profile_name: str | None = None,
+) -> LayerChange:
+    """Leave one enabled skill in an exclusive layer that has several.
+
+    The kept skill is ``keep``, else the answer of ``choose`` (given the
+    enabled skills in layer order), else the first enabled skill. The others
+    are disabled. Returns a change with ``action`` ``repair`` and ``skill`` set
+    to the kept skill, or ``nothing`` when the layer had no conflict.
+    """
+    before = _load(respec_home, profile_name)
+    _layer(before, name)
+    conflict = next(
+        (c for c in profiles.exclusivity_conflicts(before) if c.layer == name), None
+    )
+    if conflict is None:
+        return LayerChange(profile=before.name, layer=name, action="nothing")
+    enabled = list(conflict.skills)
+    if keep is None and choose is not None:
+        keep = choose(enabled)
+    if keep is None:
+        keep = enabled[0]
+    if keep not in enabled:
+        raise RespecError(
+            f"cannot keep {keep!r}: the enabled skills of layer {name!r} are "
+            f"{', '.join(enabled)}"
+        )
+    after = profiles.with_enabled(before, [keep], True)
+    change = LayerChange(
+        profile=before.name,
+        layer=name,
+        action="repair",
+        skill=keep,
+        disabled=[skill for skill in enabled if skill != keep],
+    )
+    _apply(respec_home, user_home, before, after, change)
+    profiles.discard_warning(before.name, name)
+    return change
