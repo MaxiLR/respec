@@ -1687,5 +1687,5 @@ def profile_install(
     else:
         typer.echo(
             f"Installed profile {installed.name!r} at {installed.path} "
-            f"({len(installed.skills)} skills)"
+            f"({messages.plural(len(installed.skills), 'skill')})"
         )

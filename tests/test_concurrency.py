@@ -215,3 +215,74 @@ def test_state_saves_from_several_threads_never_collide(isolated_homes):
         p.name for p in isolated_homes.respec_home.iterdir() if p.name != "state.json"
     ]
     assert leftovers == []
+
+
+def test_a_change_that_ends_while_status_reads_is_not_called_interrupted(
+    homes, holder, monkeypatch
+):
+    from respec import journal
+
+    first = holder("use:begin", "use", "a")
+    real_load = journal.load_state
+
+    def load_then_let_the_change_end(respec_home):
+        state = real_load(respec_home)
+        if first.process.poll() is None:
+            assert first.finish()[0] == 0
+        return state
+
+    monkeypatch.setattr(journal, "load_state", load_then_let_the_change_end)
+
+    assert journal.pending(homes.respec_home) is None
+    first.finish()
+
+
+def test_a_change_from_another_thread_waits_its_turn_like_another_process(
+    homes, folders, run, monkeypatch
+):
+    from respec import lock
+
+    monkeypatch.setattr(lock, "WAIT", 0.1)
+    taken, done = threading.Event(), threading.Event()
+
+    def other_thread():
+        with lock.exclusive(homes.respec_home):
+            taken.set()
+            done.wait(30)
+
+    thread = threading.Thread(target=other_thread)
+    thread.start()
+    try:
+        assert taken.wait(30)
+        refused = run("use", "a")
+    finally:
+        done.set()
+        thread.join()
+
+    assert refused.exit_code == 1
+    assert "another respec is running" in refused.stderr
+    assert not (homes.respec_home / "state.json").exists()
+    assert run("use", "a").exit_code == 0
+
+
+def test_temporary_state_files_of_a_killed_writer_are_cleaned_up(homes, folders):
+    stale = homes.respec_home / ".state.json.99999.deadbeef.tmp"
+    stale.write_text("{")
+
+    done = cli("use", "a")
+
+    assert done.returncode == 0, done.stderr
+    assert not stale.exists()
+    assert_consistent(homes.respec_home, folders, "a")
+
+
+def test_temporary_state_files_stay_while_a_change_runs(homes, holder):
+    first = holder("use:begin", "use", "a")
+    temporary = homes.respec_home / ".state.json.4242.cafe.tmp"
+    temporary.write_text("{")
+
+    assert cli("status").returncode == 0
+    assert cli("profile", "list").returncode == 0
+
+    assert temporary.exists()
+    assert first.finish()[0] == 0

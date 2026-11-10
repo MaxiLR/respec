@@ -250,10 +250,6 @@ def _choice_id(layer: str, skill: str) -> str:
     return f"{_dom_id('choose', layer)}--{_escape(skill)}"
 
 
-def _plural(count: int, one: str, many: str) -> str:
-    return f"{count} {one if count == 1 else many}"
-
-
 # What a user's input or the file system can make a core call raise. The TUI
 # shows these and keeps running; anything else is a bug and surfaces as one.
 FAILURES = (RespecError, OSError, RuntimeError, ValueError)
@@ -939,7 +935,7 @@ class ProfileScreen(Screen[None]):
         newer = [row.skill for row in rows if row.update_available]
         failed = [row.skill for row in rows if row.error]
         lines = [
-            f"Checked {_plural(len(rows), 'skill', 'skills')} with a source: "
+            f"Checked {messages.plural(len(rows), 'skill', 'skills')} with a source: "
             + (
                 f"updates available for {', '.join(newer)}"
                 if newer
@@ -1092,19 +1088,25 @@ class SyncScreen(ModalScreen[None]):
             found = []
             if report.unknown:
                 found.append(
-                    _plural(len(report.unknown), "unknown entry", "unknown entries")
+                    messages.plural(
+                        len(report.unknown), "unknown entry", "unknown entries"
+                    )
                 )
             if report.conflicts:
                 found.append(
-                    _plural(len(report.conflicts), "layer conflict", "layer conflicts")
+                    messages.plural(
+                        len(report.conflicts), "layer conflict", "layer conflicts"
+                    )
                 )
             if report.links:
                 found.append(
-                    _plural(len(report.links), "link problem", "link problems")
+                    messages.plural(len(report.links), "link problem", "link problems")
                 )
             if report.invalid:
                 found.append(
-                    _plural(len(report.invalid), "invalid profile", "invalid profiles")
+                    messages.plural(
+                        len(report.invalid), "invalid profile", "invalid profiles"
+                    )
                 )
             self._summary("Found " + ", ".join(found) + ".", clean=False)
         findings = self.query_one("#sync-findings", Vertical)
@@ -1362,7 +1364,7 @@ class SyncScreen(ModalScreen[None]):
         else:
             self._log(
                 f"Re-applied profile {result.profile!r}: "
-                f"{_plural(len(result.installed), 'link', 'links')} in place",
+                f"{messages.plural(len(result.installed), 'link', 'links')} in place",
                 ok=True,
             )
         await self.run_check()

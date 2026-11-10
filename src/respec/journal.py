@@ -255,9 +255,14 @@ def pending(respec_home: Path) -> Recovery | None:
     """The interrupted change waiting in ``state.json``, if any (reads only).
 
     A journal of a change that another respec process is still running (it
-    holds the lock, :func:`respec.lock.busy`) is not interrupted: None."""
-    journal = load_state(respec_home).journal
-    if journal is None or lock.busy(respec_home):
+    holds the lock) is not interrupted: None. The lock is checked first and
+    held shared while ``state.json`` is read (:func:`respec.lock.reading`),
+    so a change that ends meanwhile is never reported."""
+    with lock.reading(respec_home) as running:
+        if running:
+            return None
+        journal = load_state(respec_home).journal
+    if journal is None:
         return None
     paths = in_flight(journal)
     return Recovery(
@@ -1090,24 +1095,21 @@ def _recover_update(
         elif ours:
             if os.path.lexists(live):
                 if fetched.get(skill) and _digest_or_none(live) == fetched[skill]:
-                    trees.delete_entry(
-                        live
-                    )  # fetched upstream files; fetched again later
+                    # Fetched upstream files; fetched again later.
+                    trees.delete_entry(live)
                 else:
                     aside(live, f"profiles/{name}")
             os.replace(old, live)
         if os.path.lexists(incoming):
-            trees.delete_entry(
-                incoming
-            )  # fetched by this run (an older one was removed)
+            # Fetched by this run (an older one was removed).
+            trees.delete_entry(incoming)
     ours_dropping = {Path(path) for path in journal.get("dropping", [])}
     for dropping in sorted(skills_dir.glob(".*.dropping")):
         if not dropping.is_dir() or dropping.is_symlink():
             continue
         if dropping in ours_dropping:
-            trees.delete_entry(
-                dropping
-            )  # this run verified it redundant before the delete
+            # This run verified it redundant before the delete.
+            trees.delete_entry(dropping)
             continue
         skill = dropping.name[1 : -len(".dropping")]
         live = skills_dir / skill
@@ -1162,9 +1164,8 @@ def _recover_add(
     for skill in sorted(created):
         folder = profile.path / profiles.SKILLS_DIR / skill
         if os.path.lexists(folder):
-            trees.delete_entry(
-                folder
-            )  # made by this run from git; nothing of the user's
+            # Made by this run from git; nothing of the user's.
+            trees.delete_entry(folder)
     return ROLLED_BACK, (
         f"Rolled back {describe(journal)}: none of its skills were added; run "
         "'respec add' again."

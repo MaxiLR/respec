@@ -537,6 +537,22 @@ def test_profile_install_copies_whole_profile(
     assert {row["name"] for row in shown["skills"]} == {"tdd", "house"}
 
 
+def test_profile_install_counts_one_skill_in_the_singular(run, upstream):
+    pack = upstream("acme/solo")
+    pack.write(
+        "profile.yaml",
+        yaml.safe_dump(
+            {"targets": ["claude-code"], "skills": {"only": {"enabled": True}}}
+        ),
+    )
+    pack.write("skills/only/SKILL.md", "# only\n")
+    pack.commit()
+
+    result = ok(run("profile", "install", "acme/solo"))
+
+    assert "(1 skill)" in result.stdout
+
+
 def test_profile_install_with_name_and_then_owned_locally(
     run, upstream, skills_repo, profiles_root
 ):
