@@ -18,7 +18,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from respec import global_skills, journal, profiles, switch
+from respec import global_skills, journal, profiles, switch, targets
 from respec.errors import RespecError
 from respec.state import load_state
 
@@ -78,6 +78,7 @@ def add_local(
     name: str | None = None,
     origin: profiles.Source | None = None,
     reference: bool = False,
+    record: bool = True,
 ) -> profiles.Profile:
     """Copy the skill folder ``source`` into a profile and record it.
 
@@ -86,7 +87,8 @@ def add_local(
     ``source`` (where it was fetched from). With ``reference``, the folder
     itself is recorded as the source (its resolved path and a digest of the
     copy) and copied by the rules for fetched content
-    (:func:`respec.sources.copy_folder`). Target folders are not touched.
+    (:func:`respec.sources.copy_folder`); without ``record`` it is copied by
+    those rules and no source is recorded. Target folders are not touched.
     Returns the updated profile. On failure nothing is left behind in the
     profile.
     """
@@ -122,9 +124,10 @@ def add_local(
             from respec import sources
 
             sources.copy_folder(source, destination)
-            origin = profiles.Source(
-                folder=str(source), digest=sources.fetched_digest(destination)
-            )
+            if record:
+                origin = profiles.Source(
+                    folder=str(source), digest=sources.fetched_digest(destination)
+                )
         else:
             shutil.copytree(source, destination)
         skills = dict(profile.skills)
@@ -239,17 +242,43 @@ def add(
     profile_name: str | None = None,
 ) -> SkillChange:
     """Add a local skill folder to a profile (default: the active one) and
-    record the folder as the skill's source. The folder is only read."""
+    record the folder as the skill's source. The folder is only read.
+
+    A folder inside the ``skills`` folder of the profile's own source is
+    refused: the next update would take the skill for one gone from that
+    source and remove it. A folder inside respec's own data or inside a
+    target folder is one of respec's copies or an installed skill, never a
+    source: the skill is added without one."""
     journal.ready(respec_home, user_home)
     name = resolve_profile_name(respec_home, profile_name)
     before = profiles.load_profile(respec_home, name)
+    given = user_path(source).resolve()
+    if before.source is not None and before.source.folder is not None:
+        from respec import sources
+
+        skills = (Path(before.source.folder) / profiles.SKILLS_DIR).resolve()
+        if skills in given.parents:
+            raise RespecError(
+                f"cannot add {given}: "
+                + sources.own_source_refusal(name, [given.relative_to(skills).parts[0]])
+            )
+    record = not any(
+        given == own or own in given.parents
+        for own in (
+            respec_home.resolve(),
+            *(
+                target.skills_dir(user_home).resolve()
+                for target in targets.registry().values()
+            ),
+        )
+    )
     # Journaled from before the copy (whatever profile it goes to): a crash
     # leaves no half copy or unrefreshed profile behind (respec.journal).
     with journaled(respec_home, before, True):
         target = _skill_folder(before, user_path(source).resolve().name)
         if not os.path.lexists(target):
             journal.note(respec_home, "created", target.name)
-        profile = add_local(respec_home, name, source, reference=True)
+        profile = add_local(respec_home, name, source, reference=True, record=record)
         item = next(skill for skill in profile.skills if skill not in before.skills)
         folder = _skill_folder(profile, item)
         origin = profile.skills[item].source

@@ -622,8 +622,10 @@ def test_the_round_trip_through_a_git_source(
 
     assert before["matches"] is False
     assert updated["tdd"]["result"] == updated["mine"]["result"] == "adopted"
-    assert updated["house"]["result"] == "updated"  # to the new commit
+    # Its files did not change in the source: only its commit follows.
+    assert updated["house"]["result"] == "up-to-date"
     data = read_yaml(profiles_root)
+    assert data["skills"]["house"]["source"]["commit"] == second
     assert data["source"] == {"repo": "acme/pack", "commit": second}
     for name in ("mine", "tdd"):
         source = data["skills"][name]["source"]

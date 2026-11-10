@@ -49,6 +49,10 @@ SCP_LIKE = profiles.REPO_SCP_LIKE
 # Transports git may use: no remote helpers such as ``fd::`` or ``ext::``.
 ALLOWED_PROTOCOLS = "file:git:http:https:ssh"
 FULL_SHA = re.compile(r"^[0-9a-f]{40}\Z")
+# Never content of a skill, wherever they are in it: git's own data (a
+# checkout given as a source) and the macOS Finder's ``.DS_Store``. They are
+# not copied from a source and do not count in a digest or in ``profile diff``.
+NOT_CONTENT = trees.IGNORED_FILES | {".git"}
 
 
 @dataclass(frozen=True)
@@ -333,11 +337,11 @@ def _label(root: Path, entry: Path) -> str:
         return entry.name
 
 
-def _within(root: Path, entry: Path) -> None:
+def _within(root: Path, entry: Path, where: str = "the repository") -> None:
     target = entry.resolve()
     if target != root and root not in target.parents:
         raise RespecError(
-            f"symlink {_label(root, entry)!r} points outside the repository; "
+            f"symlink {_label(root, entry)!r} points outside {where}; "
             "refusing to copy it"
         )
 
@@ -358,6 +362,7 @@ def copy_fetched(tree: Path, source: Path, destination: Path) -> None:
     write gigabytes) and sibling folder links can form copy loops. Each file
     link adds at most one copy of one file, which a repository could also
     get from duplicate files at the same fetch cost.
+    ``.git`` and ``.DS_Store`` entries are never copied (:data:`NOT_CONTENT`).
     Every failure is a :class:`RespecError` and leaves no ``destination``.
     """
     root = tree.resolve()
@@ -373,7 +378,12 @@ def _copy_checked(source: Path, destination: Path, what: str) -> None:
     with tempfile.TemporaryDirectory(prefix="respec-check-") as scratch:
         checked = Path(scratch) / "item"
         try:
-            shutil.copytree(source, checked, symlinks=True)
+            shutil.copytree(
+                source,
+                checked,
+                symlinks=True,
+                ignore=shutil.ignore_patterns(*NOT_CONTENT),
+            )
             _check_links(checked)
             shutil.copytree(checked, destination)
         except RespecError:
@@ -388,15 +398,20 @@ class SourceMissing(RespecError):
     """A source folder is gone or no longer holds ``SKILL.md``."""
 
 
-def copy_folder(folder: Path, destination: Path) -> None:
+def copy_folder(folder: Path, destination: Path, root: Path | None = None) -> None:
     """Copy the local source ``folder`` to ``destination`` by the rules for
-    fetched content (:func:`copy_fetched`). The folder is only read."""
+    fetched content (:func:`copy_fetched`). The folder is only read. With
+    ``root`` (the folder of a profile's source that ``folder`` is an entry
+    of), a ``folder`` that resolves outside it is refused, as an entry of a
+    repository is."""
     if not folder.is_dir():
         raise SourceMissing(f"source folder {folder} no longer exists")
     if not (folder / items.SKILL_FILE).is_file():
         raise SourceMissing(
             f"source folder {folder} no longer holds {items.SKILL_FILE}"
         )
+    if root is not None:
+        _within(root.resolve(), folder, f"the source folder {root}")
     _copy_checked(folder, destination, f"source folder {folder}")
 
 
@@ -456,10 +471,13 @@ def _check_links(folder: Path) -> None:
 # --- content -----------------------------------------------------------------
 
 
-def fetched_digest(folder: Path) -> str:
+def fetched_digest(folder: Path, everything: bool = False) -> str:
     """A hash of the folder's tree: every entry's relative path and kind, file
     contents and executable bits, and symlink targets (symlinks are not
     followed), so added empty folders and symlinks count as edits too.
+    ``.git`` and ``.DS_Store`` entries (:data:`NOT_CONTENT`) are left out,
+    unless ``everything`` is asked for: the digest as it was recorded before
+    they were (see :func:`copied_digest`).
 
     This is ``source.digest`` in ``profile.yaml``: the profile's copy as
     fetched. It is not :func:`respec.unknown.digest`, which fingerprints
@@ -468,6 +486,9 @@ def fetched_digest(folder: Path) -> str:
     hasher = hashlib.sha256()
     entries: list[Path] = []
     for root, dirs, files in os.walk(folder):
+        if not everything:
+            dirs[:] = [name for name in dirs if name not in NOT_CONTENT]
+            files = [name for name in files if name not in NOT_CONTENT]
         entries.extend(Path(root) / name for name in dirs + files)
     for entry in sorted(entries):
         relative = entry.relative_to(folder).as_posix()
@@ -480,6 +501,21 @@ def fetched_digest(folder: Path) -> str:
             hasher.update(f"f\0{relative}\0{executable}\0".encode())
             hasher.update(hashlib.sha256(entry.read_bytes()).digest())
     return f"sha256:{hasher.hexdigest()}"
+
+
+def copied_digest(profile: profiles.Profile, item: str) -> str | None:
+    """The digest recorded for the skill's copy, as :func:`fetched_digest`
+    gives it today; None without one. A digest recorded when ``.DS_Store``
+    and ``.git`` entries still counted stays valid: while the copy still
+    matches it, it stands for the copy's digest of today."""
+    source = profile.skills[item].source
+    if source is None or source.digest is None:
+        return None
+    folder = profile.path / profiles.SKILLS_DIR / item
+    now = fetched_digest(folder)
+    if source.digest != now and source.digest == fetched_digest(folder, True):
+        return now
+    return source.digest
 
 
 def _find_skills(tree: Path, spec: Spec) -> list[tuple[str, str | None]]:
@@ -552,6 +588,15 @@ def _add(
     with checkout(spec.url, ref, spec.repo) as (tree, commit):
         found = _find_skills(tree, spec)
         global_skills.refuse_reserved(respec_home, [item for item, _ in found], name)
+        inside_source = [
+            item
+            for item, path in found
+            if before.source is not None
+            and profiles.Source(repo=spec.repo, path=path, ref=ref)
+            == _skill_source(before.source, item)
+        ]
+        if inside_source:
+            raise RespecError(own_source_refusal(name, inside_source))
         clashes = [item for item, _ in found if item in before.skills]
         if clashes:
             raise RespecError(
@@ -593,6 +638,20 @@ def _add(
     journal.set_phase(respec_home, "refresh")
     items.refresh_active(respec_home, user_home, change, lambda: _forget(before, added))
     return change
+
+
+def own_source_refusal(profile: str, skills: list[str]) -> str:
+    """Why ``add`` refuses skills taken from inside the source of the profile
+    they would go to: recorded with a source there, the next update would
+    take them for skills gone from it and remove them."""
+    names = ", ".join(map(repr, skills))
+    return (
+        f"{names} {'is' if len(skills) == 1 else 'are'} inside the source of "
+        f"profile {profile!r}; a skill of that source is added by 'respec "
+        "update', not by 'respec add'. Nothing was added. List the skill in "
+        f"the source's {profiles.PROFILE_FILE} (if it is not listed yet) and "
+        f"run 'respec update -p {profile}', which adds it."
+    )
 
 
 def _forget(before: profiles.Profile, added: list[str]) -> None:
@@ -646,9 +705,8 @@ def _sourced(profile: profiles.Profile, item: str | None) -> list[str]:
 
 def _modified(profile: profiles.Profile, item: str) -> bool:
     """Whether the item's files differ from what was fetched (unknown: True)."""
-    source = profile.skills[item].source
     folder = profile.path / profiles.SKILLS_DIR / item
-    return source is None or source.digest != fetched_digest(folder)
+    return copied_digest(profile, item) != fetched_digest(folder)
 
 
 def _latest(source: profiles.Source, cache: dict[tuple[str, str | None], str]) -> str:
@@ -663,9 +721,13 @@ def _latest(source: profiles.Source, cache: dict[tuple[str, str | None], str]) -
     return cache[key]
 
 
-def _recorded(source: profiles.Source) -> str | None:
+def _recorded(profile: profiles.Profile, item: str) -> str | None:
     """What ``profile.yaml`` says the copy was made from (see :func:`_latest`)."""
-    return source.digest if source.folder is not None else source.commit
+    source = profile.skills[item].source
+    assert source is not None
+    if source.folder is not None:
+        return copied_digest(profile, item)
+    return source.commit
 
 
 def _open_source(
@@ -673,8 +735,11 @@ def _open_source(
 ) -> tuple[Reference | None, RespecError | None]:
     """The profile's source, opened (until ``stack`` closes) to compare its
     skills with the profile's, or the reason it cannot be read. Neither when
-    one skill is named or the profile has no source."""
-    if item is not None or profile.source is None:
+    the profile has no source, or one skill is named that did not come from
+    it."""
+    if profile.source is None or not (
+        item is None or (item in profile.skills and from_profile_source(profile, item))
+    ):
         return None, None
     try:
         return stack.enter_context(reference(profile.source, profile.name)), None
@@ -699,8 +764,11 @@ def check(
 ) -> tuple[str, list[Row], dict[str, object] | None]:
     """Report, per sourced item, whether a newer upstream commit exists, and
     (when no item is named) the skills that are new in the profile's source
-    or gone from it. Returns the profile's name, the rows and the state of
-    the profile's source (None when it has none or an item is named): its
+    or gone from it. A skill that came from the profile's source has an
+    update when its files there differ from what was copied, whatever the
+    source's commit, as ``profile diff`` reports it. Returns the profile's
+    name, the rows and the state of the profile's source (None when it has
+    none or an item is named): its
     record, ``latest`` for git, and ``source_missing`` with ``message`` or
     ``error`` when it could not be read."""
     profile = profiles.load_profile(
@@ -709,7 +777,8 @@ def check(
     cache: dict[tuple[str, str | None], str] = {}
     rows: list[Row] = []
     with contextlib.ExitStack() as stack:
-        found, failure = _open_source(stack, profile, item)
+        opened, failure = _open_source(stack, profile, item)
+        found = opened if item is None else None
         for name in _sourced(profile, item):
             source = profile.skills[name].source
             assert source is not None
@@ -724,10 +793,17 @@ def check(
                 row.gone = True
                 continue
             try:
-                if failure is not None and from_profile_source(profile, name):
-                    raise failure  # an unreadable source changes nothing
+                if from_profile_source(profile, name):
+                    if failure is not None:
+                        raise failure  # an unreadable source changes nothing
+                    assert opened is not None
+                    row.update_available = opened.digest(name) != copied_digest(
+                        profile, name
+                    )
+                    row.latest = opened.source.commit
+                    continue
                 latest = _latest(source, cache)
-                row.update_available = latest != _recorded(source)
+                row.update_available = latest != _recorded(profile, name)
                 if source.folder is None:
                     row.latest = latest
             except GitCancelled:
@@ -781,8 +857,13 @@ def update(
     remove_edits: Confirm | None = None,
 ) -> UpdateResult:
     """Apply newer upstream commits, or a source folder's newer files, to
-    sourced items. With no item named, the profile is also put in line with
-    the skills of its own source: new ones are added, in the state the source
+    sourced items. A skill that came from the profile's source is compared
+    by its files there and copied from the source as opened once: when they
+    are the ones that were copied it is up to date (only its recorded commit
+    follows), whatever was edited in the copy.
+
+    With no item named, the profile is also put in line with the skills of
+    its own source: new ones are added, in the state the source
     gives them, the ones that came from it and are gone are removed, and a
     skill whose copy holds exactly the files the source now holds for it is
     adopted: only its source is recorded, pointing into the profile's source.
@@ -834,10 +915,11 @@ def _update(
     cache: dict[tuple[str, str | None], str] = {}
     try:
         with contextlib.ExitStack() as stack:
-            found, failure = _open_source(stack, profile, item)
+            opened, failure = _open_source(stack, profile, item)
+            found = opened if item is None else None
             # Skills someone carried into the profile's source: the copy
             # already holds the same files, so only their source is recorded.
-            recorded: list[str] = []  # edited copies of skills from it
+            recorded: list[str] = []  # skills from it: only the record changes
             adopted = {  # skills that did not come from it
                 name: carried
                 for name in (found.profile.skills if found is not None else ())
@@ -865,10 +947,18 @@ def _update(
                     del skills[name]
                     row["result"] = "removed"
                     continue
+                mine = opened if from_profile_source(profile, name) else None
                 try:
-                    if failure is not None and from_profile_source(profile, name):
+                    if mine is None and from_profile_source(profile, name):
+                        assert failure is not None
                         raise failure  # an unreadable source changes nothing
-                    latest = _latest(source, cache)
+                    if mine is not None:
+                        # By its files in the source, not the source's commit.
+                        latest = mine.source.commit or ""
+                        same = mine.digest(name) == copied_digest(profile, name)
+                    else:
+                        latest = _latest(source, cache)
+                        same = latest == _recorded(profile, name)
                 except GitCancelled:
                     raise
                 except RespecError as error:
@@ -876,8 +966,17 @@ def _update(
                     continue
                 if source.folder is None:
                     row["latest"] = latest
-                if latest == _recorded(source):
+                if same:
                     row["result"] = "up-to-date"
+                    if mine is not None and source.commit != mine.source.commit:
+                        # The files it has are the ones of that commit too.
+                        recorded.append(name)
+                        skills[name] = dataclasses.replace(
+                            skills[name],
+                            source=dataclasses.replace(
+                                source, commit=mine.source.commit
+                            ),
+                        )
                     continue
                 if _modified(profile, name):
                     carried = (
@@ -895,7 +994,9 @@ def _update(
                         row["result"] = "skipped-local-edits"
                         continue
                 try:
-                    new_source = _replace(respec_home, profile, name, source, replaced)
+                    new_source = _replace(
+                        respec_home, profile, name, source, replaced, mine
+                    )
                 except GitCancelled:
                     raise
                 except (RespecError, OSError, shutil.Error) as error:
@@ -1026,8 +1127,11 @@ def _replace(
     item: str,
     source: profiles.Source,
     replaced: list[tuple[Path, Path]],
+    opened: Reference | None = None,
 ) -> profiles.Source:
-    """Swap the item's folder for the upstream files; keep the old folder."""
+    """Swap the item's folder for the upstream files; keep the old folder.
+    With ``opened`` (the profile's source, for a skill that came from it)
+    the files are copied from it instead of being fetched again."""
     skills_dir = profile.path / profiles.SKILLS_DIR
     live = skills_dir / item
     incoming = skills_dir / f".{item}.incoming"
@@ -1055,7 +1159,10 @@ def _replace(
     swap = {"skill": item, "live": trees.digest(live), "old": str(old)}
     journal.note(respec_home, "swaps", swap)
     commit = source.commit
-    if source.folder is not None:
+    if opened is not None:
+        opened.copy(item, incoming)
+        commit = opened.source.commit
+    elif source.folder is not None:
         copy_folder(Path(source.folder), incoming)
     else:
         assert source.repo is not None
@@ -1206,17 +1313,37 @@ class Reference:
     folder: Path
     profile: profiles.Profile
 
+    def copy(self, item: str, destination: Path) -> None:
+        """Copy the files this source holds for skill ``item`` to
+        ``destination``. A skill folder that is a symlink out of the source
+        is refused, for a folder as for a repository."""
+        skill = self.folder / profiles.SKILLS_DIR / item
+        if self.tree is None:
+            copy_folder(skill, destination, self.folder)
+            return
+        _within(self.tree.resolve(), skill)
+        if not (skill / items.SKILL_FILE).is_file():
+            raise RespecError(
+                f"{self.source.repo} at {(self.source.commit or '')[:12]} has no "
+                f"{items.SKILL_FILE} in {skill.relative_to(self.tree).as_posix()}"
+            )
+        copy_fetched(self.tree, skill, destination)
+
+    def digest(self, item: str) -> str:
+        """The digest a copy of skill ``item`` made from this source now
+        would record."""
+        with tempfile.TemporaryDirectory(prefix="respec-compare-") as scratch:
+            copy = Path(scratch) / "skill"
+            self.copy(item, copy)
+            return fetched_digest(copy)
+
     def take(self, item: str, destination: Path) -> profiles.SkillEntry:
         """Copy skill ``item`` to ``destination`` and return its entry for the
         copy's ``profile.yaml``: enabled as the source says, with its own git
         source when it has one, otherwise a source pointing into this one. A
         folder named by the source's own ``profile.yaml`` is never trusted: a
         later update would copy from whatever local path it names."""
-        skill = self.folder / profiles.SKILLS_DIR / item
-        if self.tree is None:
-            copy_folder(skill, destination)
-        else:
-            copy_fetched(self.tree, skill, destination)
+        self.copy(item, destination)
         entry = self.profile.skills[item]
         if entry.source is not None and entry.source.folder is None:
             return entry
@@ -1372,7 +1499,7 @@ def _differences(
         original = scratch / name
         taken = found.take(name, original).source
         now, upstream = fetched_digest(copy), fetched_digest(original)
-        recorded = entry.source.digest if mine and entry.source else None
+        recorded = copied_digest(profile, name) if mine else None
         if now == upstream:
             if (
                 now != recorded
@@ -1462,10 +1589,12 @@ def _file_changes(original: Path, copy: Path) -> dict[str, list[str]]:
 
 def _files(folder: Path) -> dict[str, tuple[object, ...]]:
     """What :func:`fetched_digest` hashes, per entry: every file and symlink
-    by its relative path, and every empty folder as ``path/``."""
+    by its relative path, and every empty folder as ``path/``; ``.git`` and
+    ``.DS_Store`` entries are left out."""
     found: dict[str, tuple[object, ...]] = {}
     for root, dirs, files in os.walk(folder):
-        for name in dirs + files:
+        dirs[:] = [name for name in dirs if name not in NOT_CONTENT]
+        for name in dirs + [name for name in files if name not in NOT_CONTENT]:
             entry = Path(root) / name
             relative = entry.relative_to(folder).as_posix()
             if entry.is_symlink():
@@ -1473,7 +1602,7 @@ def _files(folder: Path) -> dict[str, tuple[object, ...]]:
             elif not entry.is_dir():
                 content = hashlib.sha256(entry.read_bytes()).digest()
                 found[relative] = ("f", os.access(entry, os.X_OK), content)
-            elif not any(entry.iterdir()):
+            elif not any(c.name not in NOT_CONTENT for c in entry.iterdir()):
                 found[f"{relative}/"] = ("d",)
     return found
 
@@ -1500,6 +1629,13 @@ def install_profile(
             )
         if not (folder / profiles.PROFILE_FILE).is_file():
             raise RespecError(f"{folder} has no {profiles.PROFILE_FILE}")
+        home = respec_home.resolve()
+        if folder == home or home in folder.parents:
+            raise RespecError(
+                f"{folder} is inside respec's own data ({home}): what is there "
+                "is respec's copy of a profile, never a source. Install from "
+                "the folder or repository the profile came from"
+            )
         source = profiles.Source(folder=str(folder))
         name = name or folder.name
     else:

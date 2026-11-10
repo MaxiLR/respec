@@ -184,7 +184,7 @@ respec keeps its own copy of every skill and never writes to a skill's source.
 An agent asked to edit a global skill first looks up where it came from:
 `respec profile show <name> --json` (and `respec status --json`) give each
 skill's `provenance` and `source`. A skill with a source is edited there and
-brought in with `respec update <skill>`; only a skill that is original to the
+brought in with `respec update <skill> -p <profile>`; only a skill that is original to the
 copy is edited under `~/.respec/profiles/`. The shipped `respec` skill states
 this rule, and a generated `SOURCE.md` in each profile's folder repeats it per
 skill. See

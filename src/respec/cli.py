@@ -1712,7 +1712,12 @@ def _source_missing(
     if state and state.get("message"):
         found.append({"folder": state["folder"], "message": state["message"]})
     found += [
-        {"skill": row["skill"], "folder": row["folder"], "message": row["message"]}
+        {
+            "skill": row["skill"],
+            # A skill that is new in the profile's source has no folder yet.
+            **({"folder": row["folder"]} if row.get("folder") else {}),
+            "message": row["message"],
+        }
         for row in rows
         if row.get("message")
     ]

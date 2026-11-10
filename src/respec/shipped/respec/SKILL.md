@@ -21,9 +21,12 @@ every path it creates, and hand edits make its record disagree with disk.
   active profile) and read the skill's `provenance` and `source`:
   - `profile-source` or `own-source`: the skill has a `source`. Edit it
     there (the `folder`, or a checkout of the `repo` at its `path`), then run
-    `respec update <skill>` to bring the change into the copy. An edit made
-    in the copy never reaches the source, and `edited: true` marks a copy
-    that already differs from what was copied.
+    `respec update <skill> -p <profile>` to bring the change into the copy
+    (without `-p` it looks in the active profile only). For a git source,
+    commit and push the edit first: respec reads the remote, so `update`
+    cannot see an edit that is only in a checkout. An edit made in the copy
+    never reaches the source, and `edited: true` marks a copy that already
+    differs from what was copied.
   - `original`: the skill has no `source`; the copy is the only one. Edit it
     under `~/.respec/profiles/<profile>/skills/<skill>/`.
 
@@ -97,6 +100,9 @@ Every enabled skill of a profile goes to all of that profile's targets.
   `path`), and every installed skill gets a source pointing into it, with a
   digest, unless it carries a git source of its own. respec only ever reads
   the source and never writes to it; `respec update` brings its changes in.
+  A folder inside `~/.respec` is refused: it holds respec's own copies, never
+  a source. A skill folder of the source that is a symlink must point inside
+  the source, for a folder as for a repository.
 - `respec profile diff <name>`: how respec's copy of the profile differs
   from the profile's source. Reads only: it changes nothing and never waits.
   `--json` gives `profile`, `path`, `source` (plus `latest` for git),
@@ -136,7 +142,17 @@ Every enabled skill of a profile goes to all of that profile's targets.
   resolved commit, digest). A local folder is recorded as the skill's source
   too (its absolute path and a digest of the copy; `source` in the `--json`
   output). respec copies from that folder and never writes to it. Symlinks in
-  it must point to files inside it, as for git.
+  it must point to files inside it, as for git. `.git` and `.DS_Store`
+  entries are never copied from any source and never count as content: not
+  as an update, not as an edit and not in `respec profile diff`.
+  - A skill inside the profile's own source (a folder under its `skills/`,
+    or the same repository path) is refused and nothing changes: list the
+    skill in the source's `profile.yaml` and run `respec update`, which
+    adds it.
+  - A folder inside `~/.respec` or inside a target folder (a link respec
+    installed, or a skill sitting in a target folder) is one of respec's
+    copies or an installed skill, not a source: the skill is added without
+    a `source`, so its `provenance` is `original`.
 - `respec remove <skill> [-p <profile>]`: remove a skill and delete its files.
 - `respec enable <skill> [-p <profile>]`: enable it; an active profile links
   it right away.
@@ -144,7 +160,12 @@ Every enabled skill of a profile goes to all of that profile's targets.
   source record.
 - `respec update --check [<skill>] [-p <profile>]`: report which sourced
   skills have an update: a newer upstream commit, or a source folder whose
-  files differ from what was copied. Reads only. Each row gives `skill`,
+  files differ from what was copied. A skill that came from the profile's
+  source (`profile-source`) has an update only when its files in that source
+  differ from what was copied, also for git: a new commit that did not touch
+  it is no update, so `update --check` and `respec profile diff` agree, and
+  `current` and `latest` may then differ while `update_available` is false.
+  Reads only. Each row gives `skill`,
   `update_available` and `modified` (the profile's copy was edited), with
   `current` and `latest` commits for git or `folder` for a source folder.
   With no skill named and a profile that has a source, it also compares the
@@ -157,7 +178,10 @@ Every enabled skill of a profile goes to all of that profile's targets.
   folder is copied again). A skill with local edits is only overwritten after
   confirmation or with `--yes`; with `--json` it is skipped. Each row's
   `result` is `updated`, `up-to-date`, `skipped-local-edits`, `source-missing`
-  or `error`. `update` never changes the files of a skill without a source;
+  or `error`. A skill from the profile's source whose files did not change
+  there is `up-to-date` and is never asked about or overwritten, also when
+  its copy was edited (only its recorded commit follows the source's).
+  `update` never changes the files of a skill without a source;
   it only gives such a skill a source when it adopts it (`adopted`, below).
 - `respec update` with no skill named also follows the profile's own source:
   it adds the skills that are new there (`result` `added`, with `enabled`:
@@ -170,6 +194,10 @@ Every enabled skill of a profile goes to all of that profile's targets.
   new skill named like a shipped or global skill is refused (`error`), and an
   update never changes whether an existing skill is enabled, nor layers or
   targets.
+- If the source lists fewer skills for a while (for example another branch
+  is checked out in a source folder), `update` removes the missing ones;
+  a later update adds them again in the state the source gives them, so
+  whether they were enabled locally, and their layer, is lost.
 - `respec update` with no skill named also adopts a skill whose copy holds
   exactly the files the profile's source now holds for it (someone carried
   it there): nothing is copied or asked, the skill's source then points into
@@ -184,7 +212,8 @@ Every enabled skill of a profile goes to all of that profile's targets.
 - A source folder that is gone or no longer holds `SKILL.md` changes nothing
   and is not a failure: the skill keeps its files, the other skills still
   update, and the output gives a `source-missing` warning (`profile`, `skill`,
-  `folder`). Its row has `source_missing: true` (`--check`) or `result`
+  and `folder` unless the skill is a new one that was not copied yet). Its
+  row has `source_missing: true` (`--check`) or `result`
   `source-missing` (`update`), with the same `message`.
 
 ### Layers
@@ -299,13 +328,37 @@ the source, you carry it there and respec then records it:
      overwriting, and ask the user when unsure.
    - `local_state` stays local. Change `enabled`, `targets` or `layers` in
      the source's `profile.yaml` only when the user asks for it.
-   - `changed_in_source`, `only_in_source` and `gone_from_source` need
-     nothing in the source: `respec update` brings them into the copy.
+   - `changed_in_source` and `only_in_source` need nothing in the source:
+     `respec update` brings them into the copy.
+   - `gone_from_source`: the source no longer lists the skill, so
+     `respec update` removes it from the copy. With `modified: false` that
+     needs nothing. With `modified: true` the copy holds edits that the
+     removal deletes: ask the user whether to keep them. To keep them, put
+     the skill back in the source (copy the folder at `path` to
+     `skills/<skill>/` there and list it in the source's `profile.yaml`);
+     otherwise it is removed in step 5.
 3. Let the user review the changes in the source and commit them there (for
    a git source: commit and push, as respec reads the remote).
-4. Run `respec update -p <name>`, then `respec profile diff <name> --json`
-   again and confirm that `matches` is true. Carried skills show as
-   `adopted`.
+4. Run `respec update -p <name> --json`. Always pass `--json` here: without
+   it `update` asks before it overwrites or removes an edited copy, and
+   without a terminal that question aborts the update and rolls it back.
+   Read each row's `result`:
+   skills you carried over with identical files are `adopted`, and nothing
+   else is needed for them.
+5. A row with `skipped-local-edits` is a copy that still differs from the
+   source and was left alone: a skill you merged in the source (the merged
+   files are not the copy's), or with `gone: true` a skill that is gone from
+   the source and was edited in the copy. Finishing overwrites that copy
+   with the source's files, or deletes it when it is gone. Name these skills
+   to the user, and only after the user agrees run
+   `respec update -p <name> --yes --json`.
+6. A skill listed with `not_from_source` that you merged in the source is
+   not updated from it: its copy follows its own source or none. Only after
+   the user agrees, run `respec remove <skill> -p <name>` and then
+   `respec update -p <name> --json`, which adds the source's version, in the
+   state the source gives it.
+7. Run `respec profile diff <name> --json` again and confirm that `matches`
+   is true.
 
 A skill that came from the source and is removed locally with
 `respec remove` comes back on the next `respec update`. To keep it out,

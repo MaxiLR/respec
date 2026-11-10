@@ -51,6 +51,7 @@ from typing import Any
 
 import yaml
 
+from respec import lock
 from respec.errors import RespecError
 from respec.state import sync_folder, write_durably
 from respec.targets import known_names, registry
@@ -607,7 +608,12 @@ def load_profile(respec_home: Path, name: str) -> Profile:
     """Read and validate a profile; its layer conflicts become warnings."""
     folder = existing_folder(respec_home, name)
     _touched[(folder, name)] = None
-    return _read_folder(name, folder)
+    profile = _read_folder(name, folder)
+    if lock.holds(respec_home):
+        # Loaded for a change (or a recovery): a SOURCE.md that an earlier
+        # save could not write, or was killed before writing, is put in line.
+        _refresh_source_file(profile)
+    return profile
 
 
 def existing_folder(respec_home: Path, name: str) -> Path:
@@ -705,6 +711,19 @@ def _write_source_file(profile: Profile) -> None:
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _refresh_source_file(profile: Profile) -> None:
+    """Write ``SOURCE.md`` again when it does not say what ``profile.yaml``
+    gives now; otherwise nothing is written."""
+    from respec import provenance  # imports this module
+
+    try:
+        current = (profile.path / SOURCE_FILE).read_text("utf-8")
+    except (OSError, UnicodeDecodeError):
+        current = None
+    if current != provenance.source_file(profile):
+        _write_source_file(profile)
 
 
 def save_profile(profile: Profile) -> None:

@@ -45,14 +45,14 @@ def of(profile: profiles.Profile, skill: str) -> str:
 def edited(profile: profiles.Profile, skill: str) -> bool | None:
     """Whether the copy of ``skill`` no longer matches what was copied; None
     when that cannot be judged (no source, no digest, or unreadable files)."""
-    source = profile.skills[skill].source
-    if source is None or source.digest is None:
-        return None
     try:
+        recorded = sources.copied_digest(profile, skill)
+        if recorded is None:
+            return None
         copy = sources.fetched_digest(profile.path / profiles.SKILLS_DIR / skill)
     except OSError:
         return None
-    return copy != source.digest
+    return copy != recorded
 
 
 def fields(profile: profiles.Profile, skill: str) -> dict[str, Any]:
