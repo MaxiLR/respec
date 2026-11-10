@@ -313,6 +313,14 @@ def _install(source: Path, destination: Path) -> str:
     return "copy"
 
 
+class LinkFailed(RespecError):
+    """Linking stopped part way; ``linked`` lists what was linked before."""
+
+    def __init__(self, message: str, linked: list[str]) -> None:
+        super().__init__(message)
+        self.linked = list(linked)
+
+
 @dataclass
 class LinkResult:
     linked: list[str] = field(default_factory=list)
@@ -356,9 +364,16 @@ def link_skills(
             mode = _install(source, destination)
         except OSError as error:
             save_state(respec_home, state)
-            raise RespecError(
+            reinstall = (
+                " respec's own copy there was removed to be reinstalled; the "
+                "next 'respec use' puts it back."
+                if record is not None
+                else ""
+            )
+            raise LinkFailed(
                 f"linking {skill!r} into {destination.parent} did not complete: "
-                f"{error}"
+                f"{error}.{reinstall}",
+                result.linked,
             ) from None
         state.installed.append(
             Installed(
@@ -372,6 +387,19 @@ def link_skills(
         save_state(respec_home, state)
         result.linked.append(str(destination))
     return result
+
+
+def new_backups(respec_home: Path, owned_before: set[str]) -> dict[str, str]:
+    """Takeover backups of folders owned now but not in ``owned_before``.
+
+    A switch takes folders over before it resolves the entries in its way, so
+    this also names the backups of a switch that failed or was interrupted.
+    """
+    return {
+        target: entry.backup
+        for target, entry in load_state(respec_home).owned.items()
+        if target not in owned_before and entry.backup
+    }
 
 
 def refuse_layer_conflicts(

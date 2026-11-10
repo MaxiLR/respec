@@ -1008,17 +1008,19 @@ def test_overwriting_add_says_the_previous_copy_was_replaced_and_where_it_went(
     assert (saved / "SKILL.md").read_text() == "# tdd from a\n"
 
 
-def test_overwrite_cleans_up_leftover_staging_folders(
+def test_overwrite_cleans_up_only_redundant_leftover_staging_folders(
     run, activated_as_copy, respec_home
 ):
     skills = respec_home / "profiles" / "a" / "skills"
-    (skills / ".old-skill.respec-old").mkdir()
-    (skills / ".old-skill.respec-new").mkdir()
+    (skills / "other").mkdir()
+    (skills / "other" / "SKILL.md").write_text("other\n")
+    # A staged copy identical to the live folder holds nothing new.
+    shutil.copytree(skills / "other", skills / ".other.respec-new")
     (activated_as_copy / "SKILL.md").write_text("edited by hand\n")
 
     ok(run("adopt", "--add", "tdd"))
 
-    assert sorted(p.name for p in skills.iterdir()) == ["tdd"]
+    assert sorted(p.name for p in skills.iterdir()) == ["other", "tdd"]
 
 
 def test_add_clash_points_to_remove_with_a_backup_not_respec_remove(
@@ -1060,3 +1062,137 @@ def test_unknown_add_without_an_active_profile_explains_the_takeover_case(
     assert result.exit_code == 1
     assert "no profile is active" in result.output
     assert "profile being activated" in result.output
+
+
+# --- fix round 3 -------------------------------------------------------------
+
+
+def test_leftover_whose_live_folder_is_gone_is_restored_not_deleted(
+    run, activated_as_copy, respec_home
+):
+    skills = respec_home / "profiles" / "a" / "skills"
+    (skills / ".other.respec-old").mkdir()
+    (skills / ".other.respec-old" / "SKILL.md").write_text("only copy\n")
+    (activated_as_copy / "SKILL.md").write_text("edited by hand\n")
+
+    ok(run("adopt", "--add", "tdd"))
+
+    assert (skills / "other" / "SKILL.md").read_text() == "only copy\n"
+    assert not (skills / ".other.respec-old").exists()
+
+
+def test_leftover_that_may_be_the_only_copy_is_kept_and_reported(
+    run, activated_as_copy, respec_home
+):
+    skills = respec_home / "profiles" / "a" / "skills"
+    (skills / "other").mkdir()
+    (skills / "other" / "SKILL.md").write_text("live\n")
+    (skills / ".other.respec-old").mkdir()
+    (skills / ".other.respec-old" / "SKILL.md").write_text("only copy\n")
+    (activated_as_copy / "SKILL.md").write_text("edited by hand\n")
+
+    result = ok(run("adopt", "--add", "tdd"))
+
+    leftover = skills / ".other.respec-old"
+    assert (leftover / "SKILL.md").read_text() == "only copy\n"
+    assert str(leftover) in result.output
+
+
+@pytest.fixture
+def takeover_then_clash(run, respec_home, dirs, monkeypatch):
+    """a (claude-code: tdd, lint disabled) is active. b (claude-code, agents:
+    first, lint) is in the way of hand-made first and lint; agents holds
+    foreign and is taken over by the switch."""
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    make_profile(respec_home, "a", ["claude-code"], ["tdd", "lint"])
+    ok(run("use", "a"))
+    ok(run("disable", "lint"))
+    make_profile(respec_home, "b", ["claude-code", "agents"], ["first", "lint"])
+    first = drop_skill(dirs["claude-code"], "first", "first\n")
+    drop_skill(dirs["claude-code"], "lint", "hand lint\n")
+    foreign = drop_skill(dirs["agents"], "foreign", "foreign\n")
+    return first, foreign
+
+
+def takeover_backup(respec_home):
+    [folder] = [p for p in (respec_home / "backups").glob("*/agents") if p.is_dir()]
+    assert (folder / "foreign" / "SKILL.md").read_text() == "foreign\n"
+    return folder
+
+
+def test_failed_switch_reports_the_takeover_backup_and_warns(
+    run, takeover_then_clash, respec_home, dirs
+):
+    first, foreign = takeover_then_clash
+
+    result = run("use", "b", input="remove\nadd\n")
+
+    assert result.exit_code == 1
+    assert "already has a skill 'lint'" in result.output
+    assert f"Backed up agents folder to {takeover_backup(respec_home)}" in (
+        result.stdout
+    )
+    assert f"Backed up {first} to " in result.stdout
+    assert str(foreign) in result.stderr and "respec adopt" in result.stderr
+    assert active_profile(respec_home) == "a"
+
+
+def test_failed_switch_json_has_backups_resolved_warnings_and_error(
+    run, takeover_then_clash, respec_home, dirs
+):
+    first, foreign = takeover_then_clash
+
+    result = run("use", "b", "--unknown", "add", "--json")
+
+    assert result.exit_code == 1
+    data = json.loads(result.stdout)
+    assert data["backups"] == {"agents": str(takeover_backup(respec_home))}
+    assert [r["name"] for r in data["resolved"]] == ["first"]
+    assert "already has a skill 'lint'" in data["error"]
+    paths = [w["path"] for w in data["warnings"] if w["type"] == "unknown-entry"]
+    assert str(foreign) in paths
+    # first went into the still-active profile a and is linked again.
+    assert first.is_symlink()
+    assert (first / "SKILL.md").read_text() == "first\n"
+
+
+def test_aborted_switch_reports_the_takeover_backup(
+    run, takeover_then_clash, respec_home
+):
+    result = run("use", "b", input="remove\n")
+
+    assert result.exit_code == 1
+    assert f"Backed up agents folder to {takeover_backup(respec_home)}" in (
+        result.stdout
+    )
+    assert "did not happen" in result.stderr
+
+
+def test_aborted_switch_with_a_failing_relink_still_reports_everything(
+    run, takeover_then_clash, respec_home, monkeypatch
+):
+    from respec import switch
+
+    first, _ = takeover_then_clash
+
+    def fail(*args, **kwargs):
+        raise switch.SwitchBlocked("linking refused for the test")
+
+    monkeypatch.setattr(switch, "link_skills", fail)
+
+    result = run("use", "b", input="add\n")
+
+    assert result.exit_code == 1
+    assert "linking refused for the test" in result.stderr
+    assert f"Added {first} to profile 'a'" in result.stdout
+    assert f"Backed up agents folder to {takeover_backup(respec_home)}" in (
+        result.stdout
+    )
+
+
+def test_replaced_wording_names_the_skill_and_profile_plainly(run, activated_as_copy):
+    (activated_as_copy / "SKILL.md").write_text("edited by hand\n")
+
+    result = ok(run("adopt", "--add", "tdd"))
+
+    assert "Replaced the copy of 'tdd' in profile 'a'" in result.stdout

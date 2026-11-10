@@ -545,3 +545,27 @@ def test_tui_says_an_overwriting_add_replaced_the_profile_copy(
 
     copy = respec_home / "profiles" / "alpha" / "skills" / "a1" / "SKILL.md"
     assert copy.read_text() == "foreign\n"
+
+
+def test_failed_switch_in_the_tui_names_the_folder_it_took_over(
+    isolated_homes, respec_home, two_profiles, dirs, run
+):
+    make_profile(respec_home, "gamma", ["oh-my-pi"], ["g1", "g2"])
+    drop_skill(dirs["oh-my-pi"], "g1")
+    (dirs["oh-my-pi"] / "g2").write_text("loose\n")  # adding a file fails
+
+    async def scenario(app, pilot):
+        await pilot.click("#profile-gamma")
+        await pilot.click("#activate")
+        await pilot.pause()
+        await pilot.click("#unknown-0-remove")
+        await pilot.click("#unknown-1-add")
+        await pilot.click("#apply")
+        await pilot.pause()
+        feedback = text_of(app.query_one("#feedback"))
+        assert "error" in feedback.lower()
+        assert "Backed up oh-my-pi folder to" in feedback
+
+    drive(isolated_homes, scenario)
+
+    assert status_json(run)["active_profile"] == "alpha"

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Any, NoReturn, Optional
@@ -331,82 +331,107 @@ def _fail_after(
     _fail(error)
 
 
-def _ask_about_takeover(
-    homes: Homes,
-    result: switch.SwitchResult,
-    decide: adopt_entries.Decide,
-) -> int:
-    """Resolve entries already in folders this switch took over; report as it goes.
-
-    Returns the exit code: 1 when a choice failed, 0 otherwise (also when the
-    prompt was interrupted: the rest stays unknown and is warned about).
+@dataclass
+class _SwitchRun:
+    """Everything one ``respec use`` did, reported the same way however it ends:
+    success, a refusal, a failed choice, an interrupted prompt or a link error.
     """
-    entries = adopt_entries.taken_over(homes.respec_home, result)
-    if not entries:
-        return 0
-    done: list[adopt_entries.Resolution] = []
-    code = 0
-    try:
-        adopt_entries.resolve(
-            homes.respec_home,
-            entries,
-            decide,
-            adopt_entries.takeover_profile(result),
-            done=done,
-        )
-    except PROMPT_ABORTED:
-        typer.echo()  # end the interrupted prompt's line
-        typer.echo(
-            "warning: interrupted; the remaining entries stay as they are",
-            err=True,
-        )
-    except RespecError as error:
-        typer.echo(f"error: {error}", err=True)
-        code = 1
-    for resolution in done:
-        _report_resolution(resolution)
-    try:
-        linked = adopt_entries.link_added(homes.respec_home, homes.user_home, done)
-    except RespecError as error:
-        typer.echo(f"error: {error}", err=True)
-        return 1
-    for path in linked.linked:
-        typer.echo(f"  linked {path}")
-    return code
 
+    homes: Homes
+    name: str
+    owned_before: set[str]
+    resolutions: list[adopt_entries.Resolution] = field(default_factory=list)
+    linked: list[str] = field(default_factory=list)
+    result: switch.SwitchResult | None = None
+    errors: list[str] = field(default_factory=list)
+    notices: list[str] = field(default_factory=list)
+    prompt_cut: bool = False
 
-def _interrupted_switch(
-    homes: Homes,
-    name: str,
-    resolutions: list[adopt_entries.Resolution],
-    owned_before: set[str],
-) -> NoReturn:
-    """A prompt before the switch was interrupted: report what was done."""
-    typer.echo()  # end the interrupted prompt's line
-    linked: list[str] = []
-    try:
-        state = load_state(homes.respec_home)
-        # The profile being left is still active: link what was added to it.
-        linked = adopt_entries.link_added(
-            homes.respec_home, homes.user_home, resolutions
-        ).linked
-    except RespecError as error:
-        typer.echo(f"error: {error}", err=True)
-        state = None
-    for resolution in resolutions:
-        _report_resolution(resolution)
-    for path in linked:
-        typer.echo(f"  linked {path}")
-    if state is not None:
-        for target, entry in state.owned.items():
-            if target not in owned_before and entry.backup:
-                typer.echo(f"Backed up {target} folder to {entry.backup}")
-    typer.echo(
-        f"warning: interrupted; the switch to profile {name!r} did not happen",
-        err=True,
-    )
-    _warn_unresolved(homes)
-    raise typer.Exit(code=1)
+    def interrupted(self, what: str) -> None:
+        self.prompt_cut = True
+        self.notices.append(f"interrupted; {what}")
+
+    def ask_about_takeover(self, decide: adopt_entries.Decide) -> None:
+        """Resolve entries already in folders this switch took over first."""
+        assert self.result is not None
+        try:
+            adopt_entries.resolve(
+                self.homes.respec_home,
+                adopt_entries.taken_over(self.homes.respec_home, self.backups()),
+                decide,
+                adopt_entries.takeover_profile(self.result),
+                done=self.resolutions,
+            )
+        except PROMPT_ABORTED:
+            self.interrupted("the remaining entries stay as they are")
+        except RespecError as error:
+            self.errors.append(str(error))
+
+    def link(self) -> None:
+        try:
+            self.linked += adopt_entries.link_added(
+                self.homes.respec_home, self.homes.user_home, self.resolutions
+            ).linked
+        except switch.LinkFailed as error:
+            self.linked += error.linked
+            self.errors.append(str(error))
+        except RespecError as error:
+            self.errors.append(str(error))
+
+    def backups(self) -> dict[str, str]:
+        """Folders taken over by this run (also when it failed), from state."""
+        try:
+            return switch.new_backups(self.homes.respec_home, self.owned_before)
+        except RespecError as error:
+            self.errors.append(str(error))
+            return dict(self.result.backups) if self.result else {}
+
+    def finish(self, as_json: bool) -> None:
+        """Report everything, then exit 1 unless the switch and its choices
+        all went through (an interrupted takeover prompt still exits 0)."""
+        if self.prompt_cut and not as_json:
+            typer.echo()  # end the interrupted prompt's line
+        backups = self.backups()
+        result = self.result
+        if not as_json:
+            for resolution in self.resolutions:
+                _report_resolution(resolution)
+            for path in self.linked:
+                typer.echo(f"  linked {path}")
+            for target, backup in backups.items():
+                typer.echo(f"Backed up {target} folder to {backup}")
+            if result is not None:
+                if result.removed:
+                    left = f" of profile {result.previous!r}" if result.previous else ""
+                    typer.echo(f"Removed {len(result.removed)} skills{left}")
+                typer.echo(
+                    f"Switched to profile {result.profile!r}: "
+                    f"installed {len(result.installed)} skills"
+                )
+        for error in self.errors:
+            _failure.append(error)
+            typer.echo(f"error: {error}", err=True)
+        for notice in self.notices:
+            typer.echo(f"warning: {notice}", err=True)
+        warnings = _warn_unresolved(self.homes)
+        if as_json:
+            data: dict[str, Any] = {
+                "active_profile": result.profile if result else None,
+                "previous_profile": result.previous if result else None,
+                "backups": backups,
+                "removed": [item.path for item in result.removed] if result else [],
+                "installed": (
+                    [vars(item) for item in result.installed] if result else []
+                ),
+                "resolved": [resolution.to_dict() for resolution in self.resolutions],
+                "linked": self.linked,
+                "warnings": warnings,
+            }
+            if self.errors:
+                data["error"] = "\n".join(self.errors)
+            _print_json(data)
+        if self.errors or result is None:
+            raise typer.Exit(code=1)
 
 
 @app.command("use")
@@ -433,11 +458,12 @@ def use(
     """Activate a profile: remove the previous profile's skills, install this one."""
     homes = _homes(ctx)
     interactive = _interactive() and not as_json
-    resolutions: list[adopt_entries.Resolution] = []
     try:
-        previous = load_state(homes.respec_home).active_profile
+        state = load_state(homes.respec_home)
     except RespecError as error:
         _fail(error)
+    previous = state.active_profile
+    run = _SwitchRun(homes, name, set(state.owned))
     decide: adopt_entries.Decide | None = None
     if on_unknown is not None:
         if on_unknown.value not in adopt_entries.choices(previous):
@@ -460,62 +486,33 @@ def use(
 
         def handler(entries: list[unknown.Unknown]) -> None:
             adopt_entries.resolve(
-                homes.respec_home, entries, chosen, previous, done=resolutions
+                homes.respec_home, entries, chosen, previous, done=run.resolutions
             )
 
     try:
-        owned_before = set(load_state(homes.respec_home).owned)
-        result = switch.use(
+        run.result = switch.use(
             homes.respec_home, homes.user_home, name, on_unknown=handler
         )
     except PROMPT_ABORTED:
-        _interrupted_switch(homes, name, resolutions, owned_before)
+        run.interrupted(f"the switch to profile {name!r} did not happen")
     except switch.UnknownEntries as error:
-        _fail_after(
-            resolutions,
-            RespecError(
-                f"{error}\nOr pass "
-                f"'--unknown {'|'.join(adopt_entries.choices(previous))}' "
-                "to 'respec use'."
-            ),
-            as_json,
+        run.errors.append(
+            f"{error}\nOr pass "
+            f"'--unknown {'|'.join(adopt_entries.choices(previous))}' "
+            "to 'respec use'."
         )
     except RespecError as error:
-        _fail_after(resolutions, error, as_json)
-    if not as_json:
-        for resolution in resolutions:
-            _report_resolution(resolution)
-        for target, backup in result.backups.items():
-            typer.echo(f"Backed up {target} folder to {backup}")
-        if result.removed:
-            left = f" of profile {result.previous!r}" if result.previous else ""
-            typer.echo(f"Removed {len(result.removed)} skills{left}")
-        typer.echo(
-            f"Switched to profile {result.profile!r}: "
-            f"installed {len(result.installed)} skills"
-        )
-    code = 0
-    if interactive:
-        takeover = adopt_entries.takeover_profile(result)
+        run.errors.append(str(error))
+    if run.result is not None and interactive:
+        takeover = adopt_entries.takeover_profile(run.result)
         ask = decide if on_unknown is not None else None
         if ask is None:
             ask = lambda entry: _prompt_choice(entry, takeover)  # noqa: E731
-        code = _ask_about_takeover(homes, result, ask)
-    warnings = _warn_unresolved(homes)
-    if as_json:
-        _print_json(
-            {
-                "active_profile": result.profile,
-                "previous_profile": result.previous,
-                "backups": result.backups,
-                "removed": [item.path for item in result.removed],
-                "installed": [vars(item) for item in result.installed],
-                "unknown": [resolution.to_dict() for resolution in resolutions],
-                "warnings": warnings,
-            }
-        )
-    if code:
-        raise typer.Exit(code=code)
+        run.ask_about_takeover(ask)
+    # Skills added to the profile active now (the one being left, when the
+    # switch did not happen; the new one, for takeover entries) get linked.
+    run.link()
+    run.finish(as_json)
 
 
 @app.command("status")

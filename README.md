@@ -76,8 +76,16 @@ activated; `--unknown add` always means the profile active now, so it is refused
 when none is. Interrupting a prompt leaves the rest unknown. Other runs back the
 folder up as always and warn. Whatever was already done is always reported,
 with backup paths, also when a switch fails or is interrupted part way: choices
-already made are kept, not undone. An add that replaces the profile's own copy
-of a skill says so and names the backup of the previous copy. `respec adopt`
+already made are kept, not undone, and skills added to the profile that is
+still active are linked. That includes any folder the switch already took over
+and backed up: `respec use --json` always gives `backups`, `resolved`, `linked`
+and `warnings`, plus `error` when it failed. An add that replaces the profile's
+own copy of a skill says so and names the backup of the previous copy. If an
+earlier run was killed while replacing a copy, its hidden
+`.<skill>.respec-old`/`.respec-new` folder in the profile is removed only when
+its content is held elsewhere (the live folder or a backup run); a missing live
+folder is restored from it, and any other leftover is kept and reported.
+`respec adopt`
 resolves unknown entries at any time (`--add` or `--remove` per entry, or
 `--all`).
 

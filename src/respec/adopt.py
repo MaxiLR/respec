@@ -30,7 +30,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -58,6 +58,8 @@ class Resolution:
     link: str | None = field(default=None, repr=False)
     # Backup of the profile's own copy that an edited copy replaced.
     replaced_copy: str | None = None
+    # Staging folders of earlier interrupted changes, kept and reported.
+    leftovers: list[str] = field(default_factory=list)
 
     def describe(self) -> str:
         """What was done, in the words the CLI and the TUI print."""
@@ -65,11 +67,17 @@ class Resolution:
         if self.choice != "add":
             return f"Backed up {path} to {self.backup} and removed it"
         if self.replaced_copy is not None:
-            return (
-                f"Replaced profile {self.profile!r}'s copy of {self.entry.name!r} "
-                f"with {path} (its previous copy is backed up at "
-                f"{self.replaced_copy})"
+            text = (
+                f"Replaced the copy of {self.entry.name!r} in profile "
+                f"{self.profile!r} with {path} (the previous copy is backed up "
+                f"at {self.replaced_copy})"
             )
+            for leftover in self.leftovers:
+                text += (
+                    f"\n  left {leftover} in place: it is from an interrupted "
+                    "change and may hold the only copy of earlier content"
+                )
+            return text
         return f"Added {path} to profile {self.profile!r}"
 
     def to_dict(self) -> dict[str, object]:
@@ -79,6 +87,7 @@ class Resolution:
             "profile": self.profile,
             "backup": self.backup,
             "replaced_copy": self.replaced_copy,
+            "leftovers": list(self.leftovers),
         }
 
 
@@ -135,23 +144,67 @@ STAGED = ".respec-new"
 RETIRED = ".respec-old"
 
 
-def _clean_leftovers(skills_dir: Path) -> None:
-    """Delete staging folders an interrupted overwrite may have left.
+def _same_content(left: Path, right: Path) -> bool:
+    try:
+        return unknown.digest(left) == unknown.digest(right)
+    except OSError:
+        return False
 
-    They only ever hold a copy of content that is also elsewhere: the entry
-    being added, or a profile copy already saved to a backup run.
+
+def _backed_up(respec_home: Path, profile: str, name: str, folder: Path) -> bool:
+    """Whether a backup run holds a profile copy of ``name`` like ``folder``."""
+    pattern = f"*/profiles/{profile}/{name}"
+    return any(
+        _same_content(saved, folder)
+        for saved in switch.backups_dir(respec_home).glob(pattern)
+    )
+
+
+def _clean_leftovers(respec_home: Path, profile: profiles.Profile) -> list[str]:
+    """Settle staging folders that an interrupted overwrite may have left.
+
+    A leftover is deleted only when its content is verifiably held elsewhere:
+    by the live folder of that skill, or (for a previous copy) by a backup run.
+    A previous copy whose live folder is gone is moved back into place. Any
+    other leftover is kept, and its path is returned so it can be reported.
     """
-    for leftover in skills_dir.glob(".*.respec-*"):
-        if leftover.name.endswith((STAGED, RETIRED)) and not leftover.is_symlink():
-            shutil.rmtree(leftover, ignore_errors=True)
+    skills_dir = profile.path / profiles.SKILLS_DIR
+    kept: list[str] = []
+    # Previous copies first, so a missing live folder is restored before the
+    # staged copy of the same skill is judged against it.
+    for suffix in (RETIRED, STAGED):
+        for leftover in sorted(skills_dir.glob(f".*{suffix}")):
+            if leftover.is_symlink() or not leftover.is_dir():
+                continue
+            name = leftover.name[1 : -len(suffix)]
+            live = skills_dir / name
+            try:
+                if not os.path.lexists(live) and suffix == RETIRED:
+                    os.replace(leftover, live)
+                    continue
+                if (os.path.lexists(live) and _same_content(live, leftover)) or (
+                    suffix == RETIRED
+                    and _backed_up(respec_home, profile.name, name, leftover)
+                ):
+                    shutil.rmtree(leftover)
+                    continue
+            except OSError:
+                pass
+            kept.append(str(leftover))
+    return kept
 
 
 def _overwrite(
-    profile: profiles.Profile, entry: unknown.Unknown, run_dir: Callable[[], Path]
-) -> str:
+    respec_home: Path,
+    profile: profiles.Profile,
+    entry: unknown.Unknown,
+    run_dir: Callable[[], Path],
+) -> tuple[str, list[str]]:
     """Replace the profile's copy of ``entry.name`` with the entry's content.
 
-    The profile's previous copy is backed up first; returns where.
+    The profile's previous copy is backed up first. Returns where, and the
+    leftover staging folders kept because they may hold the only copy of
+    something.
     """
     source = Path(entry.path).resolve()
     if not source.is_dir():
@@ -163,12 +216,16 @@ def _overwrite(
     destination = profile.path / profiles.SKILLS_DIR / entry.name
     staged = destination.with_name(f".{entry.name}{STAGED}")
     retired = destination.with_name(f".{entry.name}{RETIRED}")
-    if not os.path.lexists(destination) and retired.is_dir():
-        # An earlier overwrite stopped between its two renames: undo the first.
-        os.replace(retired, destination)
+    _clean_leftovers(respec_home, profile)
+    for leftover in (staged, retired):
+        if os.path.lexists(leftover):
+            raise RespecError(
+                f"cannot add {source}: {leftover} is left from an interrupted "
+                "change and may hold the only copy of earlier content; move it "
+                "out of the way first. Nothing was changed."
+            )
     saved = run_dir() / "profiles" / profile.name / entry.name
     _copy_entry(destination, saved)
-    _clean_leftovers(destination.parent)
     try:
         shutil.copytree(source, staged)
         if os.path.lexists(destination):
@@ -182,8 +239,8 @@ def _overwrite(
             f"could not add {source} to profile {profile.name!r}; "
             f"both were left as they were: {error}"
         ) from None
-    _clean_leftovers(destination.parent)
-    return str(saved)
+    # The previous copy now sits in ``retired`` and in the backup run.
+    return str(saved), _clean_leftovers(respec_home, profile)
 
 
 def _add(
@@ -201,7 +258,9 @@ def _add(
         )
     profile = profiles.load_profile(respec_home, profile_name)
     if entry.replaced and entry.name in profile.skills:
-        resolution.replaced_copy = _overwrite(profile, entry, run_dir)
+        resolution.replaced_copy, resolution.leftovers = _overwrite(
+            respec_home, profile, entry, run_dir
+        )
     elif entry.name in profile.skills:
         raise RespecError(
             f"cannot add {entry.path}: profile {profile_name!r} already has a "
@@ -380,15 +439,13 @@ def link_added(
     return switch.link_skills(respec_home, user_home, active, added)
 
 
-def taken_over(respec_home: Path, result: switch.SwitchResult) -> list[unknown.Unknown]:
-    """Unknown entries in the folders ``result``'s switch took over first."""
-    if not result.backups:
+def taken_over(respec_home: Path, targets: Iterable[str]) -> list[unknown.Unknown]:
+    """Unknown entries in the folders of ``targets`` (those a switch took over
+    first, see :func:`respec.switch.new_backups`)."""
+    wanted = set(targets)
+    if not wanted:
         return []
-    return [
-        entry
-        for entry in unresolved(respec_home)
-        if set(entry.targets) & set(result.backups)
-    ]
+    return [entry for entry in unresolved(respec_home) if set(entry.targets) & wanted]
 
 
 def takeover_profile(result: switch.SwitchResult) -> str:
