@@ -18,6 +18,7 @@ active profile with the switching engine.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,15 +39,22 @@ class LinkProblem:
     skill: str
     path: str
     problem: str  # one of MISSING, BROKEN, NOT_LINKED, NOT_ENABLED
+    # The active profile's folder of this skill, when it is enabled there but
+    # the folder is gone: re-applying cannot work until it is restored or the
+    # skill is disabled.
+    folder_gone: str | None = None
 
     def describe(self) -> str:
         what = {
             MISSING: "is missing",
-            BROKEN: "is a broken link (its skill folder is gone)",
+            BROKEN: "is a broken link",
             NOT_LINKED: "is enabled in the active profile but not linked",
             NOT_ENABLED: "is linked but no longer enabled in the active profile",
         }[self.problem]
-        return f"{self.skill} ({self.target}) {what}: {self.path}"
+        text = f"{self.skill} ({self.target}) {what}: {self.path}"
+        if self.folder_gone:
+            text += f"\n  its skill folder {self.folder_gone} is gone"
+        return text
 
 
 @dataclass
@@ -56,6 +64,15 @@ class SyncReport:
     conflicts: list[profiles.LayerConflict] = field(default_factory=list)
     links: list[LinkProblem] = field(default_factory=list)
     invalid: list[str] = field(default_factory=list)
+
+    @property
+    def folders_gone(self) -> dict[str, str]:
+        """Skills of the active profile whose folder is gone, with the folder."""
+        return {
+            problem.skill: problem.folder_gone
+            for problem in self.links
+            if problem.folder_gone is not None
+        }
 
     @property
     def clean(self) -> bool:
@@ -75,6 +92,12 @@ def _link_problems(
             problems.append(LinkProblem(item.target, item.name, item.path, BROKEN))
     if active is None:
         return problems
+    gone = {
+        skill: str(folder)
+        for skill, entry in active.skills.items()
+        if entry.enabled
+        and not (folder := active.path / profiles.SKILLS_DIR / skill).is_dir()
+    }
     recorded = {unknown.real(item.path): item for item in state.installed}
     # What the switching engine would install for the active profile.
     expected = {
@@ -87,7 +110,10 @@ def _link_problems(
     for key, item in recorded.items():
         if key not in expected and os.path.lexists(key):
             problems.append(LinkProblem(item.target, item.name, item.path, NOT_ENABLED))
-    return problems
+    return [
+        dataclasses.replace(problem, folder_gone=gone.get(problem.skill))
+        for problem in problems
+    ]
 
 
 def check(respec_home: Path, user_home: Path) -> SyncReport:

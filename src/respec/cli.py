@@ -13,7 +13,8 @@ import click
 import typer
 
 from respec import adopt as adopt_entries
-from respec import items, layers, paths, profiles, sources, switch, targets, unknown
+from respec import items, layers, messages, paths, profiles, sources, switch, targets
+from respec import unknown
 from respec import restore as restore_backups
 from respec.errors import RespecError
 from respec.state import load_state
@@ -183,13 +184,7 @@ def profile_list(ctx: typer.Context, as_json: JsonOption = False) -> None:
         typer.echo(f"{entry['name']:<{width}}  {detail}")
 
 
-def _source_label(source: profiles.Source) -> str:
-    label = source.repo
-    if source.path:
-        label += f"#{source.path}"
-    if source.ref:
-        label += f"@{source.ref}"
-    return label
+_source_label = messages.source_label
 
 
 @profile_app.command("show")
@@ -576,17 +571,8 @@ def _report_change(
     if as_json:
         _print_json({**change.to_dict(), "warnings": warnings})
         return
-    messages = {
-        "add": f"Added {change.skill!r} to profile {change.profile!r}",
-        "remove": f"Removed {change.skill!r} from profile {change.profile!r}",
-        "enable": f"Enabled {change.skill!r} in profile {change.profile!r}",
-        "disable": f"Disabled {change.skill!r} in profile {change.profile!r}",
-    }
-    typer.echo(messages[change.action])
-    for path in change.linked:
-        typer.echo(f"  linked {path}")
-    for path in change.unlinked:
-        typer.echo(f"  unlinked {path}")
+    for line in messages.skill_change(change):
+        typer.echo(line)
 
 
 RefOption = Annotated[
@@ -616,9 +602,9 @@ def add(
 ) -> None:
     """Add a skill from a local folder or a git repository and enable it."""
     homes = _homes(ctx)
-    local = Path(source).expanduser()
-    from_git = not local.exists() and sources.is_git_spec(source)
     try:
+        local = items.user_path(source)
+        from_git = not local.exists() and sources.is_git_spec(source)
         if from_git:
             sourced = sources.add(
                 homes.respec_home, homes.user_home, source, profile, ref
@@ -642,15 +628,8 @@ def _report_sourced(
     if as_json:
         _print_json({**change.to_dict(), "warnings": warnings})
         return
-    for skill in change.skills:
-        origin = change.sources[skill]
-        typer.echo(
-            f"Added {skill!r} to profile {change.profile!r} from "
-            f"{_source_label(profiles.Source(**origin))} "
-            f"at {origin['commit'][:12]}"
-        )
-    for path in change.linked:
-        typer.echo(f"  linked {path}")
+    for line in messages.sourced_change(change):
+        typer.echo(line)
 
 
 @app.command("remove")
@@ -717,28 +696,8 @@ def _report_layer_change(
     if as_json:
         _print_json({**change.to_dict(), "warnings": warnings})
         return
-    where = f"layer {change.layer!r} of profile {change.profile!r}"
-    messages = {
-        "add": f"Added {where}",
-        "rm": f"Removed {where}; its skills stay in the profile",
-        "add-skill": f"Added {change.skill!r} to {where}",
-        "remove-skill": f"Removed {change.skill!r} from {where}",
-        "use": f"Using {change.skill!r} in {where}",
-        "enable": f"Enabled the skills of {where}",
-        "disable": f"Disabled the skills of {where}",
-        "on": f"Turned on {where}",
-        "off": f"Turned off {where}; its rules no longer apply",
-        "repair": f"Repaired {where}: kept {change.skill!r}",
-        "nothing": f"Nothing to repair in {where}: at most one skill is enabled",
-        "additive": f"Nothing to repair in {where}: it is additive",
-    }
-    typer.echo(messages[change.action])
-    for skill in change.disabled:
-        typer.echo(f"  disabled {skill!r}")
-    for path in change.linked:
-        typer.echo(f"  linked {path}")
-    for path in change.unlinked:
-        typer.echo(f"  unlinked {path}")
+    for line in messages.layer_change(change):
+        typer.echo(line)
 
 
 def _layer_kind(layer: dict[str, Any]) -> str:
@@ -1261,9 +1220,7 @@ def update(
         raise typer.Exit(code=1)
 
 
-def _short(commit: str | None) -> str:
-    """A commit for messages; skills installed without one show as unknown."""
-    return commit[:12] if commit else "unknown"
+_short = messages.short
 
 
 def _update_line(row: dict[str, Any]) -> str:

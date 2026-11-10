@@ -320,3 +320,13 @@ def test_json_reports_no_link_changes_for_inactive_profile(run, tmp_path):
 
     assert added["active"] is False
     assert added["linked"] == [] and added["unlinked"] == []
+
+
+def test_add_with_a_home_that_cannot_be_found_fails_with_an_error(run):
+    new_profile(run, "work", "claude-code")
+
+    result = run("add", "~nosuchuser_zz/skill", "-p", "work")
+
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "~nosuchuser_zz" in result.output

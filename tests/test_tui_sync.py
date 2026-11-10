@@ -8,6 +8,7 @@ through Textual's Pilot against the temporary homes from ``conftest.py``.
 
 import asyncio
 import json
+import os
 
 import pytest
 import yaml
@@ -274,7 +275,8 @@ def test_layer_conflict_is_listed_and_repaired_keeping_the_chosen_skill(
         await pilot.click("#sync-conflict-0-repair")
         await pilot.pause()
         assert "Repaired layer 'design-principles'" in log(app)
-        assert "kept 'd2'" in log(app) and "disabled 'd1', 'd3'" in log(app)
+        assert "kept 'd2'" in log(app)
+        assert "disabled 'd1'" in log(app) and "disabled 'd3'" in log(app)
         assert "All in sync" in summary(app)
 
     drive(isolated_homes, scenario)
@@ -327,17 +329,49 @@ def test_missing_link_is_found_and_relinked(
     assert (claude_dir / "s1").is_symlink()
 
 
-def test_broken_link_is_found(isolated_homes, respec_home, work, claude_dir):
+def test_broken_link_without_its_profile_folder_offers_disable(
+    isolated_homes, respec_home, work, claude_dir
+):
     import shutil
 
-    shutil.rmtree(respec_home / "profiles" / "work" / "skills" / "s2")
+    folder = respec_home / "profiles" / "work" / "skills" / "s2"
+    shutil.rmtree(folder)
 
     async def scenario(app, pilot):
         await open_sync(app, pilot)
         links = text_of(app.screen.query_one("#sync-links"))
         assert "s2" in links and "broken" in links
+        assert str(folder) in links
+        # Re-applying cannot work while the folder is gone, so it is not offered.
+        assert not app.screen.query("#sync-relink")
+        await pilot.click("#sync-disable-0")
+        await pilot.pause()
+        assert "Disabled 's2' in profile 'work'" in log(app)
+        assert "All in sync" in summary(app)
 
     drive(isolated_homes, scenario)
+
+    assert enabled(respec_home, "work") == {"s1"}
+    assert not os.path.lexists(claude_dir / "s2")
+
+
+def test_broken_link_to_an_old_profile_path_is_relinked(
+    isolated_homes, respec_home, work, claude_dir
+):
+    link = claude_dir / "s1"
+    link.unlink()
+    link.symlink_to(respec_home / "profiles" / "renamed" / "skills" / "s1")
+
+    async def scenario(app, pilot):
+        await open_sync(app, pilot)
+        assert "broken" in text_of(app.screen.query_one("#sync-links"))
+        await pilot.click("#sync-relink")
+        await pilot.pause()
+        assert "All in sync" in summary(app)
+
+    drive(isolated_homes, scenario)
+
+    assert link.resolve() == (respec_home / "profiles" / "work" / "skills" / "s1")
 
 
 def test_skill_enabled_by_hand_but_not_linked_is_found(

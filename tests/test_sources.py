@@ -1366,3 +1366,61 @@ def test_profile_install_with_a_skill_named_like_a_shipped_skill_is_refused(
 
     assert "'respec'" in result.output and "ships" in result.output
     assert not (profiles_root / "pack").exists()
+
+
+@pytest.fixture
+def silent_server():
+    """An http URL whose server accepts connections and never answers."""
+    import socket
+
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(8)
+    yield f"http://127.0.0.1:{server.getsockname()[1]}/x.git"
+    server.close()
+
+
+def test_git_gives_up_on_a_silent_server_after_the_timeout(
+    run, silent_server, monkeypatch
+):
+    import time
+
+    new_profile(run)
+    monkeypatch.setenv("RESPEC_GIT_TIMEOUT", "2")
+
+    started = time.monotonic()
+    result = fails(run("add", silent_server, "-p", "work"))
+
+    assert time.monotonic() - started < 15
+    assert "timed out after 2s" in result.output
+    assert "RESPEC_GIT_TIMEOUT" in result.output
+
+
+def test_an_invalid_git_timeout_is_refused(run, upstream, monkeypatch):
+    repo = upstream("acme/skills")
+    repo.write("SKILL.md", "# s\n")
+    repo.commit()
+    new_profile(run)
+    monkeypatch.setenv("RESPEC_GIT_TIMEOUT", "soon")
+
+    result = fails(run("add", "acme/skills", "-p", "work"))
+
+    assert "RESPEC_GIT_TIMEOUT" in result.output
+
+
+def test_git_can_be_cancelled_and_nothing_is_added(run, silent_server, profiles_root):
+    import threading
+
+    from respec import sources
+    from respec.errors import RespecError
+
+    new_profile(run)
+    cancel = threading.Event()
+    threading.Timer(0.5, cancel.set).start()
+    with pytest.raises(RespecError, match="cancelled"):
+        with sources.cancel_on(cancel):
+            sources.add(
+                profiles_root.parent, profiles_root.parent, silent_server, "work"
+            )
+
+    assert read_yaml(profiles_root, "work")["skills"] == {}

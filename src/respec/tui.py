@@ -11,7 +11,8 @@ through :mod:`respec.items`, :mod:`respec.layers` and :mod:`respec.sources`
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+import threading
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ from respec import (
     adopt,
     items,
     layers,
+    messages,
     profiles,
     sources,
     switch,
@@ -247,49 +249,13 @@ def _plural(count: int, one: str, many: str) -> str:
     return f"{count} {one if count == 1 else many}"
 
 
+# What a user's input or the file system can make a core call raise. The TUI
+# shows these and keeps running; anything else is a bug and surfaces as one.
+FAILURES = (RespecError, OSError, RuntimeError, ValueError)
+
+
 def _one_line(error: Exception) -> str:
     return " ".join(line.strip() for line in str(error).splitlines())
-
-
-def _link_lines(change: Any) -> list[str]:
-    """The links a change added or removed (the CLI's wording)."""
-    return [
-        *(f"  linked {path}" for path in change.linked),
-        *(f"  unlinked {path}" for path in change.unlinked),
-    ]
-
-
-def _skill_change_lines(change: items.SkillChange) -> list[str]:
-    where = f"{change.skill!r} {{}} profile {change.profile!r}"
-    lead = {
-        "add": "Added " + where.format("to"),
-        "enable": "Enabled " + where.format("in"),
-        "disable": "Disabled " + where.format("in"),
-    }[change.action]
-    return [lead, *_link_lines(change)]
-
-
-def _layer_change_lines(change: layers.LayerChange) -> list[str]:
-    where = f"layer {change.layer!r} of profile {change.profile!r}"
-    lead = {
-        "use": f"Using {change.skill!r} in {where}",
-        "disable": f"Disabled the skills of {where}",
-        "repair": f"Repaired {where}: kept {change.skill!r}",
-        "nothing": f"Nothing to repair in {where}: at most one skill is enabled",
-        "additive": f"Nothing to repair in {where}: it is additive",
-    }[change.action]
-    if change.disabled:
-        lead += ", disabled " + ", ".join(repr(skill) for skill in change.disabled)
-    return [lead, *_link_lines(change)]
-
-
-def _source_label(source: profiles.Source) -> str:
-    where = f"{source.repo}#{source.path}" if source.path else source.repo
-    return f"{where}@{source.ref}" if source.ref else where
-
-
-def _short(commit: str | None) -> str:
-    return commit[:12] if commit else "unknown"
 
 
 def _skill_text(
@@ -298,14 +264,14 @@ def _skill_text(
     """A skill's name, where it came from and, once checked, its update state."""
     text = Text(name, style="bold")
     if entry.source is not None:
-        text.append(f"  from {_source_label(entry.source)}", style=MUTED)
+        text.append(f"  from {messages.source_label(entry.source)}", style=MUTED)
     if update is None:
         return text
     if update.error:
         text.append(f"  check failed: {update.error.splitlines()[0]}", style=DANGER)
     elif update.update_available:
         text.append(
-            f"  ⬆ update available {_short(update.current)} → {_short(update.latest)}",
+            f"  ⬆ update available {messages.short(update.current)} → {messages.short(update.latest)}",
             style=WARNING,
         )
     else:
@@ -576,7 +542,7 @@ class NewProfileDialog(ModalScreen[profiles.Profile | None]):
             return
         try:
             profile = profiles.create_profile(self.respec_home, name, chosen)
-        except RespecError as problem:
+        except FAILURES as problem:
             error.update(f"error: {_one_line(problem)}")
             return
         self.dismiss(profile)
@@ -633,6 +599,7 @@ class ProfileScreen(Screen[None]):
         self.profile_name = profile
         self.updates: dict[str, sources.Row] = {}
         self._drawing = asyncio.Lock()
+        self._cancel: threading.Event | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="editor-bar"):
@@ -644,6 +611,9 @@ class ProfileScreen(Screen[None]):
             yield Button("Add from git", id="add-git")
             yield Button("Check updates", id="check-updates")
             yield Button("Back", id="back")
+            cancel = Button("Cancel", id="cancel-git", variant="error")
+            cancel.display = False
+            yield cancel
         with VerticalScroll(id="editor-log"):
             yield Static("", id="editor-feedback")
         yield Footer()
@@ -657,7 +627,7 @@ class ProfileScreen(Screen[None]):
     def _load(self) -> profiles.Profile | None:
         try:
             return profiles.load_profile(self.respec_home, self.profile_name)
-        except RespecError as error:
+        except FAILURES as error:
             self.show_feedback([f"error: {_one_line(error)}"], ok=False)
             return None
 
@@ -780,7 +750,7 @@ class ProfileScreen(Screen[None]):
         feedback.set_class(not ok, "-error")
         self.query_one("#editor-log", VerticalScroll).scroll_home(animate=False)
 
-    def _failed(self, error: RespecError) -> None:
+    def _failed(self, error: Exception) -> None:
         self.show_feedback(f"error: {str(error).strip()}".splitlines(), ok=False)
 
     # --- actions ------------------------------------------------------------
@@ -803,10 +773,10 @@ class ProfileScreen(Screen[None]):
                 event.value,
                 self.profile_name,
             )
-        except RespecError as error:
+        except FAILURES as error:
             self._failed(error)
         else:
-            self.show_feedback(_skill_change_lines(change), ok=True)
+            self.show_feedback(messages.skill_change(change), ok=True)
         await self.render_profile()
 
     @on(RadioSet.Changed)
@@ -840,10 +810,10 @@ class ProfileScreen(Screen[None]):
                     skill,
                     self.profile_name,
                 )
-        except RespecError as error:
+        except FAILURES as error:
             self._failed(error)
         else:
-            self.show_feedback(_layer_change_lines(change), ok=True)
+            self.show_feedback(messages.layer_change(change), ok=True)
         await self.render_profile()
 
     @on(Button.Pressed, "#add-folder")
@@ -855,71 +825,139 @@ class ProfileScreen(Screen[None]):
         self._ask_to_add(git=True)
 
     def _ask_to_add(self, git: bool) -> None:
+        if self.busy:
+            return
+
         async def chosen(answer: tuple[str, str | None] | None) -> None:
             if answer is None:
                 return
             text, ref = answer
-            try:
-                if git:
-                    change = sources.add(
+            if git:
+                self._run_git(
+                    f"Fetching {text}…",
+                    "Cancelled; nothing was added.",
+                    lambda: sources.add(
                         self.respec_home, self.user_home, text, self.profile_name, ref
-                    )
-                    lines = [
-                        f"Added {skill!r} to profile {change.profile!r} from "
-                        f"{_source_label(profiles.Source(**change.sources[skill]))} "
-                        f"at {change.sources[skill]['commit'][:12]}"
-                        for skill in change.skills
-                    ] + _link_lines(change)
-                else:
-                    added = items.add(
-                        self.respec_home,
-                        self.user_home,
-                        Path(text).expanduser(),
-                        self.profile_name,
-                    )
-                    lines = _skill_change_lines(added)
-            except RespecError as error:
+                    ),
+                    lambda change: self.show_feedback(
+                        messages.sourced_change(change), ok=True
+                    ),
+                )
+                return
+            try:
+                added = items.add(
+                    self.respec_home,
+                    self.user_home,
+                    items.user_path(text),
+                    self.profile_name,
+                )
+            except FAILURES as error:
                 self._failed(error)
             else:
-                self.show_feedback(lines, ok=True)
+                self.show_feedback(messages.skill_change(added), ok=True)
             await self.render_profile()
 
         self.app.push_screen(AddDialog(self.profile_name, git), chosen)
 
     @on(Button.Pressed, "#check-updates")
-    async def action_check_updates(self) -> None:
+    def action_check_updates(self) -> None:
         """Ask each skill's source for a newer commit (manual, never polled)."""
-        try:
-            _, rows = sources.check(self.respec_home, self.profile_name)
-        except RespecError as error:
-            self._failed(error)
+        if self.busy:
             return
+        self._run_git(
+            "Checking sources for updates…",
+            "Cancelled the update check.",
+            lambda: sources.check(self.respec_home, self.profile_name)[1],
+            self._checked,
+        )
+
+    def _checked(self, rows: list[sources.Row]) -> None:
         self.updates = {row.skill: row for row in rows}
         if not rows:
             self.show_feedback(
                 [f"Profile {self.profile_name!r} has no skills with a source."],
                 ok=True,
             )
-        else:
-            newer = [row.skill for row in rows if row.update_available]
-            failed = [row.skill for row in rows if row.error]
-            lines = [
-                f"Checked {_plural(len(rows), 'skill', 'skills')} with a source: "
-                + (
-                    f"updates available for {', '.join(newer)}"
-                    if newer
-                    else "no updates available"
-                )
-            ]
-            if failed:
-                lines.append(f"Could not check {', '.join(failed)}")
-            if newer:
-                lines.append("Apply them with 'respec update'.")
-            self.show_feedback(lines, ok=not failed)
-        await self.render_profile()
+            return
+        newer = [row.skill for row in rows if row.update_available]
+        failed = [row.skill for row in rows if row.error]
+        lines = [
+            f"Checked {_plural(len(rows), 'skill', 'skills')} with a source: "
+            + (
+                f"updates available for {', '.join(newer)}"
+                if newer
+                else "no updates available"
+            )
+        ]
+        if failed:
+            lines.append(f"Could not check {', '.join(failed)}")
+        if newer:
+            lines.append("Apply them with 'respec update'.")
+        self.show_feedback(lines, ok=not failed)
+
+    # --- git in the background ----------------------------------------------
+
+    @property
+    def busy(self) -> bool:
+        return self._cancel is not None
+
+    def _set_busy(self, busy: bool) -> None:
+        """While git runs, editing waits (a failed fetch rolls the profile
+        back to how it was before), and Cancel is offered."""
+        self.query_one("#editor-skills").disabled = busy
+        for button in ("#add-folder", "#add-git", "#check-updates"):
+            self.query_one(button, Button).disabled = busy
+        self.query_one("#cancel-git", Button).display = busy
+        if busy:
+            self.query_one("#cancel-git", Button).focus()
+
+    def _run_git(
+        self,
+        busy: str,
+        cancelled: str,
+        job: Callable[[], Any],
+        done: Callable[[Any], None],
+    ) -> None:
+        """Run ``job`` in a thread so the screen keeps drawing; Esc stops it."""
+        event = threading.Event()
+        self._cancel = event
+        self._set_busy(True)
+        self.show_feedback([busy, "Press Esc or Cancel to stop."], ok=True)
+
+        def run() -> Any:
+            with sources.cancel_on(event):
+                return job()
+
+        async def work() -> None:
+            try:
+                result = await asyncio.to_thread(run)
+            except sources.GitCancelled:
+                self.show_feedback([cancelled], ok=False)
+            except FAILURES as error:
+                self._failed(error)
+            else:
+                done(result)
+            finally:
+                self._cancel = None
+                self._set_busy(False)
+            await self.render_profile()
+
+        self.run_worker(work(), group="git", exclusive=True)
+
+    @on(Button.Pressed, "#cancel-git")
+    def action_cancel_git(self) -> None:
+        if self._cancel is not None:
+            self._cancel.set()
+
+    def on_unmount(self) -> None:
+        self.action_cancel_git()
 
     @on(Button.Pressed, "#back")
     def action_back(self) -> None:
+        """Leave the editor; while git runs, stop it instead."""
+        if self.busy:
+            self.action_cancel_git()
+            return
         self.dismiss(None)
 
 
@@ -970,7 +1008,7 @@ class SyncScreen(ModalScreen[None]):
         self.choices = {}
         try:
             self.report = sync.check(self.respec_home, self.user_home)
-        except RespecError as error:
+        except FAILURES as error:
             self.report = sync.SyncReport()
             self._log(f"error: {_one_line(error)}", ok=False)
             summary_text = "The check failed; see above."
@@ -1110,7 +1148,25 @@ class SyncScreen(ModalScreen[None]):
                 id="sync-links",
             )
         )
-        if active:
+        gone = report.folders_gone
+        if gone:
+            # Re-applying refuses while an enabled skill has no folder.
+            section.compose_add_child(
+                Static(
+                    "Restore each missing skill folder (then check again and "
+                    "re-apply), or disable the skill:",
+                    classes="section-intro",
+                )
+            )
+            for index, skill in enumerate(gone):
+                section.compose_add_child(
+                    Button(
+                        f"Disable {skill}",
+                        id=f"sync-disable-{index}",
+                        classes="disable-skill",
+                    )
+                )
+        elif active:
             section.compose_add_child(
                 Button(f"Re-apply profile {active}", id="sync-relink")
             )
@@ -1133,7 +1189,7 @@ class SyncScreen(ModalScreen[None]):
         log.display = True
         self.query_one("#sync-body", VerticalScroll).scroll_home(animate=False)
 
-    def _log_error(self, error: RespecError) -> None:
+    def _log_error(self, error: Exception) -> None:
         self._log("error: " + str(error).strip(), ok=False)
 
     # --- actions ------------------------------------------------------------
@@ -1160,7 +1216,7 @@ class SyncScreen(ModalScreen[None]):
                 lambda entry: choices.get(entry.path),
                 done=done,
             )
-        except RespecError as error:
+        except FAILURES as error:
             for resolution in done:
                 self._log(resolution.describe(), ok=True)
             self._log_error(error)
@@ -1185,10 +1241,10 @@ class SyncScreen(ModalScreen[None]):
                 keep=keep,
                 profile_name=conflict.profile,
             )
-        except RespecError as error:
+        except FAILURES as error:
             self._log_error(error)
         else:
-            for line in _layer_change_lines(change):
+            for line in messages.layer_change(change):
                 self._log(line, ok=True)
         await self.run_check()
 
@@ -1196,7 +1252,7 @@ class SyncScreen(ModalScreen[None]):
     async def _relink(self) -> None:
         try:
             result = sync.reapply(self.respec_home, self.user_home)
-        except RespecError as error:
+        except FAILURES as error:
             self._log_error(error)
         else:
             self._log(
@@ -1204,6 +1260,26 @@ class SyncScreen(ModalScreen[None]):
                 f"{_plural(len(result.installed), 'link', 'links')} in place",
                 ok=True,
             )
+        await self.run_check()
+
+    @on(Button.Pressed, ".disable-skill")
+    async def _disable(self, event: Button.Pressed) -> None:
+        """Disable a skill whose folder is gone (``respec disable``)."""
+        index = int((event.button.id or "").rsplit("-", 1)[1])
+        skill = list(self.report.folders_gone)[index]
+        try:
+            change = items.set_enabled(
+                self.respec_home,
+                self.user_home,
+                skill,
+                False,
+                self.report.active_profile,
+            )
+        except FAILURES as error:
+            self._log_error(error)
+        else:
+            for line in messages.skill_change(change):
+                self._log(line, ok=True)
         await self.run_check()
 
     @on(Button.Pressed, "#sync-recheck")
@@ -1244,7 +1320,10 @@ class RespecApp(App[None]):
         if action in self.LIST_ACTIONS:
             return len(self.screen_stack) == 1
         if action == "sync":
-            return not isinstance(self.screen, ModalScreen)
+            screen = self.screen
+            if isinstance(screen, ProfileScreen) and screen.busy:
+                return False  # git is changing this profile; Sync waits
+            return not isinstance(screen, ModalScreen)
         return True
 
     # --- layout -----------------------------------------------------------

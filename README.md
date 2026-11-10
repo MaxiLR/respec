@@ -36,7 +36,10 @@ asks before overwriting them (with `--json` it skips them unless `--yes`).
 Fetched skills may only contain symlinks to files inside the skill's own
 folder; they are copied as plain files, and links to folders are refused. Git
 never prompts: ssh runs with `BatchMode=yes` unless you set your own ssh
-command (`GIT_SSH_COMMAND`, `GIT_SSH` or `core.sshCommand`). A source `repo`
+command (`GIT_SSH_COMMAND`, `GIT_SSH` or `core.sshCommand`). Each git command
+stops after `RESPEC_GIT_TIMEOUT` seconds (default 120); http transfers slower
+than 1 KB/s for 30 seconds, and ssh connections not made within 15 seconds,
+fail sooner. A source `repo`
 must be `owner/repo`, `user@host:path` or an https, http, ssh or git URL; local
 paths and other git transports are refused. Skills installed by
 `profile install` have no recorded digest, so their first `update` asks before
@@ -142,7 +145,8 @@ entries outside a switch, `r` refreshes and `q` quits.
 **Edit** (`e`) opens the selected profile: its skills grouped by layer, with a
 toggle per skill and, in an active exclusive layer, a choice of one skill (or
 none). **Add folder** (`a`) and **Add from git** (`g`) add skills, and
-**Check updates** (`u`) marks sourced skills that have a newer commit. Every
+**Check updates** (`u`) marks sourced skills that have a newer commit. Git runs
+in the background with a **Cancel** button (or `Esc`). Every
 change goes through the same code as `respec enable`, `respec layer use` and
 `respec add`, so an active profile is re-applied at once and a refused change
 leaves the profile as it was. **New profile** (`n`) asks for a name and targets.

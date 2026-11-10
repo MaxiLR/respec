@@ -81,6 +81,13 @@ def drive(isolated_homes, scenario):
     asyncio.run(main())
 
 
+async def settle(app, pilot):
+    """Wait for background work (git runs in a worker) and the redraw after it."""
+    await app.workers.wait_for_complete()
+    await pilot.pause()
+    await pilot.pause()
+
+
 async def open_editor(app, pilot, name, key=True):
     if key:
         await pilot.click(f"#profile-{name}")
@@ -320,7 +327,7 @@ def test_add_from_git_source_records_the_source_and_links_it(
         await pilot.pause()
         app.screen.query_one("#add-input").value = "acme/skills#skills/tdd"
         await pilot.click("#add-confirm")
-        await pilot.pause()
+        await settle(app, pilot)
         feedback = text_of(app.screen.query_one("#editor-feedback"))
         assert "Added 'tdd' to profile 'work' from acme/skills" in feedback
 
@@ -342,7 +349,7 @@ def test_check_updates_marks_a_skill_with_a_newer_commit(
         await open_editor(app, pilot, "work")
         assert "update available" not in text_of(app.screen.query_one("#skill-tdd"))
         await pilot.press("u")
-        await pilot.pause()
+        await settle(app, pilot)
         assert "update available" in text_of(app.screen.query_one("#skill-tdd"))
         # Skills without a source get no indicator.
         assert "update" not in text_of(app.screen.query_one("#skill-s1"))
@@ -358,7 +365,7 @@ def test_check_updates_by_click_says_up_to_date(
     async def scenario(app, pilot):
         await open_editor(app, pilot, "work")
         await pilot.click("#check-updates")
-        await pilot.pause()
+        await settle(app, pilot)
         assert "up to date" in text_of(app.screen.query_one("#skill-tdd"))
 
     drive(isolated_homes, scenario)
@@ -470,3 +477,140 @@ def test_list_keys_do_nothing_in_the_editor_but_sync_opens_and_refreshes_it(
     drive(isolated_homes, scenario)
 
     assert enabled(respec_home, "work") == {"d1", "r1", "r2", "plain"}
+
+
+@pytest.mark.parametrize("typed", ["~nosuchuser_zz/skill", "bad\x00path"])
+def test_add_folder_with_an_unusable_path_shows_the_error_and_keeps_running(
+    isolated_homes, respec_home, work, typed
+):
+    async def scenario(app, pilot):
+        await open_editor(app, pilot, "work")
+        await pilot.press("a")
+        await pilot.pause()
+        app.screen.query_one("#add-input").value = typed
+        await pilot.click("#add-confirm")
+        await pilot.pause()
+        assert "error" in text_of(app.screen.query_one("#editor-feedback"))
+        assert app.return_code is None and app.is_running
+
+    drive(isolated_homes, scenario)
+
+    assert set(read_yaml(respec_home, "work")["skills"]) == {"s1", "s2"}
+
+
+@pytest.fixture
+def silent_server():
+    """An http URL whose server accepts connections and never answers."""
+    import socket
+
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(8)
+    yield f"http://127.0.0.1:{server.getsockname()[1]}/x.git"
+    server.close()
+
+
+def test_add_from_git_shows_progress_stays_responsive_and_can_be_cancelled(
+    isolated_homes, respec_home, work, remote, silent_server
+):
+    async def scenario(app, pilot):
+        await open_editor(app, pilot, "work")
+        await pilot.press("g")
+        await pilot.pause()
+        app.screen.query_one("#add-input").value = silent_server
+        await pilot.click("#add-confirm")
+        await pilot.pause()
+        assert "Fetching" in text_of(app.screen.query_one("#editor-feedback"))
+        cancel = app.screen.query_one("#cancel-git")
+        assert cancel.display
+        # The screen keeps drawing while git waits; editing waits for it.
+        assert app.screen.query_one("#editor-skills").disabled
+        await pilot.press("s")  # Sync waits too
+        await pilot.pause()
+        assert app.screen.query("#cancel-git")
+        await pilot.click("#cancel-git")
+        await settle(app, pilot)
+        feedback = text_of(app.screen.query_one("#editor-feedback"))
+        assert "Cancelled" in feedback and "nothing was added" in feedback
+        assert not app.screen.query_one("#cancel-git").display
+
+    drive(isolated_homes, scenario)
+
+    assert set(read_yaml(respec_home, "work")["skills"]) == {"s1", "s2"}
+
+
+def test_escape_cancels_a_running_update_check(
+    isolated_homes, respec_home, work, remote, run, silent_server
+):
+    from respec.tui import ProfileScreen
+
+    ok(run("add", "acme/skills#skills/tdd", "-p", "work"))
+    data = read_yaml(respec_home, "work")
+    data["skills"]["tdd"]["source"]["repo"] = silent_server
+    (respec_home / "profiles" / "work" / "profile.yaml").write_text(
+        yaml.safe_dump(data)
+    )
+
+    async def scenario(app, pilot):
+        await open_editor(app, pilot, "work")
+        await pilot.press("u")
+        await pilot.pause()
+        assert "Checking" in text_of(app.screen.query_one("#editor-feedback"))
+        await pilot.press("escape")
+        await settle(app, pilot)
+        # Escape stopped the check; the editor is still open.
+        assert isinstance(app.screen, ProfileScreen)
+        assert "Cancelled" in text_of(app.screen.query_one("#editor-feedback"))
+
+    drive(isolated_homes, scenario)
+
+
+def test_e_right_after_launch_edits_the_active_profile(
+    isolated_homes, respec_home, run
+):
+    make_profile(respec_home, "alpha", ["agents"], {"a1": True})
+    make_profile(respec_home, "work", ["claude-code"], {"s1": True})
+    ok(run("use", "work"))
+
+    async def scenario(app, pilot):
+        await pilot.press("e")
+        await pilot.pause()
+        assert "work" in text_of(app.screen.query_one("#editor-title"))
+
+    drive(isolated_homes, scenario)
+
+
+def test_e_right_after_launch_without_an_active_profile_edits_the_first(
+    isolated_homes, respec_home
+):
+    make_profile(respec_home, "alpha", ["agents"], {"a1": True})
+
+    async def scenario(app, pilot):
+        await pilot.press("e")
+        await pilot.pause()
+        assert "alpha" in text_of(app.screen.query_one("#editor-title"))
+
+    drive(isolated_homes, scenario)
+
+
+def test_new_profile_that_cannot_be_written_shows_the_error(
+    isolated_homes, respec_home, monkeypatch
+):
+    from respec import profiles
+
+    def refuse(*args, **kwargs):
+        raise PermissionError(13, "Permission denied", str(respec_home))
+
+    monkeypatch.setattr(profiles, "create_profile", refuse)
+
+    async def scenario(app, pilot):
+        await pilot.press("n")
+        await pilot.pause()
+        app.screen.query_one("#new-name").value = "fresh"
+        await pilot.click("#new-target-claude-code")
+        await pilot.click("#create")
+        await pilot.pause()
+        assert "Permission denied" in text_of(app.screen.query_one("#new-error"))
+        assert app.is_running
+
+    drive(isolated_homes, scenario)

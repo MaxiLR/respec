@@ -10,7 +10,9 @@ the files as fetched, so later local edits can be detected.
 
 Updates are explicit: :func:`check` only reads the remote; :func:`update`
 replaces an item's folder with the newer upstream files. Items without a
-source never change. Git runs as a subprocess with prompts disabled.
+source never change. Git runs as a subprocess with prompts disabled, a time
+limit (``RESPEC_GIT_TIMEOUT`` seconds per git command, default 120) and, for
+the TUI, a way to be cancelled (:func:`cancel_on`).
 """
 
 from __future__ import annotations
@@ -20,10 +22,14 @@ import hashlib
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
+import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -116,7 +122,48 @@ LOCAL_GIT_ENV = (
 
 # Commands that may contact a remote, and so may start ssh.
 REMOTE_COMMANDS = ("fetch", "ls-remote")
-BATCH_SSH = "ssh -o BatchMode=yes"
+BATCH_SSH = "ssh -o BatchMode=yes -o ConnectTimeout=15"
+# Give up on an http(s) transfer slower than 1 KB/s for this many seconds.
+LOW_SPEED = ("-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=30")
+
+TIMEOUT_ENV = "RESPEC_GIT_TIMEOUT"
+DEFAULT_TIMEOUT = 120.0
+
+_cancel: ContextVar[threading.Event | None] = ContextVar("cancel", default=None)
+
+
+@contextmanager
+def cancel_on(event: threading.Event) -> Iterator[None]:
+    """Stop git, in this thread or task, as soon as ``event`` is set.
+
+    The running git command is killed and :class:`GitCancelled` is raised,
+    so the operation rolls back like any other git failure.
+    """
+    token = _cancel.set(event)
+    try:
+        yield
+    finally:
+        _cancel.reset(token)
+
+
+class GitCancelled(RespecError):
+    """Raised when git was stopped through :func:`cancel_on`."""
+
+
+def git_timeout() -> float:
+    """Seconds one git command may take (``RESPEC_GIT_TIMEOUT``)."""
+    raw = os.environ.get(TIMEOUT_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    if not value > 0 or value == float("inf"):
+        raise RespecError(
+            f"{TIMEOUT_ENV}={raw!r} is not a number of seconds above zero"
+        )
+    return value
 
 
 def _git(*args: str, cwd: Path | None = None) -> str:
@@ -138,36 +185,70 @@ def _git(*args: str, cwd: Path | None = None) -> str:
     }
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_ALLOW_PROTOCOL"] = ALLOWED_PROTOCOLS
-    if args[0] in REMOTE_COMMANDS and not _own_ssh(env, cwd):
-        env["GIT_SSH_COMMAND"] = BATCH_SSH
-    done = _run(["git", *args], cwd, env)
+    options: tuple[str, ...] = ()
+    if args[0] in REMOTE_COMMANDS:
+        options = LOW_SPEED
+        if not _own_ssh(env, cwd):
+            env["GIT_SSH_COMMAND"] = BATCH_SSH
+    done = _run(["git", *options, *args], cwd, env, args[0])
     if done.returncode != 0:
         raise RespecError(done.stderr.strip() or f"git {args[0]} failed")
     return done.stdout
 
 
 def _run(
-    command: list[str], cwd: Path | None, env: dict[str, str]
+    command: list[str], cwd: Path | None, env: dict[str, str], name: str = ""
 ) -> subprocess.CompletedProcess[str]:
+    """Run ``command``; stop it at the time limit or when cancelled."""
+    limit = git_timeout()
+    cancel = _cancel.get()
     try:
-        return subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=cwd,
             env=env,
             stdin=subprocess.DEVNULL,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=False,
+            # Its own process group, so a stop also ends git's helpers
+            # (git-remote-http, ssh) that hold the output pipes open.
+            start_new_session=True,
         )
     except FileNotFoundError:
         raise RespecError("git is not installed or not on PATH") from None
+    deadline = time.monotonic() + limit
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=0.1)
+            break
+        except subprocess.TimeoutExpired:
+            if cancel is not None and cancel.is_set():
+                _stop(process)
+                raise GitCancelled(f"git {name} cancelled") from None
+            if time.monotonic() >= deadline:
+                _stop(process)
+                raise RespecError(
+                    f"git {name} timed out after {limit:g}s (set {TIMEOUT_ENV} "
+                    "to allow longer)"
+                ) from None
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def _stop(process: subprocess.Popen[str]) -> None:
+    """Kill git and every helper it started, then reap it."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        process.kill()
+    process.communicate()
 
 
 def _own_ssh(env: dict[str, str], cwd: Path | None) -> bool:
     """Whether the user chose how git runs ssh."""
     if env.get("GIT_SSH_COMMAND") or env.get("GIT_SSH"):
         return True
-    found = _run(["git", "config", "--get", "core.sshCommand"], cwd, env)
+    found = _run(["git", "config", "--get", "core.sshCommand"], cwd, env, "config")
     return found.returncode == 0 and bool(found.stdout.strip())
 
 
@@ -178,6 +259,8 @@ def remote_commit(url: str, ref: str | None, label: str) -> str:
     wanted = ref or "HEAD"
     try:
         output = _git("ls-remote", "--end-of-options", url, wanted)
+    except GitCancelled:
+        raise
     except RespecError as error:
         raise RespecError(f"cannot read {label}: {error}") from None
     found = dict(
@@ -217,6 +300,8 @@ def checkout(url: str, ref: str | None, label: str) -> Iterator[tuple[Path, str]
                 )
                 _git("checkout", "-q", "FETCH_HEAD", cwd=tree)
             commit = _git("rev-parse", "HEAD", cwd=tree).strip()
+        except GitCancelled:
+            raise
         except RespecError as error:
             raise RespecError(f"cannot fetch {label}: {error}") from None
         shutil.rmtree(tree / ".git")
@@ -523,6 +608,8 @@ def check(
         try:
             row.latest = _latest(source, cache)
             row.update_available = row.latest != source.commit
+        except GitCancelled:
+            raise
         except RespecError as error:
             row.error = str(error)
         rows.append(row)
@@ -571,6 +658,8 @@ def update(
             result.skills.append(row)
             try:
                 latest = _latest(source, cache)
+            except GitCancelled:
+                raise
             except RespecError as error:
                 row.update({"result": "error", "error": str(error)})
                 continue
@@ -583,6 +672,8 @@ def update(
                 continue
             try:
                 new_source = _replace(profile, name, source, replaced)
+            except GitCancelled:
+                raise
             except (RespecError, OSError, shutil.Error) as error:
                 row.update({"result": "error", "error": str(error)})
                 continue
