@@ -110,6 +110,7 @@ def test_conflict_json_has_structured_warnings_and_clean_stdout(run, conflict, c
     payload = json.loads(result.stdout)
     assert payload["warnings"] == [
         {
+            "type": "layer-conflict",
             "profile": "work",
             "layer": "design-principles",
             "skills": ["a", "b"],
@@ -219,14 +220,16 @@ def test_repair_of_named_inactive_profile_does_not_touch_targets(
 def test_repair_refused_by_switch_preflight_leaves_profile_unchanged(
     run, conflict, profiles_root, claude_dir
 ):
-    (claude_dir / "stray").mkdir()  # an unknown entry blocks the refresh
+    # A hand-made folder replaced c's link: the refresh would remove it.
+    (claude_dir / "c").unlink()
+    (claude_dir / "c").mkdir()
     before = read_yaml(profiles_root)
 
     result = fails(run("layer", "repair", "design-principles", "--keep", "b"))
 
     assert "not managed by respec" in result.output
     assert read_yaml(profiles_root) == before
-    assert linked(claude_dir) == {"a", "b", "c", "stray"}
+    assert linked(claude_dir) == {"a", "b", "c"}
 
 
 # Criterion 3: respec use refuses an unrepaired conflict.
@@ -373,7 +376,9 @@ def test_refused_change_restores_legacy_file_bytes(run, work, profiles_root):
     file = profiles_root / "work" / "profile.yaml"
     original = file.read_bytes()
     claude_dir = profiles_root.parent.parent / "home" / ".claude" / "skills"
-    (claude_dir / "stray").mkdir()  # an unknown entry blocks the refresh
+    # A hand-made folder replaced c's link: every refresh would remove it.
+    (claude_dir / "c").unlink()
+    (claude_dir / "c").mkdir()
 
     fails(run("layer", "add-skill", "review", "b"))
     assert file.read_bytes() == original
@@ -447,9 +452,9 @@ def test_adopt_rolls_back_an_add_when_the_relink_is_refused(
     yaml_before = yaml_file.read_bytes()
 
     def refuse(*args, **kwargs):
-        raise switch.SwitchBlocked("cannot switch: refused for the test")
+        raise switch.SwitchBlocked("linking refused for the test")
 
-    monkeypatch.setattr(switch, "use", refuse)
+    monkeypatch.setattr(switch, "link_skills", refuse)
 
     result = fails(run("adopt", "--add", "foreign", "--add", "pointer"))
 
@@ -568,7 +573,7 @@ def test_adopt_failure_reports_backups_made_earlier(run, two_targets, isolated_h
     foreign.mkdir()
     (foreign / "SKILL.md").write_text("precious\n")
 
-    result = fails(run("adopt", "--backup", "a-stray", "--add", "foreign"))
+    result = fails(run("adopt", "--remove", "a-stray", "--add", "foreign"))
 
     assert str(stray) in result.output
     assert "backups" in result.output
@@ -611,9 +616,9 @@ def test_adopt_keeps_the_copy_when_the_original_path_holds_something_else(
     def occupy_then_fail(*args, **kwargs):
         foreign.mkdir()
         (foreign / "SKILL.md").write_text("someone else\n")
-        raise switch.SwitchBlocked("cannot switch: refused for the test")
+        raise switch.SwitchBlocked("linking refused for the test")
 
-    monkeypatch.setattr(switch, "use", occupy_then_fail)
+    monkeypatch.setattr(switch, "link_skills", occupy_then_fail)
 
     result = fails(run("adopt", "--add", "foreign"))
 
@@ -622,3 +627,76 @@ def test_adopt_keeps_the_copy_when_the_original_path_holds_something_else(
     assert str(copy) in result.output
     assert read_yaml(profiles_root, "two")["skills"]["foreign"] == {"enabled": True}
     assert (foreign / "SKILL.md").read_text() == "someone else\n"
+
+
+# fix-6 on top of fix-5: unknown entries, refresh wording, merged warnings.
+
+
+def test_unrelated_unknown_entry_does_not_block_layer_repair(
+    run, conflict, profiles_root, claude_dir
+):
+    (claude_dir / "stray").mkdir()
+
+    result = ok(run("layer", "repair", "design-principles", "--keep", "b"))
+
+    assert enabled_skills(profiles_root) == {"b", "c"}
+    assert linked(claude_dir) == {"b", "c", "stray"}
+    assert str(claude_dir / "stray") in result.stderr
+    assert "respec adopt" in result.stderr
+
+
+def test_refused_refresh_says_refresh_not_switch(run, conflict, profiles_root):
+    before = (profiles_root / "work" / "profile.yaml").read_bytes()
+
+    result = fails(run("disable", "c"))
+
+    assert "cannot refresh profile 'work'" in result.stderr
+    assert "cannot switch" not in result.output
+    assert (profiles_root / "work" / "profile.yaml").read_bytes() == before
+
+
+def test_refresh_blocked_by_an_entry_in_the_way_says_refresh(
+    run, work, profiles_root, claude_dir
+):
+    (claude_dir / "a").unlink()
+    (claude_dir / "a").mkdir()
+
+    result = fails(run("layer", "add-skill", "design-principles", "b"))
+
+    assert "cannot refresh profile 'work'" in result.stderr
+    assert "cannot switch" not in result.output
+    assert str(claude_dir / "a") in result.stderr
+
+
+def test_layer_off_that_resolves_a_conflict_links_the_enabled_skills(
+    run, work, profiles_root, claude_dir
+):
+    ok(run("disable", "b"))
+    data = read_yaml(profiles_root)
+    data["skills"]["b"]["enabled"] = True  # hand edit: b enabled, not linked
+    data["layers"] = {"design-principles": {"skills": ["a", "b"]}}
+    write_yaml(profiles_root, data)
+    assert "b" not in linked(claude_dir)
+
+    change = json.loads(ok(run("layer", "off", "design-principles", "--json")).stdout)
+
+    assert "b" in linked(claude_dir)
+    assert (claude_dir / "b").is_symlink()
+    assert change["linked"] == [str(claude_dir / "b")]
+
+
+def test_json_warnings_hold_layer_conflicts_and_unknown_entries_together(
+    run, conflict, claude_dir
+):
+    (claude_dir / "stray").mkdir()
+
+    result = ok(run("layer", "add", "x", "--additive", "-d", "X", "--json"))
+
+    warnings = json.loads(result.stdout)["warnings"]
+    assert sorted(w["type"] for w in warnings) == ["layer-conflict", "unknown-entry"]
+    layer = next(w for w in warnings if w["type"] == "layer-conflict")
+    entry = next(w for w in warnings if w["type"] == "unknown-entry")
+    assert layer["layer"] == "design-principles"
+    assert entry["path"] == str(claude_dir / "stray") and entry["kind"] == "folder"
+    assert all(w["message"] for w in warnings)
+    assert "design-principles" in result.stderr and "stray" in result.stderr

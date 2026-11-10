@@ -13,8 +13,8 @@ respec add ./my-skill [-p work]   # copy a skill folder (with SKILL.md) into a p
 respec disable my-skill [-p work] # stop linking it; files and metadata stay
 respec enable my-skill [-p work]
 respec remove my-skill [-p work]  # drop it from profile.yaml and delete its folder
-respec adopt [--add|--backup|--keep <entry>] [--all <choice>] [-p work]
-respec restore [<backup>] [--list] [--unknown add|backup|keep] [--overwrite]
+respec adopt [--add|--remove <entry>] [--all add|remove]
+respec restore [<backup>] [--list] [--unknown add|remove] [--overwrite]
 respec add owner/repo[#path] [--ref main] [-p work]  # fetch skill(s) from git
 respec update --check [-p work]   # which sourced skills have newer commits
 respec update [my-skill] [-p work] [--yes]  # apply; --yes overwrites local edits
@@ -53,15 +53,33 @@ respec takes over a target folder it copies the folder's full contents to
 
 Entries in an owned folder that respec did not create are _unknown_. So is a
 recorded path that no longer holds what respec put there: a symlink replaced by
-something else, or a copy whose content was edited or replaced. `status` lists
-them, and before a switch each one needs a choice: `add` (copy it into
-the profile being activated, then manage it), `backup` (move it to
-`~/.respec/backups/<timestamp>/<target>/`) or `keep` (leave it, unmanaged, and
-stop asking). A terminal asks per entry; other runs stop unless
-`respec use <profile> --unknown add|backup|keep` gives the choice. `respec adopt`
-resolves unknown entries outside a switch (`--add` copies into the active
-profile unless `-p` names another). Nothing is removed before it is copied into
-a profile or a backup.
+something else, or a copy whose content was edited or replaced. Each unknown
+entry has two resolutions: `add` copies it into the currently active profile
+and manages it from then on (an edited or replaced copy of one of that
+profile's own skills overwrites the profile's copy, so the edit is kept), and
+`remove` backs it up to `~/.respec/backups/<timestamp>/<target>/` and then
+removes it. Without an active profile only `remove` is available. Nothing is
+removed before it is copied into a profile or a backup.
+
+Unknown entries block a command only when they sit exactly where it would
+install or remove a skill. Any other unknown entry is reported as a warning on
+stderr (and in a `warnings` list with `--json`) with a hint to run
+`respec adopt`; `status` lists them too. For a switch that is blocked, a
+terminal asks per entry; other runs stop unless
+`respec use <profile> --unknown add|remove` gives the choice. During a switch,
+`add` goes to the profile being switched away from. The first time respec takes
+over a folder that already holds entries, a terminal asks about each right
+away (after the switch, which has already backed up the whole folder);
+`--unknown` given on a terminal answers these too. At the very first takeover
+no profile was active yet, so `add` goes to the profile being activated.
+Interrupting the prompt leaves the rest unknown. Other runs back the folder up
+as always and warn. Whatever was already done is always reported. `respec adopt`
+resolves unknown entries at any time (`--add` or `--remove` per entry, or
+`--all`).
+
+Hidden entries (names starting with a dot, such as `.DS_Store`) are ignored:
+they are never reported as unknown, never asked about and never removed by a
+switch. A `.DS_Store` file inside an installed copy does not count as an edit.
 
 `respec restore` undoes respec: it removes every skill respec manages, puts each
 owned folder back to the backup taken when respec first took it over (a folder
@@ -70,11 +88,11 @@ leaves no profile active. `respec restore <backup>` restores the target folders
 of that run instead; `--list` shows the runs. respec's own skills in a backup are
 skipped and reported: symlinks into profiles, and copies that the run's
 `manifest.json` records as installed by respec when the backup was taken.
-Entries the backup would overwrite (unknown ones, edited copies, or kept entries
-whose content or permissions differ from the backup) stop the restore until
-they are resolved with `--unknown` or `respec adopt`, or until `--overwrite` (or
-a yes in a terminal) backs them up and replaces them. Kept and hidden entries
-the backup does not hold stay in place and are reported. A restore that fails
+Entries the backup would overwrite (unknown ones or edited copies whose content
+or permissions differ from the backup) stop the restore until they are resolved
+with `--unknown add|remove`, a terminal's answer per entry or `respec adopt`, or
+until `--overwrite` backs them up and replaces them. Hidden entries the backup
+does not hold stay in place and are reported. A restore that fails
 part way can be run again to finish.
 
 ### TUI
@@ -82,8 +100,10 @@ part way can be run again to finish.
 `respec` without a command (or `respec tui`) opens a terminal UI: profiles on
 the left with the active one marked, each owned target folder on the right.
 Select a profile with the arrow keys or a click, then press Enter or click
-**Activate**. Unknown entries open a dialog with the same three choices; `a`
-resolves them outside a switch, `r` refreshes and `q` quits.
+**Activate**. Unknown entries in the way open a dialog with the same two
+choices (add to the active profile, or back up and remove); so do entries found
+in a folder the switch took over for the first time. `a` resolves unknown
+entries outside a switch, `r` refreshes and `q` quits.
 
 ### Layers
 
@@ -115,10 +135,28 @@ in a layer that is turned off: `--keep <skill>` picks it, a terminal asks, and
 other runs keep the first listed skill. The `--json` output of every `respec
 layer` change lists the skills it disabled under `disabled`.
 
-Every `--json` output that is an object has a `warnings` list, empty when there
-are no conflicts; each entry gives `profile`, `layer`, `skills`, `message` and
-`fix`. `respec restore --list --json` prints a bare list of backups instead: it
-reads no profile, so it has nothing to warn about.
+Turning a layer off (or on) in the active profile re-applies the profile once it
+has no conflicts left, so skills that a conflict kept out of the target folders
+are linked right away. A change that cannot be applied to the active profile is
+refused with `cannot refresh profile '<name>'` and leaves `profile.yaml` as it
+was.
+
+Every `--json` output that is an object has one `warnings` list, empty when
+there is nothing to warn about. Each warning is an object with a `type` and a
+`message`:
+
+- `layer-conflict`: an exclusive layer has several enabled skills; it also
+  gives `profile`, `layer`, `skills` and `fix`.
+- `unknown-entry`: an entry respec did not place (or an edited or replaced
+  copy) in a folder it owns; it also gives `name`, `path`, `kind` (`folder`,
+  `file` or `symlink`), `targets` and `replaced`. Commands that change skills,
+  layers or the active profile (`use`, `add`, `remove`, `enable`, `disable`,
+  `update` and the `layer` changes) report these; `status` and `adopt` list
+  unknown entries in their own `unknown` field instead.
+
+The same warnings are printed on stderr. `respec restore --list --json` prints a
+bare list of backups instead: it reads no profile, so it has nothing to warn
+about.
 
 ## Development
 

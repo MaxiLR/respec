@@ -5,9 +5,11 @@ created: a recorded symlink must still be a symlink into the profiles folder,
 a recorded copy must still exist. A recorded path that now holds something
 else (for example a link replaced by a hand-made folder, or a
 copy another tool replaced or someone edited) is unknown again and
-flagged ``replaced``. Entries the user chose to keep unmanaged are listed in
-``state.unmanaged`` and are not unknown. Hidden entries (``.DS_Store`` and the
-like) are never reported.
+flagged ``replaced``. Hidden entries (``.DS_Store`` and the like) are never
+reported, and ``.DS_Store`` files inside a copy do not count as an edit.
+
+Every unknown entry is resolved the same way (see :mod:`respec.adopt`): add it
+to the active profile, or remove it after backing it up.
 
 Targets whose folders resolve to one real directory are scanned once, under the
 first of them in registry order; the others are its aliases.
@@ -22,6 +24,8 @@ from pathlib import Path
 
 from respec import profiles, targets
 from respec.state import Installed, State
+
+IGNORED_FILES = frozenset({".DS_Store"})
 
 
 @dataclass(frozen=True)
@@ -51,7 +55,8 @@ def real(path: Path | str) -> Path:
 def digest(path: Path | str) -> str:
     """Fingerprint of an entry's content: names, file bytes and link targets.
 
-    Symlinks are recorded by target and never followed.
+    Symlinks are recorded by target and never followed. ``.DS_Store`` files
+    (written by the macOS Finder when a folder is opened) are left out.
     """
     root = Path(path)
     hasher = hashlib.sha256()
@@ -63,6 +68,8 @@ def digest(path: Path | str) -> str:
         elif entry.is_dir():
             hasher.update(b"D\0" + relative.encode() + b"\0")
             for child in sorted(entry.iterdir(), key=lambda c: c.name):
+                if child.name in IGNORED_FILES:
+                    continue
                 add(f"{relative}/{child.name}", child)
         else:
             content = entry.read_bytes()
@@ -108,7 +115,7 @@ def folder_groups(state: State) -> list[tuple[Path, list[str]]]:
     return list(groups.values())
 
 
-def _kind(entry: Path) -> str:
+def kind_of(entry: Path) -> str:
     if entry.is_symlink():
         return "symlink"
     return "folder" if entry.is_dir() else "file"
@@ -120,7 +127,6 @@ def find_unknown(respec_home: Path, state: State) -> list[Unknown]:
         real(item.path) for item in state.installed if is_managed(respec_home, item)
     }
     recorded = {real(item.path) for item in state.installed}
-    kept = {real(path) for path in state.unmanaged}
     found: list[Unknown] = []
     for folder, group in folder_groups(state):
         if not folder.is_dir():
@@ -129,13 +135,13 @@ def find_unknown(respec_home: Path, state: State) -> list[Unknown]:
             if entry.name.startswith("."):
                 continue
             key = real(entry)
-            if key in managed or key in kept:
+            if key in managed:
                 continue
             found.append(
                 Unknown(
                     name=entry.name,
                     path=str(entry),
-                    kind=_kind(entry),
+                    kind=kind_of(entry),
                     targets=tuple(group),
                     replaced=key in recorded,
                 )
@@ -144,22 +150,15 @@ def find_unknown(respec_home: Path, state: State) -> list[Unknown]:
 
 
 def folder_report(respec_home: Path, state: State) -> dict[str, dict[str, object]]:
-    """Per owned target: its alias, unknown entries and kept unmanaged entries."""
+    """Per owned target: the target it shares a folder with, and unknown entries."""
     entries = find_unknown(respec_home, state)
     report: dict[str, dict[str, object]] = {}
     for folder, group in folder_groups(state):
         first, aliases = group[0], group[1:]
-        real_folder = folder.resolve()
-        kept = [
-            {"name": Path(path).name, "path": path}
-            for path in state.unmanaged
-            if os.path.lexists(path) and real(path).parent == real_folder
-        ]
         report[first] = {
             "same_as": None,
             "unknown": [e.to_dict() for e in entries if e.targets[0] == first],
-            "unmanaged": kept,
         }
         for alias in aliases:
-            report[alias] = {"same_as": first, "unknown": [], "unmanaged": []}
+            report[alias] = {"same_as": first, "unknown": []}
     return report

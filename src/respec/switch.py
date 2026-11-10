@@ -1,18 +1,20 @@
-"""Profile switching: ``respec use`` removes the previous profile's items and
+"""Profile switching: ``respec use`` removes the previous profile's skills and
 installs the new profile's enabled skills into its targets.
 
 Order of a switch:
 
-0. Unknown entries in owned folders (see :mod:`respec.unknown`): refuse with
-   :class:`UnknownEntries` unless the caller passes ``on_unknown`` to resolve
-   them (add to the profile, back up and remove, or keep unmanaged).
 1. Preflight (nothing changes): load the profile, check every enabled skill has
-   a folder, and refuse when an install path is occupied by an entry respec did
-   not create.
+   a folder, and find the unknown entries in the way (:func:`conflicts`): those
+   at a path the switch installs to, or at a recorded path it would remove (an
+   edited or replaced copy). They refuse the switch with
+   :class:`UnknownEntries` unless the caller passes ``on_unknown`` to resolve
+   them (:mod:`respec.adopt`: add to the active profile, or remove). Unknown
+   entries anywhere else do not block; callers report them as warnings.
 2. Take over target folders seen for the first time: copy their full contents
    to ``<respec home>/backups/<timestamp>/<target>/`` and record ownership.
-3. Remove every path recorded in ``state.json`` (any folder, any target).
-4. Link each enabled skill into each of the profile's targets (symlink, or copy
+3. Resolve the entries in the way through ``on_unknown``.
+4. Remove every path recorded in ``state.json`` (any folder, any target).
+5. Link each enabled skill into each of the profile's targets (symlink, or copy
    when symlinking fails) and record every created path.
 """
 
@@ -51,22 +53,32 @@ class SwitchBlocked(RespecError):
     """The preflight refused the switch; nothing on disk was changed."""
 
 
-class UnknownEntries(SwitchBlocked):
-    """Owned folders hold entries respec did not create; the user must choose."""
+def describe(entry: unknown.Unknown) -> str:
+    """How an unknown entry reads in messages."""
+    if entry.replaced:
+        return f"{entry.path} (an edited or replaced copy of skill {entry.name!r})"
+    return f"{entry.path} ({entry.kind})"
 
-    def __init__(self, profile: str, entries: list[unknown.Unknown]) -> None:
+
+class UnknownEntries(SwitchBlocked):
+    """Entries respec did not place sit where it would install or remove a skill."""
+
+    def __init__(
+        self,
+        profile: str,
+        entries: list[unknown.Unknown],
+        lead: str | None = None,
+        note: str = "",
+    ) -> None:
+        self.profile = profile
         self.entries = entries
-        lines = "\n".join(
-            f"  - {entry.path} ({entry.kind}"
-            + (", replaced a skill respec installed)" if entry.replaced else ")")
-            for entry in entries
-        )
+        lines = "\n".join(f"  - {describe(entry)}" for entry in entries)
+        lead = lead or f"cannot switch to profile {profile!r}"
         super().__init__(
-            f"cannot switch to profile {profile!r}: folders respec owns hold "
-            f"entries not managed by respec:\n{lines}\n"
-            "Choose for each: add to profile, back up and remove, or keep "
-            "unmanaged. Run 'respec adopt', or pass '--unknown add|backup|keep' "
-            "to 'respec use'."
+            f"{lead}: these entries are not managed by respec and sit where it "
+            f"would install or remove a skill:\n{lines}\n"
+            "Resolve them with 'respec adopt': add each to the active profile, "
+            "or remove it (it is backed up first)." + (f"\n{note}" if note else "")
         )
 
 
@@ -95,20 +107,14 @@ def _real(path: Path) -> Path:
     return path.parent.resolve() / path.name
 
 
-def _preflight(
-    profile: profiles.Profile, state: State, user_home: Path
+def _plan(
+    profile: profiles.Profile, user_home: Path
 ) -> list[tuple[str, str, Path, Path]]:
-    """Plan installs as (target, skill, source, destination); fail on conflicts."""
+    """Installs as (target, skill, source, destination)."""
     registry = targets.registry()
-    recorded = {_real(Path(item.path)) for item in state.installed}
     plan: list[tuple[str, str, Path, Path]] = []
     seen_folders: set[Path] = set()
-    problems: list[str] = []
     enabled = [name for name, entry in profile.skills.items() if entry.enabled]
-    for skill in enabled:
-        source = profile.path / profiles.SKILLS_DIR / skill
-        if not source.is_dir():
-            problems.append(f"skill {skill!r} has no folder at {source}")
     for target in profile.targets:
         folder = registry[target].skills_dir(user_home)
         # Targets whose folders resolve to one real directory (for example
@@ -117,20 +123,69 @@ def _preflight(
             continue
         seen_folders.add(folder.resolve())
         for skill in enabled:
-            destination = folder / skill
-            if os.path.lexists(destination) and _real(destination) not in recorded:
-                problems.append(
-                    f"{destination} already exists and is not managed by respec; "
-                    "move it out of the way before switching"
-                )
             source = profile.path / profiles.SKILLS_DIR / skill
-            plan.append((target, skill, source, destination))
+            plan.append((target, skill, source, folder / skill))
+    return plan
+
+
+def _check_sources(profile: profiles.Profile, lead: str) -> None:
+    """Refuse when an enabled skill has no folder in the profile."""
+    problems = [
+        f"skill {skill!r} has no folder at {profile.path / profiles.SKILLS_DIR / skill}"
+        for skill, entry in profile.skills.items()
+        if entry.enabled and not (profile.path / profiles.SKILLS_DIR / skill).is_dir()
+    ]
     if problems:
         raise SwitchBlocked(
-            f"cannot switch to profile {profile.name!r}:\n"
-            + "\n".join(f"  - {problem}" for problem in problems)
+            f"{lead}:\n" + "\n".join(f"  - {problem}" for problem in problems)
         )
-    return plan
+
+
+def conflicts(
+    respec_home: Path, user_home: Path, profile: profiles.Profile, state: State
+) -> list[unknown.Unknown]:
+    """Unknown entries in the way of activating ``profile``.
+
+    That is every entry respec did not place (or that was edited or replaced)
+    sitting exactly at a path the switch installs to or removes, including
+    paths in folders respec does not own yet.
+    """
+    plan = _plan(profile, user_home)
+    installs = {_real(destination) for _, _, _, destination in plan}
+    recorded = {_real(Path(item.path)) for item in state.installed}
+    found: list[unknown.Unknown] = []
+    seen: set[Path] = set()
+    for entry in unknown.find_unknown(respec_home, state):
+        key = _real(Path(entry.path))
+        if key in installs or key in recorded:
+            found.append(entry)
+            seen.add(key)
+    managed = {
+        _real(Path(item.path))
+        for item in state.installed
+        if unknown.is_managed(respec_home, item)
+    }
+    registry = targets.registry()
+    sharing: dict[Path, list[str]] = {}
+    for target in profile.targets:
+        sharing.setdefault(registry[target].skills_dir(user_home).resolve(), []).append(
+            target
+        )
+    for _, skill, _, destination in plan:
+        key = _real(destination)
+        if key in seen or key in managed or not os.path.lexists(destination):
+            continue
+        seen.add(key)
+        found.append(
+            unknown.Unknown(
+                name=skill,
+                path=str(destination),
+                kind=unknown.kind_of(destination),
+                targets=tuple(sharing[destination.parent.resolve()]),
+                replaced=key in recorded,
+            )
+        )
+    return found
 
 
 BACKUP_MANIFEST = "manifest.json"
@@ -251,20 +306,65 @@ def _install(source: Path, destination: Path) -> str:
     return "copy"
 
 
-def _forget_replaced(respec_home: Path) -> None:
-    """Drop records of paths that now hold a foreign entry; it is not respec's."""
+@dataclass
+class LinkResult:
+    linked: list[str] = field(default_factory=list)
+    blocked: list[str] = field(default_factory=list)  # destinations in the way
+
+
+def link_skills(
+    respec_home: Path, user_home: Path, name: str, skills: list[str]
+) -> LinkResult:
+    """Link ``skills`` of the active profile ``name`` without a full switch.
+
+    Only folders respec already owns are touched. A destination that holds an
+    unknown entry is left alone and reported in ``blocked``; other unknown
+    entries do not matter. A managed copy is reinstalled so it matches the
+    profile's current files; a managed link already points at them.
+    """
+    profile = profiles.load_profile(respec_home, name)
     state = load_state(respec_home)
-    replaced = {
-        unknown.real(entry.path)
-        for entry in unknown.find_unknown(respec_home, state)
-        if entry.replaced
+    owned = {Path(entry.skills_dir).resolve() for entry in state.owned.values()}
+    wanted = {
+        skill
+        for skill in skills
+        if skill in profile.skills and profile.skills[skill].enabled
     }
-    if not replaced:
-        return
-    state.installed = [
-        item for item in state.installed if unknown.real(item.path) not in replaced
-    ]
-    save_state(respec_home, state)
+    result = LinkResult()
+    for target, skill, source, destination in _plan(profile, user_home):
+        if skill not in wanted or destination.parent.resolve() not in owned:
+            continue
+        key = _real(destination)
+        record = next((i for i in state.installed if _real(Path(i.path)) == key), None)
+        if os.path.lexists(destination):
+            if record is None or not unknown.is_managed(respec_home, record):
+                result.blocked.append(str(destination))
+                continue
+            if record.mode == "symlink":
+                continue
+            remove_installed(respec_home, record)
+        if record is not None:
+            state.installed.remove(record)
+        try:
+            mode = _install(source, destination)
+        except OSError as error:
+            save_state(respec_home, state)
+            raise RespecError(
+                f"linking {skill!r} into {destination.parent} did not complete: "
+                f"{error}"
+            ) from None
+        state.installed.append(
+            Installed(
+                target=target,
+                name=skill,
+                path=str(destination),
+                mode=mode,
+                digest=unknown.digest(destination) if mode == "copy" else None,
+            )
+        )
+        save_state(respec_home, state)
+        result.linked.append(str(destination))
+    return result
 
 
 def refuse_layer_conflicts(
@@ -285,27 +385,39 @@ def use(
     name: str,
     now: Clock = utc_now,
     on_unknown: UnknownHandler | None = None,
+    action: str = "switch to",
 ) -> SwitchResult:
     """Activate profile ``name``; see the module docstring for the order.
 
-    ``on_unknown`` receives the unknown entries of owned folders before
-    anything else happens; entries it leaves in place stay untouched.
+    ``on_unknown`` receives the unknown entries in the way (:func:`conflicts`)
+    after new folders are taken over and before anything is removed. Entries it
+    leaves in place refuse the switch with :class:`UnknownEntries`. ``action``
+    names what a refusal says could not be done ("cannot <action> profile"):
+    ``"refresh"`` when an edited profile is re-applied.
     """
     profile = profiles.load_profile(respec_home, name)
-    refuse_layer_conflicts(profile)
-    entries = unknown.find_unknown(respec_home, load_state(respec_home))
-    if entries:
-        if on_unknown is None:
-            raise UnknownEntries(profile.name, entries)
-        on_unknown(entries)
-        _forget_replaced(respec_home)
-        profile = profiles.load_profile(respec_home, name)
+    refuse_layer_conflicts(profile, action)
+    lead = f"cannot {action} profile {profile.name!r}"
     state = load_state(respec_home)
-    plan = _preflight(profile, state, user_home)
+    _check_sources(profile, lead)
+    found = conflicts(respec_home, user_home, profile, state)
+    if found and on_unknown is None:
+        raise UnknownEntries(profile.name, found, lead=lead)
     result = SwitchResult(profile=profile.name, previous=state.active_profile)
 
     result.backups = _take_over(respec_home, user_home, profile, state, now)
     save_state(respec_home, state)
+
+    if found and on_unknown is not None:
+        on_unknown(found)
+        profile = profiles.load_profile(respec_home, name)
+        refuse_layer_conflicts(profile, action)
+        state = load_state(respec_home)
+        _check_sources(profile, lead)
+        left = conflicts(respec_home, user_home, profile, state)
+        if left:
+            raise UnknownEntries(profile.name, left, lead=lead)
+    plan = _plan(profile, user_home)
 
     # state.json is saved after every removal and every install, so it always
     # lists each path respec has created and a later switch can remove it.

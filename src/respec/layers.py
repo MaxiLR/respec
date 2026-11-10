@@ -270,7 +270,8 @@ def set_active(
     Turning a layer off is always allowed: it can only remove conflicts.
     Turning it on is refused only when that layer itself would have more than
     one enabled skill; other layers' conflicts stay warnings. No skill changes
-    state, so the target folders are not touched.
+    state; but when the change leaves an active profile free of conflicts, it
+    is re-applied, so skills a conflict kept out of its folders get linked.
     """
     before = _load(respec_home, profile_name)
     after = _with_layer(
@@ -287,6 +288,13 @@ def set_active(
     )
     if after != before:
         profiles.save_profile(after)
+        if change.active and not profiles.exclusivity_conflicts(after):
+            items.refresh_active(
+                respec_home,
+                user_home,
+                change,
+                lambda: profiles.restore_profile(before),
+            )
     return change
 
 

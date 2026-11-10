@@ -90,6 +90,14 @@ def activated(run, respec_home, dirs):
     ok(run("use", "a"))
 
 
+def deactivate(respec_home):
+    """Leave the folders owned but no profile active (as after a failed switch)."""
+    path = respec_home / "state.json"
+    state = json.loads(path.read_text())
+    state["active_profile"] = None
+    path.write_text(json.dumps(state))
+
+
 # --- detection -------------------------------------------------------------
 
 
@@ -110,7 +118,7 @@ def test_status_json_reports_foreign_entry_dropped_after_activation(
             "replaced": False,
         }
     ]
-    assert folder["unmanaged"] == []
+    assert "unmanaged" not in folder
 
 
 def test_status_human_lists_unknown_entries_with_a_hint(run, activated, dirs):
@@ -121,6 +129,7 @@ def test_status_human_lists_unknown_entries_with_a_hint(run, activated, dirs):
     line = next(line for line in out.splitlines() if "foreign" in line)
     assert "unknown" in line
     assert "respec adopt" in out
+    assert "keep" not in out
 
 
 def test_hidden_files_are_not_reported(run, activated, dirs):
@@ -150,97 +159,254 @@ def test_status_shows_alias_for_targets_sharing_one_real_folder(run, respec_home
     assert "same folder as claude-code" in out
 
 
-# --- before a switch -------------------------------------------------------
-
-
-def test_non_interactive_switch_with_unknown_entry_fails_and_changes_nothing(
+def test_entries_once_kept_unmanaged_are_unknown_again_and_the_record_is_pruned(
     run, activated, respec_home, dirs
 ):
     foreign = drop_skill(dirs["claude-code"], "foreign")
+    path = respec_home / "state.json"
+    state = json.loads(path.read_text())
+    state["unmanaged"] = [str(foreign), str(dirs["claude-code"] / "gone")]
+    path.write_text(json.dumps(state))
+
+    folder = folder_report(status_json(run), "claude-code")
+    assert [u["path"] for u in folder["unknown"]] == [str(foreign)]
+
+    ok(run("adopt", "--remove", "foreign"))
+
+    assert "unmanaged" not in json.loads(path.read_text())
+    assert not os.path.lexists(foreign)
+    assert "foreign\n" in backup_files(respec_home).values()
+
+
+def test_dot_ds_store_inside_an_installed_copy_does_not_mark_it_edited(
+    run, activated_as_copy, dirs
+):
+    (activated_as_copy / ".DS_Store").write_bytes(b"\0\1finder")
+
+    folder = folder_report(status_json(run), "claude-code")
+
+    assert [(i["name"], i["mode"]) for i in folder["skills"]] == [("tdd", "copy")]
+    assert folder["unknown"] == []
+
+
+# --- exactly two choices: add or remove ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("adopt", "--keep", "foreign"),
+        ("adopt", "--backup", "foreign"),
+        ("adopt", "--all", "keep"),
+        ("use", "b", "--unknown", "keep"),
+        ("use", "b", "--unknown", "backup"),
+        ("restore", "--unknown", "keep"),
+    ],
+)
+def test_keep_and_other_old_choices_are_rejected(run, activated, dirs, args):
+    foreign = drop_skill(dirs["claude-code"], "foreign")
+
+    result = run(*args)
+
+    assert result.exit_code == 2
+    assert (foreign / "SKILL.md").read_text() == "foreign\n"
+
+
+@pytest.mark.parametrize("command", [("adopt",), ("use",), ("restore",)])
+def test_help_offers_only_add_and_remove(run, command):
+    out = run(*command, "--help").output
+
+    assert "add" in out and "remove" in out
+    assert "keep" not in out.lower() and "unmanaged" not in out.lower()
+
+
+# --- only entries in the way block ----------------------------------------
+
+
+def test_unknown_entry_elsewhere_warns_but_does_not_block_a_switch(
+    run, activated, respec_home, dirs
+):
+    foreign = drop_skill(dirs["claude-code"], "foreign")
+
+    result = ok(run("use", "b"))
+
+    assert active_profile(respec_home) == "b"
+    assert sorted(p.name for p in dirs["claude-code"].iterdir()) == [
+        "foreign",
+        "lint",
+    ]
+    assert (foreign / "SKILL.md").read_text() == "foreign\n"
+    assert str(foreign) in result.stderr and "respec adopt" in result.stderr
+    assert "warning" in result.stderr.lower()
+    assert str(foreign) not in result.stdout
+
+
+def test_switch_json_lists_unknown_entries_as_warnings(run, activated, dirs):
+    foreign = drop_skill(dirs["claude-code"], "foreign")
+
+    data = json.loads(ok(run("use", "b", "--json")).stdout)
+
+    [warning] = data["warnings"]
+    assert warning["path"] == str(foreign)
+    assert warning["replaced"] is False
+    assert "respec adopt" in warning["message"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("disable", "tdd"),
+        ("enable", "tdd"),
+        ("layer", "use", "design-principles", "tdd"),
+        ("layer", "disable", "design-principles"),
+        ("layer", "off", "design-principles"),
+    ],
+)
+def test_unknown_entry_elsewhere_warns_but_does_not_block_profile_edits(
+    run, activated, respec_home, dirs, command
+):
+    foreign = drop_skill(dirs["claude-code"], "foreign")
+
+    result = ok(run(*command))
+
+    assert (foreign / "SKILL.md").read_text() == "foreign\n"
+    assert str(foreign) in result.stderr and "respec adopt" in result.stderr
+    assert "cannot" not in result.output and "--unknown" not in result.output
+    data = json.loads(ok(run(*command, "--json")).stdout)
+    assert [w["path"] for w in data["warnings"]] == [str(foreign)]
+
+
+def test_add_and_remove_of_a_skill_warn_but_are_not_blocked(
+    run, activated, respec_home, dirs, tmp_path
+):
+    foreign = drop_skill(dirs["claude-code"], "foreign")
+    source = drop_skill(tmp_path / "src", "extra", "extra\n")
+
+    added = ok(run("add", str(source)))
+    removed = ok(run("remove", "extra"))
+
+    for result in (added, removed):
+        assert str(foreign) in result.stderr
+    assert "extra" not in profile_skills(respec_home, "a")
+
+
+def test_no_warning_without_unknown_entries(run, activated):
+    result = ok(run("use", "b"))
+
+    assert result.stderr == ""
+    assert json.loads(ok(run("use", "a", "--json")).stdout)["warnings"] == []
+
+
+def test_entry_at_an_install_path_blocks_the_switch_and_changes_nothing(
+    run, activated, respec_home, dirs
+):
+    in_the_way = drop_skill(dirs["claude-code"], "lint")
 
     result = run("use", "b")
 
     assert result.exit_code == 1
-    assert str(foreign) in result.output
+    assert str(in_the_way) in result.output
     assert "--unknown" in result.output and "respec adopt" in result.output
-    assert (foreign / "SKILL.md").read_text() == "foreign\n"
+    assert "keep" not in result.output
+    assert (in_the_way / "SKILL.md").read_text() == "foreign\n"
     assert (dirs["claude-code"] / "tdd").is_symlink()
-    assert not (dirs["claude-code"] / "lint").exists()
     assert active_profile(respec_home) == "a"
     assert not (respec_home / "backups").exists()
 
 
-def test_switch_policy_backup_moves_entry_to_backups_then_switches(
+def test_switch_policy_remove_backs_up_the_entry_in_the_way_then_switches(
     run, activated, respec_home, dirs
 ):
-    foreign = drop_skill(dirs["claude-code"], "foreign")
+    in_the_way = drop_skill(dirs["claude-code"], "lint")
 
-    ok(run("use", "b", "--unknown", "backup"))
+    ok(run("use", "b", "--unknown", "remove"))
 
-    assert not os.path.lexists(foreign)
-    assert sorted(p.name for p in dirs["claude-code"].iterdir()) == ["lint"]
+    assert in_the_way.is_symlink()
+    assert (in_the_way / "SKILL.md").read_text() == "# lint from b\n"
     assert backup_files(respec_home) == {
-        "claude-code/foreign/SKILL.md": "foreign\n",
-        "claude-code/foreign/refs/note.md": "note\n",
+        "claude-code/lint/SKILL.md": "foreign\n",
+        "claude-code/lint/refs/note.md": "note\n",
     }
     assert active_profile(respec_home) == "b"
 
 
-def test_switch_policy_add_copies_entry_into_new_profile_and_links_it(
+def test_switch_policy_add_goes_to_the_profile_being_switched_away_from(
     run, activated, respec_home, dirs
 ):
-    drop_skill(dirs["claude-code"], "foreign")
+    drop_skill(dirs["claude-code"], "lint")
 
     ok(run("use", "b", "--unknown", "add"))
 
-    copied = respec_home / "profiles" / "b" / "skills" / "foreign"
+    copied = respec_home / "profiles" / "a" / "skills" / "lint"
     assert (copied / "SKILL.md").read_text() == "foreign\n"
     assert (copied / "refs" / "note.md").read_text() == "note\n"
-    assert profile_skills(respec_home, "b")["foreign"] == {"enabled": True}
-    link = dirs["claude-code"] / "foreign"
-    assert link.is_symlink() and link.resolve() == copied.resolve()
-    report = folder_report(status_json(run), "claude-code")
-    assert sorted(i["name"] for i in report["skills"]) == ["foreign", "lint"]
-    assert report["unknown"] == []
+    assert profile_skills(respec_home, "a")["lint"] == {"enabled": True}
+    assert (
+        respec_home / "profiles" / "b" / "skills" / "lint" / "SKILL.md"
+    ).read_text() == ("# lint from b\n")
+    link = dirs["claude-code"] / "lint"
+    assert link.is_symlink()
+    assert (link / "SKILL.md").read_text() == "# lint from b\n"
+    assert active_profile(respec_home) == "b"
 
 
-def test_switch_policy_keep_leaves_entry_and_stops_asking(
+def test_switch_policy_add_without_an_active_profile_fails_before_any_change(
     run, activated, respec_home, dirs
 ):
-    foreign = drop_skill(dirs["claude-code"], "foreign")
+    deactivate(respec_home)
+    in_the_way = drop_skill(dirs["claude-code"], "lint")
 
-    ok(run("use", "b", "--unknown", "keep"))
+    result = run("use", "b", "--unknown", "add")
 
-    assert (foreign / "SKILL.md").read_text() == "foreign\n"
-    report = folder_report(status_json(run), "claude-code")
-    assert report["unknown"] == []
-    assert report["unmanaged"] == [{"name": "foreign", "path": str(foreign)}]
-    # Kept entries are not asked about again and never removed by a switch.
-    ok(run("use", "a"))
-    assert (foreign / "SKILL.md").read_text() == "foreign\n"
+    assert result.exit_code == 1
+    assert "no active profile" in result.output and "remove" in result.output
+    assert (in_the_way / "SKILL.md").read_text() == "foreign\n"
+    assert not (respec_home / "backups").exists()
 
 
-def test_interactive_switch_prompts_once_per_entry(
+def test_interactive_switch_prompts_once_per_entry_in_the_way(
     run, activated, respec_home, dirs, monkeypatch
 ):
     monkeypatch.setattr(cli, "_interactive", lambda: True)
+    make_profile(respec_home, "c", ["claude-code"], ["first", "second"])
     first = drop_skill(dirs["claude-code"], "first", "first\n")
-    second = drop_skill(dirs["claude-code"], "second", "second\n")
+    drop_skill(dirs["claude-code"], "second", "second\n")
+    elsewhere = drop_skill(dirs["claude-code"], "elsewhere")
 
-    result = run("use", "b", input="backup\nkeep\n")
+    result = run("use", "c", input="remove\nadd\n")
 
     ok(result)
-    assert result.output.count("add to profile") == 2
-    assert not os.path.lexists(first)
-    assert (second / "SKILL.md").read_text() == "second\n"
+    assert result.stdout.count("add to profile 'a'") == 2
+    assert "keep" not in result.stdout
+    assert first.is_symlink()
     assert "first\n" in backup_files(respec_home).values()
-    assert active_profile(respec_home) == "b"
+    added = respec_home / "profiles" / "a" / "skills" / "second" / "SKILL.md"
+    assert added.read_text() == "second\n"
+    assert (elsewhere / "SKILL.md").read_text() == "foreign\n"
+    assert str(elsewhere) in result.stderr
+    assert active_profile(respec_home) == "c"
+
+
+def test_interactive_prompt_without_an_active_profile_offers_only_remove(
+    run, activated, respec_home, dirs, monkeypatch
+):
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    deactivate(respec_home)
+    in_the_way = drop_skill(dirs["claude-code"], "lint")
+
+    result = run("use", "b", input="add\nremove\n")
+
+    ok(result)
+    assert "add to profile" not in result.stdout
+    assert "please answer: remove" in result.stdout
+    assert in_the_way.is_symlink()
+    assert "foreign\n" in backup_files(respec_home).values()
 
 
 def test_add_choice_on_a_file_fails_and_keeps_the_file(
     run, activated, respec_home, dirs
 ):
-    loose = dirs["claude-code"] / "notes.txt"
+    loose = dirs["claude-code"] / "lint"
     loose.write_text("loose\n")
 
     result = run("use", "b", "--unknown", "add")
@@ -249,6 +415,55 @@ def test_add_choice_on_a_file_fails_and_keeps_the_file(
     assert "not a folder" in result.output
     assert loose.read_text() == "loose\n"
     assert active_profile(respec_home) == "a"
+
+
+# --- first takeover ----------------------------------------------------------
+
+
+def test_first_takeover_without_terminal_backs_up_and_warns(run, respec_home, dirs):
+    old = drop_skill(dirs["claude-code"], "old", "old\n")
+    make_profile(respec_home, "a", ["claude-code"], ["tdd"])
+
+    result = ok(run("use", "a"))
+
+    assert (old / "SKILL.md").read_text() == "old\n"
+    assert backup_files(respec_home)["claude-code/old/SKILL.md"] == "old\n"
+    assert str(old) in result.stderr and "respec adopt" in result.stderr
+
+
+def test_first_takeover_on_a_terminal_asks_about_existing_entries_right_away(
+    run, respec_home, dirs, monkeypatch
+):
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    old = drop_skill(dirs["claude-code"], "old", "old\n")
+    make_profile(respec_home, "a", ["claude-code"], ["tdd"])
+
+    result = run("use", "a", input="remove\n")
+
+    ok(result)
+    assert str(old) in result.stdout
+    assert "add to profile 'a'" in result.stdout  # the profile being activated
+    assert not os.path.lexists(old)
+    runs = sorted((respec_home / "backups").iterdir())
+    assert len(runs) == 2  # the takeover backup and the removed entry
+    assert (runs[0] / "claude-code" / "old" / "SKILL.md").read_text() == "old\n"
+    assert result.stderr == ""
+    assert active_profile(respec_home) == "a"
+
+
+def test_first_takeover_of_a_new_target_adds_to_the_profile_being_left(
+    run, activated, respec_home, dirs, monkeypatch
+):
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    make_profile(respec_home, "c", ["claude-code", "agents"], ["lint"])
+    drop_skill(dirs["agents"], "old", "old\n")
+
+    ok(run("use", "c", input="add\n"))
+
+    copied = respec_home / "profiles" / "a" / "skills" / "old" / "SKILL.md"
+    assert copied.read_text() == "old\n"
+    assert not os.path.lexists(dirs["agents"] / "old")
+    assert active_profile(respec_home) == "c"
 
 
 # --- a recorded link replaced by something else ---------------------------
@@ -265,7 +480,7 @@ def test_replaced_link_is_reported_as_unknown(run, activated, dirs):
     assert [(u["name"], u["replaced"]) for u in folder["unknown"]] == [("tdd", True)]
 
 
-def test_replaced_link_blocks_switch_cleanly_then_backup_resolves_it(
+def test_replaced_link_blocks_switch_cleanly_then_remove_resolves_it(
     run, activated, respec_home, dirs
 ):
     link = dirs["claude-code"] / "tdd"
@@ -279,13 +494,13 @@ def test_replaced_link_blocks_switch_cleanly_then_backup_resolves_it(
     assert active_profile(respec_home) == "a"
     assert (link / "SKILL.md").read_text() == "hand-made\n"
 
-    ok(run("use", "b", "--unknown", "backup"))
+    ok(run("use", "b", "--unknown", "remove"))
 
     assert sorted(p.name for p in dirs["claude-code"].iterdir()) == ["lint"]
     assert "hand-made\n" in backup_files(respec_home).values()
 
 
-def test_item_change_is_rolled_back_when_replaced_link_blocks_refresh(
+def test_item_change_blocked_by_a_replaced_link_says_so_accurately(
     run, respec_home, dirs
 ):
     make_profile(respec_home, "a", ["claude-code"], ["tdd", "lint"])
@@ -296,9 +511,29 @@ def test_item_change_is_rolled_back_when_replaced_link_blocks_refresh(
     result = run("disable", "lint")
 
     assert result.exit_code == 1
+    assert str(dirs["claude-code"] / "tdd") in result.output
+    assert "respec adopt" in result.output and "left unchanged" in result.output
+    assert "cannot switch" not in result.output and "--unknown" not in result.output
     assert profile_skills(respec_home, "a")["lint"] == {"enabled": True}
     assert active_profile(respec_home) == "a"
     assert (dirs["claude-code"] / "lint").is_symlink()
+
+
+def test_adding_a_replaced_link_back_overwrites_the_profile_copy(
+    run, activated, respec_home, dirs
+):
+    link = dirs["claude-code"] / "tdd"
+    link.unlink()
+    drop_skill(dirs["claude-code"], "tdd", "hand-made\n")
+
+    ok(run("adopt", "--add", "tdd"))
+
+    profile_copy = respec_home / "profiles" / "a" / "skills" / "tdd"
+    assert (profile_copy / "SKILL.md").read_text() == "hand-made\n"
+    assert (profile_copy / "refs" / "note.md").read_text() == "note\n"
+    assert profile_skills(respec_home, "a")["tdd"] == {"enabled": True}
+    assert link.is_symlink() and (link / "SKILL.md").read_text() == "hand-made\n"
+    assert folder_report(status_json(run), "claude-code")["unknown"] == []
 
 
 # --- a recorded copy replaced or edited by something else -----------------
@@ -352,10 +587,41 @@ def test_edited_copy_is_backed_up_before_the_switch_removes_it(
 ):
     (activated_as_copy / "SKILL.md").write_text("edited by hand\n")
 
-    ok(run("use", "b", "--unknown", "backup"))
+    ok(run("use", "b", "--unknown", "remove"))
 
     assert sorted(p.name for p in dirs["claude-code"].iterdir()) == ["lint"]
     assert "edited by hand\n" in backup_files(respec_home).values()
+
+
+def test_adding_an_edited_copy_back_overwrites_the_active_profile_copy(
+    run, activated_as_copy, respec_home, dirs
+):
+    (activated_as_copy / "SKILL.md").write_text("edited by hand\n")
+
+    data = json.loads(ok(run("adopt", "--add", "tdd", "--json")).stdout)
+
+    [resolved] = data["resolved"]
+    assert resolved["choice"] == "add" and resolved["profile"] == "a"
+    profile_copy = respec_home / "profiles" / "a" / "skills" / "tdd" / "SKILL.md"
+    assert profile_copy.read_text() == "edited by hand\n"
+    assert profile_skills(respec_home, "a")["tdd"] == {"enabled": True}
+    assert (dirs["claude-code"] / "tdd" / "SKILL.md").read_text() == "edited by hand\n"
+    folder = folder_report(status_json(run), "claude-code")
+    assert [i["name"] for i in folder["skills"]] == ["tdd"]
+    assert folder["unknown"] == []
+
+
+def test_switch_add_of_an_edited_copy_keeps_the_edit_in_the_profile_left(
+    run, activated_as_copy, respec_home, dirs
+):
+    (activated_as_copy / "SKILL.md").write_text("edited by hand\n")
+
+    ok(run("use", "b", "--unknown", "add"))
+
+    profile_copy = respec_home / "profiles" / "a" / "skills" / "tdd" / "SKILL.md"
+    assert profile_copy.read_text() == "edited by hand\n"
+    assert sorted(p.name for p in dirs["claude-code"].iterdir()) == ["lint"]
+    assert active_profile(respec_home) == "b"
 
 
 def test_unmodified_copy_stays_managed_and_is_replaced_on_switch(
@@ -385,16 +651,16 @@ def test_adopt_json_without_choices_lists_entries_and_changes_nothing(
     assert (foreign / "SKILL.md").read_text() == "foreign\n"
 
 
-def test_adopt_backup_flag_backs_up_and_removes_only_that_entry(
+def test_adopt_remove_flag_backs_up_and_removes_only_that_entry(
     run, activated, respec_home, dirs
 ):
     drop_skill(dirs["claude-code"], "one", "one\n")
     two = drop_skill(dirs["claude-code"], "two", "two\n")
 
-    data = json.loads(ok(run("adopt", "--backup", "one", "--json")).stdout)
+    data = json.loads(ok(run("adopt", "--remove", "one", "--json")).stdout)
 
     [resolved] = data["resolved"]
-    assert resolved["name"] == "one" and resolved["choice"] == "backup"
+    assert resolved["name"] == "one" and resolved["choice"] == "remove"
     assert open(os.path.join(resolved["backup"], "SKILL.md")).read() == "one\n"
     assert not os.path.lexists(dirs["claude-code"] / "one")
     assert [entry["path"] for entry in data["unknown"]] == [str(two)]
@@ -421,31 +687,36 @@ def test_adopt_add_of_a_symlinked_entry_keeps_the_entry_name(
     elsewhere = drop_skill(tmp_path / "checkout", "upstream-name")
     (dirs["claude-code"] / "my-name").symlink_to(elsewhere, target_is_directory=True)
 
-    ok(run("adopt", "--add", "my-name", "-p", "b"))
+    ok(run("adopt", "--add", "my-name"))
 
-    assert "my-name" in profile_skills(respec_home, "b")
-    copied = respec_home / "profiles" / "b" / "skills" / "my-name"
+    assert "my-name" in profile_skills(respec_home, "a")
+    copied = respec_home / "profiles" / "a" / "skills" / "my-name"
     assert (copied / "SKILL.md").read_text() == "foreign\n"
     assert not copied.is_symlink()
     assert (elsewhere / "SKILL.md").read_text() == "foreign\n"
-    assert not os.path.lexists(dirs["claude-code"] / "my-name")
+    assert (dirs["claude-code"] / "my-name").resolve() == copied.resolve()
 
 
-def test_adopt_keep_flag_records_entry_as_unmanaged(run, activated, dirs):
+def test_adopt_add_without_an_active_profile_fails_and_remove_still_works(
+    run, activated, respec_home, dirs
+):
+    deactivate(respec_home)
     foreign = drop_skill(dirs["claude-code"], "foreign")
 
-    ok(run("adopt", "--keep", str(foreign)))
+    result = run("adopt", "--add", "foreign")
 
-    folder = folder_report(status_json(run), "claude-code")
-    assert folder["unknown"] == []
-    assert folder["unmanaged"] == [{"name": "foreign", "path": str(foreign)}]
+    assert result.exit_code == 1
+    assert "no active profile" in result.output and "remove" in result.output
+    assert (foreign / "SKILL.md").read_text() == "foreign\n"
+    ok(run("adopt", "--remove", "foreign"))
+    assert not os.path.lexists(foreign)
 
 
 def test_adopt_all_applies_one_choice_to_every_entry(run, activated, respec_home, dirs):
     drop_skill(dirs["claude-code"], "one", "one\n")
     drop_skill(dirs["claude-code"], "two", "two\n")
 
-    ok(run("adopt", "--all", "backup"))
+    ok(run("adopt", "--all", "remove"))
 
     assert sorted(p.name for p in dirs["claude-code"].iterdir()) == ["tdd"]
     assert {"one\n", "two\n"} <= set(backup_files(respec_home).values())
@@ -454,7 +725,7 @@ def test_adopt_all_applies_one_choice_to_every_entry(run, activated, respec_home
 def test_adopt_unknown_selector_fails_before_changing_anything(run, activated, dirs):
     one = drop_skill(dirs["claude-code"], "one")
 
-    result = run("adopt", "--backup", "one", "--backup", "missing")
+    result = run("adopt", "--remove", "one", "--remove", "missing")
 
     assert result.exit_code == 1
     assert "missing" in result.output
@@ -467,12 +738,11 @@ def test_adopt_interactive_prompts_for_each_entry(
     monkeypatch.setattr(cli, "_interactive", lambda: True)
     foreign = drop_skill(dirs["claude-code"], "foreign")
 
-    ok(run("adopt", input="keep\n"))
+    result = ok(run("adopt", input="keep\nremove\n"))
 
-    assert (foreign / "SKILL.md").exists()
-    assert folder_report(status_json(run), "claude-code")["unmanaged"] == [
-        {"name": "foreign", "path": str(foreign)}
-    ]
+    assert "please answer one of: add, remove" in result.stdout
+    assert not os.path.lexists(foreign)
+    assert "foreign\n" in backup_files(respec_home).values()
 
 
 def test_status_lists_shared_items_once_whatever_the_profile_target_order(
@@ -493,37 +763,183 @@ def test_status_lists_shared_items_once_whatever_the_profile_target_order(
     assert folder_report(report, "agents")["same_as"] == "claude-code"
 
 
-# --- layer commands share the items refresh path ----------------------------
+# --- the core API the TUI and later a sync action share --------------------
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
-        ("layer", "use", "design-principles", "lint"),
-        ("layer", "disable", "design-principles"),
-    ],
-)
-def test_layer_change_is_rolled_back_while_an_unknown_entry_waits(
-    run, respec_home, dirs, command
+def test_unresolved_returns_unknown_entries_and_edited_copies(
+    run, activated_as_copy, respec_home, dirs
 ):
-    make_profile(respec_home, "a", ["claude-code"], ["tdd", "lint"])
-    ok(run("use", "a"))
-    ok(run("layer", "add-skill", "design-principles", "tdd"))
-    foreign = drop_skill(dirs["claude-code"], "foreign")
-    before = (respec_home / "profiles" / "a" / "profile.yaml").read_text()
+    from respec import adopt
 
-    result = run(*command)
+    (activated_as_copy / "SKILL.md").write_text("edited by hand\n")
+    foreign = drop_skill(dirs["claude-code"], "foreign")
+
+    found = adopt.unresolved(respec_home)
+
+    assert sorted((e.path, e.replaced) for e in found) == [
+        (str(foreign), False),
+        (str(activated_as_copy), True),
+    ]
+    assert adopt.choices("a") == ("add", "remove")
+    assert adopt.choices(None) == ("remove",)
+
+
+# --- fix round 1: partial results are always reported ------------------------
+
+
+def test_very_first_takeover_adds_to_the_profile_being_activated(
+    run, respec_home, dirs, monkeypatch
+):
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    old = drop_skill(dirs["claude-code"], "old", "old\n")
+    make_profile(respec_home, "a", ["claude-code"], ["tdd"])
+
+    result = ok(run("use", "a", input="add\n"))
+
+    copied = respec_home / "profiles" / "a" / "skills" / "old"
+    assert (copied / "SKILL.md").read_text() == "old\n"
+    assert profile_skills(respec_home, "a")["old"] == {"enabled": True}
+    assert old.is_symlink() and old.resolve() == copied.resolve()
+    assert f"Added {old} to profile 'a'" in result.stdout
+    assert result.stderr == ""
+
+
+def test_adopt_add_while_an_edited_copy_waits_reports_and_links_the_add(
+    run, activated_as_copy, respec_home, dirs
+):
+    (activated_as_copy / "SKILL.md").write_text("edited by hand\n")
+    foreign = drop_skill(dirs["claude-code"], "foreign")
+
+    result = ok(run("adopt", "--add", "foreign"))
+
+    assert f"Added {foreign} to profile 'a'" in result.stdout
+    assert "cannot switch" not in result.output
+    assert foreign.is_symlink()
+    assert (foreign / "SKILL.md").read_text() == "foreign\n"
+    assert (activated_as_copy / "SKILL.md").read_text() == "edited by hand\n"
+    folder = folder_report(status_json(run), "claude-code")
+    assert "foreign" in [i["name"] for i in folder["skills"]]
+    assert [u["name"] for u in folder["unknown"]] == ["tdd"]
+
+
+def test_adopt_add_json_while_an_edited_copy_waits_lists_the_link(
+    run, activated_as_copy, dirs
+):
+    (activated_as_copy / "SKILL.md").write_text("edited by hand\n")
+    foreign = drop_skill(dirs["claude-code"], "foreign")
+
+    data = json.loads(ok(run("adopt", "--add", "foreign", "--json")).stdout)
+
+    assert [r["name"] for r in data["resolved"]] == ["foreign"]
+    assert data["linked"] == [str(foreign)]
+    assert [u["name"] for u in data["unknown"]] == ["tdd"]
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_adopt_failing_part_way_reports_what_was_already_done(
+    run, activated, respec_home, dirs, as_json
+):
+    first = drop_skill(dirs["claude-code"], "a-first", "first\n")
+    (dirs["claude-code"] / "b-loose").write_text("loose\n")
+
+    args = ["adopt", "--remove", "a-first", "--add", "b-loose"]
+    result = run(*args, *(["--json"] if as_json else []))
 
     assert result.exit_code == 1
-    assert str(foreign) in result.output and "respec adopt" in result.output
-    assert (respec_home / "profiles" / "a" / "profile.yaml").read_text() == before
-    assert sorted(p.name for p in dirs["claude-code"].iterdir()) == [
-        "foreign",
-        "lint",
-        "tdd",
-    ]
-    assert active_profile(respec_home) == "a"
+    assert not os.path.lexists(first)
+    [backup] = [p for p in (respec_home / "backups").rglob("a-first") if p.is_dir()]
+    if as_json:
+        data = json.loads(result.stdout)
+        [done] = data["resolved"]
+        assert done["name"] == "a-first" and done["backup"] == str(backup)
+        assert "not a folder" in data["error"]
+    else:
+        assert f"Backed up {first} to {backup} and removed it" in result.stdout
+        assert "not a folder" in result.output
+    assert (dirs["claude-code"] / "b-loose").read_text() == "loose\n"
 
-    ok(run("adopt", "--keep", "foreign"))
-    ok(run(*command))
-    assert (foreign / "SKILL.md").read_text() == "foreign\n"
+
+@pytest.fixture
+def takeover_with_clash(run, activated, respec_home, dirs, monkeypatch):
+    """a (claude-code, tdd) is active; c also targets agents, which holds an
+    entry ``aa`` and an entry ``tdd`` that clashes with a's own tdd."""
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    make_profile(respec_home, "c", ["claude-code", "agents"], ["lint"])
+    aa = drop_skill(dirs["agents"], "aa", "aa\n")
+    drop_skill(dirs["agents"], "tdd", "other tdd\n")
+    return aa
+
+
+def test_failed_takeover_choice_still_reports_the_switch_and_what_was_done(
+    run, takeover_with_clash, respec_home, dirs
+):
+    aa = takeover_with_clash
+
+    result = run("use", "c", input="remove\nadd\n")
+
+    assert result.exit_code == 1
+    assert active_profile(respec_home) == "c"
+    assert "Switched to profile 'c'" in result.stdout
+    assert "Backed up agents folder to" in result.stdout
+    line = next(
+        x for x in result.stdout.splitlines() if x.startswith(f"Backed up {aa}")
+    )
+    backup = line.removeprefix(f"Backed up {aa} to ").removesuffix(" and removed it")
+    assert open(os.path.join(backup, "SKILL.md")).read() == "aa\n"
+    assert not os.path.lexists(aa)
+    assert "already has a skill 'tdd'" in result.output
+    assert str(dirs["agents"] / "tdd") in result.stderr
+    assert "respec adopt" in result.stderr
+
+
+def test_interrupted_takeover_prompt_reports_and_leaves_the_rest_unknown(
+    run, takeover_with_clash, respec_home, dirs
+):
+    aa = takeover_with_clash
+
+    result = run("use", "c", input="remove\n")  # then the input ends
+
+    assert result.exit_code == 0, result.output
+    assert active_profile(respec_home) == "c"
+    assert "Switched to profile 'c'" in result.stdout
+    assert f"Backed up {aa} to " in result.stdout
+    assert (dirs["agents"] / "tdd" / "SKILL.md").read_text() == "other tdd\n"
+    assert "interrupted" in result.stderr.lower()
+    assert str(dirs["agents"] / "tdd") in result.stderr
+    assert "respec adopt" in result.stderr
+
+
+def test_overwriting_add_backs_up_the_profile_previous_copy(
+    run, activated_as_copy, respec_home
+):
+    (activated_as_copy / "SKILL.md").write_text("edited by hand\n")
+
+    data = json.loads(ok(run("adopt", "--add", "tdd", "--json")).stdout)
+
+    [resolved] = data["resolved"]
+    saved = resolved["replaced_copy"]
+    assert open(os.path.join(saved, "SKILL.md")).read() == "# tdd from a\n"
+
+
+def test_failed_link_after_an_overwriting_add_puts_both_copies_back(
+    run, activated_as_copy, respec_home, monkeypatch
+):
+    from respec import switch
+
+    (activated_as_copy / "SKILL.md").write_text("edited by hand\n")
+    yaml_file = respec_home / "profiles" / "a" / "profile.yaml"
+    yaml_before = yaml_file.read_bytes()
+
+    def refuse(*args, **kwargs):
+        raise switch.SwitchBlocked("linking refused for the test")
+
+    monkeypatch.setattr(switch, "link_skills", refuse)
+
+    result = run("adopt", "--add", "tdd")
+
+    assert result.exit_code == 1
+    assert "refused for the test" in result.output
+    assert (activated_as_copy / "SKILL.md").read_text() == "edited by hand\n"
+    profile_copy = respec_home / "profiles" / "a" / "skills" / "tdd" / "SKILL.md"
+    assert profile_copy.read_text() == "# tdd from a\n"
+    assert yaml_file.read_bytes() == yaml_before

@@ -767,7 +767,27 @@ def test_check_sees_added_folders_and_symlinks_as_local_edits(
 # --- unknown entries (ticket 004) and symlinks ------------------------------
 
 
-def test_add_from_git_into_active_profile_is_blocked_by_unknown_entries(
+def test_add_from_git_into_active_profile_is_blocked_by_an_entry_in_the_way(
+    run, upstream, profiles_root, claude_dir
+):
+    repo = upstream("acme/tdd")
+    repo.write("SKILL.md", "# tdd\n")
+    repo.commit()
+    new_profile(run)
+    ok(run("use", "work"))
+    (claude_dir / "tdd").mkdir(parents=True)
+    (claude_dir / "tdd" / "SKILL.md").write_text("# not respec\n")
+
+    result = fails(run("add", "acme/tdd"))
+
+    assert str(claude_dir / "tdd") in result.output
+    assert "respec adopt" in result.output
+    assert read_yaml(profiles_root, "work")["skills"] == {}
+    assert not (profiles_root / "work" / "skills" / "tdd").exists()
+    assert (claude_dir / "tdd" / "SKILL.md").read_text() == "# not respec\n"
+
+
+def test_add_from_git_warns_about_unknown_entries_elsewhere(
     run, upstream, profiles_root, claude_dir
 ):
     repo = upstream("acme/tdd")
@@ -776,28 +796,25 @@ def test_add_from_git_into_active_profile_is_blocked_by_unknown_entries(
     new_profile(run)
     ok(run("use", "work"))
     (claude_dir / "stranger").mkdir(parents=True)
-    (claude_dir / "stranger" / "SKILL.md").write_text("# not respec\n")
 
-    result = fails(run("add", "acme/tdd"))
+    result = ok(run("add", "acme/tdd"))
 
-    assert "stranger" in result.output
-    assert read_yaml(profiles_root, "work")["skills"] == {}
-    assert not (profiles_root / "work" / "skills" / "tdd").exists()
-    assert not (claude_dir / "tdd").exists()
-    assert (claude_dir / "stranger" / "SKILL.md").read_text() == "# not respec\n"
+    assert str(claude_dir / "stranger") in result.stderr
+    assert (claude_dir / "tdd").is_symlink()
 
 
-def test_update_of_active_profile_is_blocked_by_unknown_entries(
+def test_update_of_active_profile_is_blocked_by_a_replaced_link(
     run, sourced, profiles_root, claude_dir
 ):
     ok(run("use", "work"))
     sourced.write("tdd/SKILL.md", "# tdd v2\n")
     sourced.commit()
-    (claude_dir / "stranger").mkdir()
+    (claude_dir / "lint").unlink()
+    (claude_dir / "lint").mkdir()
 
     result = fails(run("update", "tdd", "--yes"))
 
-    assert "stranger" in result.output
+    assert str(claude_dir / "lint") in result.output
     skills = profiles_root / "work" / "skills"
     assert (skills / "tdd" / "SKILL.md").read_text() == "# tdd v1\n"
     assert sorted(p.name for p in skills.iterdir()) == ["lint", "mine", "tdd"]
