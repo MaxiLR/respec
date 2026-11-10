@@ -1620,3 +1620,207 @@ def test_profile_install_interrupted_at_every_step(
         else:
             profile = profiles.load_profile(respec_home, "modpack")
             assert set(profile.skills) == {"tdd", "house"}
+
+
+# --- review 1: rollback only what the interrupted run made ------------------------
+
+
+def _unlisted_folder(respec_home):
+    folder = respec_home / "profiles" / "work" / "skills" / "up"
+    folder.mkdir(parents=True)
+    (folder / "SKILL.md").write_text("hand-placed, not listed\n")
+    return folder
+
+
+@pytest.fixture
+def up_repo(upstream):
+    repo = upstream("acme/skills")
+    repo.write("skills/up/SKILL.md", "# up v1\n")
+    repo.first = repo.commit()
+    return repo
+
+
+def test_interrupted_add_never_deletes_a_folder_it_did_not_create(
+    run, up_repo, isolated_homes, monkeypatch
+):
+    from respec import journal, sources
+
+    respec_home = isolated_homes.respec_home
+    new_profile(run)
+    folder = _unlisted_folder(respec_home)
+    _crash(
+        monkeypatch,
+        1 + 1,  # add:begin, then phase:copy
+        lambda: sources.add(respec_home, isolated_homes.home, "acme/skills", "work"),
+    )
+    assert journal.pending(respec_home) is not None
+
+    warning = _recovered(run)
+
+    assert warning["outcome"] == "rolled-back"
+    assert (folder / "SKILL.md").read_text() == "hand-placed, not listed\n"
+    assert read_yaml(respec_home / "profiles", "work")["skills"] == {}
+
+
+def test_killed_add_never_deletes_a_folder_it_did_not_create(
+    run, killed, up_repo, isolated_homes
+):
+    respec_home = isolated_homes.respec_home
+    new_profile(run)
+    folder = _unlisted_folder(respec_home)
+    assert killed("phase:copy", 1, "add", "acme/skills", "-p", "work")
+
+    warning = _recovered(run)
+
+    assert warning["outcome"] == "rolled-back"
+    assert (folder / "SKILL.md").read_text() == "hand-placed, not listed\n"
+
+
+@pytest.fixture
+def edited_with_stale_old(run, upstream, isolated_homes):
+    """'work' has sourced 'up' with local edits, an unrelated stale '.up.old'
+    and a newer upstream commit."""
+    repo = upstream("acme/skills")
+    repo.write("skills/up/SKILL.md", "# up v1\n")
+    repo.first = repo.commit()
+    new_profile(run)
+    ok(run("add", "acme/skills#skills/up", "-p", "work"))
+    repo.write("skills/up/SKILL.md", "# up v2\n")
+    repo.second = repo.commit()
+    skills = isolated_homes.respec_home / "profiles" / "work" / "skills"
+    (skills / "up" / "SKILL.md").write_text("USER-EDIT\n")
+    (skills / ".up.old").mkdir()
+    (skills / ".up.old" / "SKILL.md").write_text("stale\n")
+    return skills
+
+
+def test_interrupted_update_never_restores_a_stale_old_copy(
+    run, edited_with_stale_old, isolated_homes, monkeypatch
+):
+    from respec import sources
+
+    skills = edited_with_stale_old
+    _crash(
+        monkeypatch,
+        1,  # update:begin
+        lambda: sources.update(isolated_homes.respec_home, isolated_homes.home, "work"),
+    )
+
+    _recovered(run)
+
+    assert (skills / "up" / "SKILL.md").read_text() == "USER-EDIT\n"
+    assert (skills / ".up.old" / "SKILL.md").read_text() == "stale\n"
+
+
+def test_killed_update_never_restores_a_stale_old_copy(
+    run, killed, edited_with_stale_old, isolated_homes
+):
+    skills = edited_with_stale_old
+    assert killed("update:begin", 1, "update", "-p", "work")
+
+    warning = _recovered(run)
+
+    assert (skills / "up" / "SKILL.md").read_text() == "USER-EDIT\n"
+    assert (skills / ".up.old" / "SKILL.md").read_text() == "stale\n"
+    assert str(skills / ".up.old") in warning["message"]
+
+
+def test_update_killed_after_saving_profile_yaml_is_finished_consistently(
+    run, killed, upstream, isolated_homes
+):
+    respec_home = isolated_homes.respec_home
+    repo = upstream("acme/skills")
+    repo.write("skills/up/SKILL.md", "# up v1\n")
+    first = repo.commit()
+    new_profile(run)
+    ok(run("add", "acme/skills#skills/up", "-p", "work"))
+    ok(run("use", "work"))
+    repo.write("skills/up/SKILL.md", "# up v2\n")
+    second = repo.commit()
+    assert killed("after-save-profile", 1, "update", "-p", "work")
+
+    warning = _recovered(run)
+
+    commit = read_yaml(respec_home / "profiles", "work")["skills"]["up"]["source"]
+    text = respec_home / "profiles" / "work" / "skills" / "up" / "SKILL.md"
+    expected = {first: "# up v1\n", second: "# up v2\n"}
+    assert text.read_text() == expected[commit["commit"]]
+    assert warning["outcome"] == (
+        "finished" if commit["commit"] == second else "rolled-back"
+    )
+    assert warning["outcome"] == "finished"
+    assert not list((respec_home / "profiles" / "work" / "skills").glob(".up.*"))
+    linked = isolated_homes.home / ".claude" / "skills" / "up"
+    assert (linked / "SKILL.md").read_text() == "# up v2\n"
+
+
+def test_update_killed_at_every_step_is_consistent(
+    run, killed, upstream, tmp_path, monkeypatch
+):
+    """Real SIGKILLs: no finally block or handler runs in the killed process."""
+    repo = upstream("acme/skills")
+    repo.write("skills/up/SKILL.md", "# up v1\n")
+    first = repo.commit()
+
+    seen = set()
+    first_yaml = ""  # profile.yaml as the first run added 'up' (at v1)
+    index = 0
+    while True:
+        index += 1
+        home, respec_home = _fresh(tmp_path, monkeypatch, f"kill-update-{index}")
+        new_profile(run)
+        ok(run("add", "acme/skills#skills/up", "-p", "work"))
+        if index == 1:
+            repo.write("skills/up/SKILL.md", "# up v2\n")
+            second = repo.commit()
+        else:  # pin 'up' back to v1, as the first run added it
+            path = respec_home / "profiles" / "work" / "profile.yaml"
+            path.write_text(first_yaml)
+            folder = respec_home / "profiles" / "work" / "skills" / "up"
+            (folder / "SKILL.md").write_text("# up v1\n")
+        first_yaml = (respec_home / "profiles" / "work" / "profile.yaml").read_text()
+        ok(run("use", "work"))
+        if not killed("#", index, "update", "-p", "work"):
+            break
+        warning = _recovered(run)
+        seen.add(warning["outcome"])
+        skills = respec_home / "profiles" / "work" / "skills"
+        assert sorted(p.name for p in skills.iterdir()) == ["up"], index
+        source = read_yaml(respec_home / "profiles", "work")["skills"]["up"]["source"]
+        text = (skills / "up" / "SKILL.md").read_text()
+        assert text == {first: "# up v1\n", second: "# up v2\n"}[source["commit"]]
+        assert warning["outcome"] == (
+            "finished" if source["commit"] == second else "rolled-back"
+        ), index
+        linked = home / ".claude" / "skills" / "up"
+        assert (linked / "SKILL.md").read_text() == text, index
+        # A later update brings it to v2 or says it is there already.
+        ok(run("update", "-p", "work"))
+        assert (skills / "up" / "SKILL.md").read_text() == "# up v2\n", index
+    assert index > 5 and seen == {"finished", "rolled-back"}
+
+
+def test_add_from_git_killed_at_every_step_keeps_a_hand_placed_folder(
+    run, killed, upstream, tmp_path, monkeypatch
+):
+    repo = upstream("acme/skills")
+    repo.write("skills/tdd/SKILL.md", "# tdd\n")
+    repo.write("skills/up/SKILL.md", "# up\n")
+    repo.commit()
+
+    index = 0
+    while True:
+        index += 1
+        home, respec_home = _fresh(tmp_path, monkeypatch, f"kill-add-{index}")
+        new_profile(run)
+        ok(run("use", "work"))
+        mine = _unlisted_folder(respec_home)
+        if not killed("#", index, "add", "acme/skills", "-p", "work"):
+            break
+        json.loads(ok(run("recover", "--json")).stdout)
+        assert (mine / "SKILL.md").read_text() == "hand-placed, not listed\n", index
+        listed = set(read_yaml(respec_home / "profiles", "work")["skills"])
+        assert listed <= {"tdd"}, index
+        skills = respec_home / "profiles" / "work" / "skills"
+        assert {p.name for p in skills.iterdir()} == listed | {"up"}, index
+    assert index > 2

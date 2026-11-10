@@ -135,33 +135,54 @@ part way can be run again to finish.
 
 ### Interrupted changes
 
-Every change of several steps (a switch or refresh, a restore, adopt, a layer
+Every change of several steps is recorded in a journal in `state.json` before
+it changes anything, together with the one step in flight: a switch or
+refresh (also an edit of the active profile), a restore, adopt, a layer
 repair, linking outside a switch, `update`, `add` from git and `profile
-install`) is recorded in a journal in `state.json` before it changes anything,
-together with the one step in flight. If respec is killed or crashes part way,
-the journal stays behind:
+install`. If respec is killed or crashes part way, the journal stays behind:
 
 - `respec status` (and every other command that only reads) reports it.
 - The next command that changes skills first finishes the change or rolls it
-  back, and says which. A switch that had not yet removed any skill is rolled
-  back (the previous profile stays active); one that had is finished, or, if
-  the new profile can no longer be activated, rolled back to the previous one.
-  A restore, adopt or link change is finished. An `update` or git `add` is
-  rolled back until `profile.yaml` was saved and finished after; a half-copied
-  `profile install` is removed.
+  back, and says which (`finished` or `rolled-back`):
+  - A switch that had not yet removed any skill is rolled back (the previous
+    profile stays active). One that had is finished, or, if the new profile
+    can no longer be activated, rolled back to the previous one.
+  - A restore is finished.
+  - An adopt keeps every choice it completed; the entry in flight is finished
+    once its copy was whole and otherwise left as it was (then it reports
+    `rolled-back`).
+  - An edit of the active profile or a layer repair is finished when
+    `profile.yaml` was already saved, and rolled back when it was not; the
+    links then match `profile.yaml` either way.
+  - An `update` or git `add` is rolled back until `profile.yaml` records the
+    new skills and finished after. A rollback only touches what that run
+    made: the skills it swapped (when the folders are still the ones it
+    recorded) and the skill folders it created. A folder that was there before
+    is never removed.
+  - A half-copied `profile install` is removed.
 - `respec recover` does the same on its own; `respec recover --rollback`
   undoes the change instead where that is still possible (a switch activates
-  the previous profile again; a restore that already removed skills can only
-  be finished).
+  the previous profile again; a restore that already removed skills, and the
+  choices adopt completed, cannot be undone). A journal respec does not
+  recognise is only dropped by `respec recover --rollback`.
+- While a restore waits, `respec restore` finishes that same restore and
+  refuses another backup.
 - In the TUI, Sync shows the interrupted change with Finish and Roll back;
   until it is resolved, Sync offers nothing else and the TUI refuses every
   change to skill folders.
 
-Nothing is lost on the way: an entry a step left half made (a copy cut short)
-is moved to a fresh backup run and reported under `set_aside`, unless it is
-verifiably what that step was making, in which case it is recorded. Staging
-folders of an interrupted adopt are kept when they may hold the only copy of
-something.
+Nothing is lost on the way: an entry a step left half made (a copy cut short,
+or a staging folder of an adopt overwrite) is moved to a fresh backup run and
+reported under `set_aside`, unless it is verifiably what that step was making,
+in which case it is recorded. A `.<skill>.old` folder that no journaled
+`update` made is never used to replace a skill: it is kept, reported, and
+`update` refuses that skill until it is moved out of the way. `state.json` and
+`profile.yaml` are written to a temporary file, flushed to disk and renamed.
+
+Known limit: `respec remove` deletes the skill folder after the profile is
+refreshed. If it is interrupted at that point, the folder stays in the profile
+without being listed in `profile.yaml`, and `respec add` of the same name
+refuses until it is moved away (its content is kept).
 
 ### TUI
 

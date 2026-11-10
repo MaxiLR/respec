@@ -527,7 +527,7 @@ def _add(
             )
         added: list[str] = []
         sources: dict[str, dict[str, str]] = {}
-        journal.set_phase(respec_home, "copy", skills=[item for item, _ in found])
+        journal.set_phase(respec_home, "copy")
         try:
             with tempfile.TemporaryDirectory(prefix="respec-stage-") as staging:
                 for item, path in found:
@@ -540,6 +540,11 @@ def _add(
                         commit=commit,
                         digest=fetched_digest(staged),
                     )
+                    folder = before.path / profiles.SKILLS_DIR / item
+                    if not os.path.lexists(folder):
+                        # Only folders this run makes are removed on rollback;
+                        # add_local refuses one that is already there.
+                        journal.note(respec_home, "created", item)
                     items.add_local(respec_home, name, staged, origin=source)
                     journal.checkpoint("added")
                     added.append(item)
@@ -667,7 +672,8 @@ def update(
         respec_home,
         "update",
         profile=profile.name,
-        skills=list(_sourced(profile, item)),
+        # Whether profile.yaml was saved yet: recovery compares against this.
+        profile_digest=journal.file_digest(profile.path / profiles.PROFILE_FILE),
         phase="copy",
     ):
         return _update(respec_home, user_home, profile, item, overwrite_edits)
@@ -706,7 +712,7 @@ def _update(
                 row["result"] = "skipped-local-edits"
                 continue
             try:
-                new_source = _replace(profile, name, source, replaced)
+                new_source = _replace(respec_home, profile, name, source, replaced)
             except GitCancelled:
                 raise
             except (RespecError, OSError, shutil.Error) as error:
@@ -717,6 +723,7 @@ def _update(
         if not replaced:
             return result
         profiles.save_profile(dataclasses.replace(profile, skills=skills))
+        journal.checkpoint("profile-saved")
         journal.set_phase(respec_home, "refresh")
     except BaseException:
         _restore(profile, replaced)
@@ -735,6 +742,7 @@ def _update(
 
 
 def _replace(
+    respec_home: Path,
     profile: profiles.Profile,
     item: str,
     source: profiles.Source,
@@ -745,10 +753,19 @@ def _replace(
     live = skills_dir / item
     incoming = skills_dir / f".{item}.incoming"
     old = skills_dir / f".{item}.old"
-    if os.path.lexists(old) and not os.path.lexists(live):
-        os.replace(old, live)  # an interrupted swap; the old folder is the copy
-    for leftover in (incoming, old):
-        shutil.rmtree(leftover, ignore_errors=True)
+    if os.path.lexists(old):
+        # Not this run's: the next respec command settles its own leftovers
+        # first (respec.journal), so this may hold the only copy of something.
+        raise RespecError(
+            f"{old} is left from an interrupted change and may hold the only "
+            "copy of earlier content; move it out of the way first. "
+            f"{item!r} was not updated."
+        )
+    shutil.rmtree(incoming, ignore_errors=True)  # fetched files only
+    # Journaled before anything is made, with the identity of the live folder,
+    # so recovery puts back only what this run moved (see respec.journal).
+    swap = {"skill": item, "live": trees.digest(live)}
+    journal.note(respec_home, "swaps", swap)
     with checkout(repo_url(source.repo), source.ref, source.repo) as (tree, commit):
         upstream = inside(tree, source.path)
         if not (upstream / items.SKILL_FILE).is_file():
@@ -757,7 +774,9 @@ def _replace(
                 f"in {source.path or 'its root'}"
             )
         copy_fetched(tree, upstream, incoming)
-    journal.checkpoint("fetched")
+    journal.note(
+        respec_home, "fetched", {"skill": item, "digest": trees.digest(incoming)}
+    )
     os.replace(live, old)
     journal.checkpoint("swapped-out")
     try:

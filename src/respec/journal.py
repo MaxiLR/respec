@@ -35,15 +35,23 @@ How each operation is recovered, after the step in flight is settled:
   active. ``--rollback`` activates the previous profile instead.
 - ``restore``: finished (entries in the way are backed up first). It can only
   be rolled back before it removed any skill.
-- ``adopt`` and ``links``: the choices and links already made stay; the
-  links of the active profile are put in line with its ``profile.yaml``.
-  Staging folders of an interrupted overwrite are settled by
-  :func:`respec.adopt._clean_leftovers`, which keeps any that may hold the
-  only copy of something.
-- ``update`` and ``add``: rolled back in ``copy`` (the previous skill folders
-  come back, fetched ones go), finished in ``refresh``.
+- ``adopt`` and ``links``: what was done stays; the step in flight is
+  finished when its copy was whole, otherwise undone (``rolled-back``), and a
+  link change whose ``profile.yaml`` was not saved yet (``profile_digest``
+  unchanged) is reported rolled back. The links of the active profile are then
+  put in line with its ``profile.yaml``. Staging folders are settled by
+  :func:`respec.adopt._clean_leftovers` (fix-6); those of the overwrite in
+  flight that it keeps are set aside.
+- ``update``: rolled back until ``profile.yaml`` differs from the digest taken
+  at the start, finished after. Only the skills journaled under ``swaps`` are
+  touched, and only while their ``.old`` folder still has the recorded digest;
+  any other ``.old`` folder is kept and reported.
+- ``add``: rolled back in ``copy`` (only the skill folders journaled under
+  ``created``, which did not exist before, are removed), finished in
+  ``refresh``.
 - ``install``: kept when its ``profile.yaml`` was written (the last step),
   otherwise the half-copied profile folder is removed (fetched content only).
+- An unknown ``operation`` is only discarded by ``recover(rollback=True)``.
 
 Tests inject failures at every step boundary through :func:`checkpoint`.
 """
@@ -397,6 +405,30 @@ def set_phase(
     checkpoint(f"phase:{phase}")
 
 
+def note(respec_home: Path, key: str, value: Any) -> None:
+    """Append ``value`` to the list ``key`` of the outermost change and save,
+    before the step it describes runs (for example a folder about to be made,
+    so recovery removes only what this run made)."""
+    if _depth() != 1:
+        return
+    target = _journal_of(respec_home, None)
+    if target is None or target.journal is None:
+        return
+    target.journal.setdefault(key, []).append(value)
+    save_state(respec_home, target)
+    checkpoint(f"note:{key}")
+
+
+def file_digest(path: Path) -> str | None:
+    """Fingerprint of one file's bytes, None when it is missing."""
+    import hashlib
+
+    try:
+        return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+
+
 # --- recovering ----------------------------------------------------------------
 
 
@@ -487,7 +519,7 @@ def _settle_pending(
         if os.path.lexists(path) and not trees.same_entry(path, Path(step["source"])):
             aside(path, step["target"])  # a backup entry copied only in part
     elif kind == "adopt" and path is not None:
-        notes += _settle_adopt(respec_home, state, step, path)
+        notes += _settle_adopt(respec_home, state, step, path, aside)
     if state.journal is not None:
         state.journal.pop("pending", None)
     save_state(respec_home, state)
@@ -499,10 +531,12 @@ def _settle_adopt(
     state: State,
     step: dict[str, Any],
     original: Path,
+    aside: _Aside,
 ) -> list[str]:
     """An add or remove of an unknown entry: its original is only deleted once
     its copy (in a backup or the profile) is complete, so finish that delete,
-    or drop a copy that was cut short (the original is still whole)."""
+    or drop a copy that was cut short (the original is still whole). Sets
+    ``_local.undone`` when the entry was left as it was."""
     from respec import adopt, profiles
 
     notes: list[str] = []
@@ -512,24 +546,38 @@ def _settle_adopt(
         if stage == "copy":
             if os.path.lexists(backup):
                 _delete(backup)
+            _local.undone = True
             return notes
     else:
         profile = profiles.load_profile(respec_home, step["profile"])
         live = profile.path / profiles.SKILLS_DIR / step["name"]
         if stage == "copy":
             if step.get("overwrite"):
+                # An overwrite starts only when no staging folder of this skill
+                # exists, so the ones left now are this step's: settled by the
+                # fix-6 rules, and whatever those keep goes to a backup run
+                # (never deleted), so a retry is not blocked.
+                ours = {
+                    f".{step['name']}{adopt.STAGED}",
+                    f".{step['name']}{adopt.RETIRED}",
+                }
                 for kept in adopt._clean_leftovers(respec_home, profile):
-                    notes.append(
-                        f"left {kept} in place: it is from an interrupted change "
-                        "and may hold the only copy of earlier content"
-                    )
+                    if Path(kept).name in ours:
+                        aside(Path(kept), f"profiles/{profile.name}")
+                    else:
+                        notes.append(
+                            f"left {kept} in place: it is from an interrupted "
+                            "change and may hold the only copy of earlier content"
+                        )
                 if not (
                     os.path.lexists(original) and trees.same_content(live, original)
                 ):
+                    _local.undone = True
                     return notes  # the profile keeps its previous copy
             elif step["name"] not in profile.skills:
                 if os.path.lexists(live):
                     _delete(live)  # a copy cut short; the original is whole
+                _local.undone = True
                 return notes
     if os.path.lexists(original):
         _delete(original)
@@ -551,7 +599,30 @@ def recover(
         return None
     what = describe(journal)
     aside = _Aside(respec_home)
+    _local.aside = aside
+    _local.undone = False
     _local.recovering = True
+    if str(journal.get("operation")) not in _HANDLERS:
+        _local.recovering = False
+        if not rollback:
+            raise RespecError(
+                f"could not recover {what}: respec does not know this kind of "
+                "change. 'respec recover --rollback' discards the journal; the "
+                "records in state.json are kept as they are, and Sync checks "
+                "the folders."
+            )
+        _clear(respec_home)
+        report = Recovery(
+            operation=str(journal.get("operation")),
+            outcome=ROLLED_BACK,
+            message=(
+                f"Discarded the journal of {what}, which respec does not know; "
+                "the records in state.json are kept. Run Sync (or 'respec "
+                "status') to check the folders."
+            ),
+        )
+        _policy.reports.append(report)
+        return report
     try:
         notes = _settle_pending(respec_home, journal, aside)
         journal = load_state(respec_home).journal or journal
@@ -560,11 +631,15 @@ def recover(
             # A refresh inside this change was cut short: activate its profile
             # again first, so the change below finds it active.
             _recover_use(respec_home, user_home, {"operation": "use", **inner}, False)
-        handler = _HANDLERS.get(str(journal.get("operation")))
-        if handler is None:
-            raise RespecError(f"unknown operation {journal.get('operation')!r}")
+        handler = _HANDLERS[str(journal.get("operation"))]
         outcome, message = handler(respec_home, user_home, journal, rollback)
         _clear(respec_home)
+    except (KeyError, TypeError, ValueError) as error:
+        raise RespecError(
+            f"could not recover {what}: its journal in state.json is malformed "
+            f"({error!r}). It stays recorded; fix it, or remove the journal "
+            "entry from state.json by hand and run Sync."
+        ) from None
     except RespecError as error:
         raise RespecError(
             f"could not recover {what}: {error}\nIt stays recorded in "
@@ -622,6 +697,13 @@ def _recover_use(
     previous = journal.get("previous")
     what = describe(journal)
     if journal.get("phase") != "apply":
+        from respec import global_skills
+
+        try:
+            # A refresh of respec's own skills may have been cut short.
+            global_skills.refresh_shipped(respec_home)
+        except RespecError:
+            pass  # reported by the next switch
         stays = f"profile {previous!r}" if previous else "no profile"
         return ROLLED_BACK, (
             f"Rolled back {what}: it had not changed any skill yet, so {stays} "
@@ -683,10 +765,14 @@ def _recover_restore(
 def _recover_links(
     respec_home: Path, user_home: Path, journal: dict[str, Any], rollback: bool
 ) -> tuple[str, str]:
-    from respec import adopt, profiles, switch
+    """adopt and link changes: what was done stays (they cannot be undone),
+    the step in flight was finished or undone (``_local.undone``), and the
+    active profile's links are put in line with its ``profile.yaml``."""
+    from respec import adopt, profiles
 
     notes: list[str] = []
     name = journal.get("profile")
+    profile = None
     if name is not None and name in profiles.list_profile_names(respec_home):
         try:
             profile = profiles.load_profile(respec_home, name)
@@ -694,14 +780,38 @@ def _recover_links(
             profile = None
         if profile is not None:
             notes = [
-                f"\n  left {kept} in place: it is from an interrupted change and "
-                "may hold the only copy of earlier content"
+                f"left {kept} in place: it is from an interrupted change and may "
+                "hold the only copy of earlier content"
                 for kept in adopt._clean_leftovers(respec_home, profile)
             ]
-    switch.align_links(respec_home, user_home)
+    unchanged = (
+        profile is not None
+        and "profile_digest" in journal
+        and journal["profile_digest"]
+        == file_digest(profile.path / profiles.PROFILE_FILE)
+    )
+    if name is not None:
+        _reapply(respec_home, user_home, name)
+    if rollback:
+        notes.append("it cannot be undone, so it was settled instead")
+    tail = "".join(f"\n  {note}" for note in notes)
+    what = describe(journal)
+    if journal.get("operation") == "adopt":
+        if getattr(_local, "undone", False):
+            return ROLLED_BACK, (
+                f"Rolled back the step in flight of {what}: that entry is as it "
+                "was and still waits for a choice; choices completed before it "
+                "stay." + tail
+            )
+        return FINISHED, f"Finished {what}: every choice made stays." + tail
+    if unchanged:
+        return ROLLED_BACK, (
+            f"Rolled back {what}: profile.yaml had not been changed yet, and the "
+            "links match it." + tail
+        )
     return FINISHED, (
-        f"Finished {describe(journal)}: the choices made stay, and the links "
-        "of the active profile match its profile.yaml." + "".join(notes)
+        f"Finished {what}: the links of the active profile match its "
+        "profile.yaml." + tail
     )
 
 
@@ -716,41 +826,79 @@ def _reapply(respec_home: Path, user_home: Path, name: str) -> None:
         switch.align_links(respec_home, user_home)
 
 
+def _old_leftovers(skills_dir: Path) -> list[str]:
+    """Notes for the ``.<skill>.old`` folders left once this run's own are
+    settled: they are kept, as they may hold the only copy of something."""
+    return [
+        f"left {old} in place: it is not from this update and may hold the "
+        "only copy of earlier content"
+        for old in sorted(skills_dir.glob(".*.old"))
+    ]
+
+
 def _recover_update(
     respec_home: Path, user_home: Path, journal: dict[str, Any], rollback: bool
 ) -> tuple[str, str]:
+    """Act only on the skills this run journaled as swapped, and only when the
+    folders are still the ones it recorded. Once ``profile.yaml`` holds the new
+    commits (it differs from the digest taken at the start) the update is
+    finished; before that it is rolled back."""
     from respec import profiles
 
     name = journal["profile"]
     profile = profiles.load_profile(respec_home, name)
     skills_dir = profile.path / profiles.SKILLS_DIR
-    if journal.get("phase") != "refresh":
-        for skill in journal.get("skills", []):
-            live = skills_dir / skill
-            old = skills_dir / f".{skill}.old"
-            incoming = skills_dir / f".{skill}.incoming"
-            if old.is_dir() and not old.is_symlink():
-                if os.path.lexists(live):
+    yaml_file = profile.path / profiles.PROFILE_FILE
+    committed = journal.get("phase") == "refresh" or (
+        "profile_digest" in journal
+        and journal["profile_digest"] != file_digest(yaml_file)
+    )
+    swaps = {swap["skill"]: swap["live"] for swap in journal.get("swaps", [])}
+    fetched = {entry["skill"]: entry["digest"] for entry in journal.get("fetched", [])}
+    aside = _local.aside
+    notes: list[str] = []
+    for skill, before in swaps.items():
+        live = skills_dir / skill
+        old = skills_dir / f".{skill}.old"
+        incoming = skills_dir / f".{skill}.incoming"
+        ours = old.is_dir() and not old.is_symlink() and _digest_or_none(old) == before
+        if ours and committed:
+            _delete(old)  # the previous files; profile.yaml records the new
+        elif ours:
+            if os.path.lexists(live):
+                if fetched.get(skill) and _digest_or_none(live) == fetched[skill]:
                     _delete(live)  # fetched upstream files; fetched again later
-                os.replace(old, live)
-            if os.path.lexists(incoming):
-                _delete(incoming)
-        _reapply(respec_home, user_home, name)
-        return ROLLED_BACK, (
-            f"Rolled back {describe(journal)}: its skills are as they were "
-            "before; run 'respec update' again."
-        )
-    for skill in journal.get("skills", []):
-        for leftover in (f".{skill}.old", f".{skill}.incoming"):
-            if os.path.lexists(skills_dir / leftover):
-                _delete(skills_dir / leftover)
+                else:
+                    aside(live, f"profiles/{name}")
+            os.replace(old, live)
+        if os.path.lexists(incoming):
+            _delete(incoming)  # fetched by this run (an older one was removed)
+    notes += _old_leftovers(skills_dir)
     _reapply(respec_home, user_home, name)
-    return FINISHED, f"Finished {describe(journal)}."
+    tail = "".join(f"\n  {note}" for note in notes)
+    if committed:
+        return FINISHED, (
+            f"Finished {describe(journal)}: profile.yaml already recorded the "
+            "new commits." + tail
+        )
+    return ROLLED_BACK, (
+        f"Rolled back {describe(journal)}: its skills are as they were before; "
+        "run 'respec update' again." + tail
+    )
+
+
+def _digest_or_none(path: Path) -> str | None:
+    try:
+        return trees.digest(path)
+    except OSError:
+        return None
 
 
 def _recover_add(
     respec_home: Path, user_home: Path, journal: dict[str, Any], rollback: bool
 ) -> tuple[str, str]:
+    """Roll back only the skill folders this run journaled as made by it; a
+    folder that was there before is never touched."""
     import dataclasses
 
     from respec import profiles
@@ -760,14 +908,14 @@ def _recover_add(
         _reapply(respec_home, user_home, name)
         return FINISHED, f"Finished {describe(journal)}."
     profile = profiles.load_profile(respec_home, name)
-    added = set(journal.get("skills", []))
-    skills = {k: v for k, v in profile.skills.items() if k not in added}
+    created = set(journal.get("created", []))
+    skills = {k: v for k, v in profile.skills.items() if k not in created}
     if skills != profile.skills:
         profiles.save_profile(dataclasses.replace(profile, skills=skills))
-    for skill in added:
+    for skill in sorted(created):
         folder = profile.path / profiles.SKILLS_DIR / skill
         if os.path.lexists(folder):
-            _delete(folder)  # fetched from git; nothing of the user's
+            _delete(folder)  # made by this run from git; nothing of the user's
     return ROLLED_BACK, (
         f"Rolled back {describe(journal)}: none of its skills were added; run "
         "'respec add' again."

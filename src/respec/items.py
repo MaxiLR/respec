@@ -10,10 +10,11 @@ so the profile and its target folders never disagree.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import os
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -187,8 +188,33 @@ def commit(
     exact file ``before`` was loaded from. An interrupted change is dealt
     with first (:func:`respec.journal.ready`)."""
     journal.ready(respec_home, user_home)
-    profiles.save_profile(after)
-    _refresh(respec_home, user_home, change, lambda: profiles.restore_profile(before))
+    active = load_state(respec_home).active_profile == after.name
+    with journaled(respec_home, after, active):
+        profiles.save_profile(after)
+        journal.checkpoint("profile-saved")
+        _refresh(
+            respec_home, user_home, change, lambda: profiles.restore_profile(before)
+        )
+
+
+@contextlib.contextmanager
+def journaled(
+    respec_home: Path, profile: profiles.Profile, active: bool
+) -> Iterator[None]:
+    """Journal an edit of the active profile with its refresh, from before
+    ``profile.yaml`` is saved, so a crash in between is put in line by the next
+    command (see :mod:`respec.journal`). Other profiles' edits only write
+    ``profile.yaml``."""
+    if not active:
+        yield
+        return
+    with journal.begin(
+        respec_home,
+        "links",
+        profile=profile.name,
+        profile_digest=journal.file_digest(profile.path / profiles.PROFILE_FILE),
+    ):
+        yield
 
 
 def add(

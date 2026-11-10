@@ -162,5 +162,30 @@ def save_state(respec_home: Path, state: State) -> None:
     path = state_path(respec_home)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{STATE_FILE}.tmp")
-    temporary.write_text(json.dumps(state.to_dict(), indent=2) + "\n", "utf-8")
+    write_durably(temporary, json.dumps(state.to_dict(), indent=2) + "\n")
     os.replace(temporary, path)
+    sync_folder(path.parent)
+
+
+def write_durably(path: Path, text: str) -> None:
+    """Write ``text`` and flush it to disk before returning (``fsync``), so
+    a rename of the file that follows never exposes an empty file after a
+    power loss."""
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def sync_folder(folder: Path) -> None:
+    """Flush a folder's entries (a rename into it) to disk where supported."""
+    try:
+        descriptor = os.open(folder, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)

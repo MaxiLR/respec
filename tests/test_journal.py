@@ -466,7 +466,12 @@ def test_layer_repair_links_interrupted_at_every_step(run, tmp_path, monkeypatch
     def check(home, respec_home, context, index):
         data = payload(run("recover", "--json"))
         (warning,) = interrupted_warnings(data)
-        assert warning["outcome"] == "finished"
+        repaired = "b" not in {
+            n
+            for n, e in profiles.load_profile(respec_home, "work").skills.items()
+            if e.enabled
+        }
+        assert warning["outcome"] == ("finished" if repaired else "rolled-back"), index
         state = load_state(respec_home)
         assert state.journal is None
         claude = home / ".claude" / "skills"
@@ -510,7 +515,7 @@ def test_adopt_interrupted_at_every_step_loses_nothing(run, tmp_path, monkeypatc
     def check(home, respec_home, context, index):
         data = payload(run("recover", "--json"))
         (warning,) = interrupted_warnings(data)
-        assert warning["outcome"] == "finished"
+        assert warning["outcome"] in ("finished", "rolled-back"), index
         state = load_state(respec_home)
         assert state.journal is None
         waiting = unknown.find_unknown(respec_home, state)
@@ -670,3 +675,210 @@ def test_editing_the_profile_being_switched_to_finishes_the_switch_first(
     (warning,) = interrupted_warnings(data)
     assert warning["outcome"] == "finished"
     assert_consistent(respec_home, {"b": ["lint"]}, extra=MINE)
+
+
+# --- review 1 ------------------------------------------------------------------
+
+
+def adopt_setup(run, home, respec_home):
+    make_profile(respec_home, "work", ["claude-code"], ["tdd"])
+    assert run("use", "work").exit_code == 0
+    claude = home / ".claude" / "skills"
+    for name, text in (("newone", "new content\n"), ("junk", "junk content\n")):
+        (claude / name).mkdir()
+        (claude / name / "SKILL.md").write_text(text)
+    (claude / "tdd").unlink()
+    (claude / "tdd").mkdir()
+    (claude / "tdd" / "SKILL.md").write_text("edited tdd\n")
+
+
+def test_adopt_killed_at_every_step_loses_nothing(run, killed, tmp_path, monkeypatch):
+    """Real SIGKILLs (no handler runs), then a retry of the same choices."""
+    index = 0
+    while True:
+        index += 1
+        home, respec_home = fresh_homes(tmp_path, monkeypatch, f"kill-adopt-{index}")
+        adopt_setup(run, home, respec_home)
+        args = ("adopt", "--add", "newone", "--add", "tdd", "--remove", "junk")
+        if not killed("#", index, *args):
+            break
+        data = payload(run("recover", "--json"))
+        (warning,) = interrupted_warnings(data)
+        assert warning["outcome"] in ("finished", "rolled-back")
+        for text in ("new content\n", "junk content\n", "edited tdd\n"):
+            assert found_with(home.parent, text), (index, text)
+        # Nothing left behind blocks the same choices for what still waits.
+        choices = {"newone": "--add", "tdd": "--add", "junk": "--remove"}
+        state = load_state(respec_home)
+        waiting = [e.name for e in unknown.find_unknown(respec_home, state)]
+        retry_args = [x for name in waiting for x in (choices[name], name)]
+        if retry_args:
+            retry = run("adopt", *retry_args)
+            assert retry.exit_code == 0, (index, retry.output)
+        skills = respec_home / "profiles" / "work" / "skills"
+        assert not list(skills.glob(".*.respec-*")), index
+        assert (skills / "tdd" / "SKILL.md").read_text() == "edited tdd\n", index
+        assert (skills / "newone" / "SKILL.md").read_text() == "new content\n"
+        assert found_with(respec_home / "backups", "junk content\n"), index
+    assert index > 8
+
+
+def test_staging_folders_of_a_cut_overwrite_are_set_aside_not_left_blocking(
+    run, isolated_homes
+):
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    adopt_setup(run, home, respec_home)
+    # As if killed inside the overwrite while the staged copy was being made.
+    from respec import adopt
+
+    staged = respec_home / "profiles" / "work" / "skills" / f".tdd{adopt.STAGED}"
+    state = load_state(respec_home)
+    state.journal = {
+        "operation": "adopt",
+        "started_at": "2026-11-10T00:00:00+00:00",
+        "profile": "work",
+        "pending": {
+            "step": "adopt",
+            "choice": "add",
+            "stage": "copy",
+            "path": str(home / ".claude" / "skills" / "tdd"),
+            "name": "tdd",
+            "profile": "work",
+            "overwrite": True,
+        },
+    }
+    from respec.state import save_state
+
+    save_state(respec_home, state)
+    staged.mkdir()
+    (staged / "SKILL.md").write_text("half")
+
+    data = payload(run("recover", "--json"))
+
+    (warning,) = interrupted_warnings(data)
+    assert warning["outcome"] == "rolled-back"
+    (moved,) = warning["set_aside"]
+    assert (Path(moved) / "SKILL.md").read_text() == "half"
+    assert not staged.exists()
+    assert run("adopt", "--add", "tdd").exit_code == 0
+
+
+def test_a_repair_cut_before_saving_profile_yaml_says_rolled_back(
+    run, isolated_homes, monkeypatch
+):
+    from respec import layers
+
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    make_profile(respec_home, "work", ["claude-code"], ["a", "b", "c"])
+    assert run("use", "work").exit_code == 0
+    path = respec_home / "profiles" / "work" / "profile.yaml"
+    data = yaml.safe_load(path.read_text())
+    data["layers"] = {"design-principles": {"skills": ["a", "b"]}}
+    path.write_text(yaml.safe_dump(data))
+    (home / ".claude" / "skills" / "c").unlink()
+    (home / ".claude" / "skills" / "c").mkdir()
+    crash_at(monkeypatch, 1)  # links:begin
+    with pytest.raises(Crash):
+        layers.repair(respec_home, home, "design-principles", keep="a")
+    no_faults(monkeypatch)
+
+    data = payload(run("recover", "--rollback", "--json"))
+
+    (warning,) = interrupted_warnings(data)
+    assert warning["outcome"] == "rolled-back"
+    assert "had not been changed" in warning["message"]
+    assert "finished" not in warning["message"].lower()
+
+
+def test_a_disable_killed_after_saving_profile_yaml_is_put_in_line(
+    run, killed, isolated_homes
+):
+    respec_home = isolated_homes.respec_home
+    make_profile(respec_home, "work", ["claude-code"], ["tdd", "lint"])
+    assert run("use", "work").exit_code == 0
+
+    assert killed("after-save-profile", 1, "disable", "lint")
+    data = payload(run("status", "--json"))
+    assert interrupted_warnings(data)[0]["outcome"] == "pending"
+    data = payload(run("recover", "--json"))
+
+    assert interrupted_warnings(data)[0]["outcome"] == "finished"
+    assert_consistent(respec_home, {"work": ["tdd"]})
+
+
+@pytest.mark.shipped
+def test_a_switch_cut_while_refreshing_shipped_skills_heals_them(
+    run, killed, isolated_homes
+):
+    from respec import global_skills
+
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    two_profiles(respec_home, home)
+    assert run("use", "a").exit_code == 0
+    shipped = global_skills.shipped_dir(respec_home) / "respec"
+    (shipped / "SKILL.md").write_text("outdated\n")
+    # Simulate the kill inside refresh_shipped: the old copy is gone and the
+    # staged one is half made, while the switch is still in 'prepare'.
+    import shutil
+
+    shutil.rmtree(shipped)
+    (shipped.parent / ".respec.new").mkdir()
+    state = load_state(respec_home)
+    state.journal = {
+        "operation": "use",
+        "started_at": "2026-11-10T00:00:00+00:00",
+        "profile": "b",
+        "previous": "a",
+        "phase": "prepare",
+    }
+    from respec.state import save_state
+
+    save_state(respec_home, state)
+
+    payload(run("recover", "--json"))
+
+    assert (shipped / "SKILL.md").is_file()
+    assert "outdated" not in (shipped / "SKILL.md").read_text()
+    link = home / ".claude" / "skills" / "respec"
+    assert (link / "SKILL.md").is_file()
+
+
+def test_restore_of_another_backup_waits_for_the_interrupted_one(
+    run, isolated_homes, monkeypatch
+):
+    from respec import restore
+
+    home, respec_home = isolated_homes.home, isolated_homes.respec_home
+    two_profiles(respec_home, home)
+    assert run("use", "a").exit_code == 0
+    crash_at(monkeypatch, 4)
+    with pytest.raises(Crash):
+        restore.restore(respec_home, home)
+    no_faults(monkeypatch)
+    other = next((respec_home / "backups").iterdir()).name
+
+    result = run("restore", other)
+
+    assert result.exit_code == 1
+    assert "interrupted restore" in result.output
+    assert load_state(respec_home).journal is not None
+
+
+def test_an_unknown_journal_can_be_discarded_with_rollback(run, isolated_homes):
+    respec_home = isolated_homes.respec_home
+    from respec.state import State, save_state
+
+    save_state(
+        respec_home,
+        State(journal={"operation": "teleport", "started_at": "then"}),
+    )
+
+    refused = run("recover", "--json")
+    assert refused.exit_code == 1
+    assert "--rollback" in json.loads(refused.stdout)["error"]
+
+    data = payload(run("recover", "--rollback", "--json"))
+
+    assert interrupted_warnings(data)[0]["outcome"] == "rolled-back"
+    assert load_state(respec_home).journal is None
+    assert payload(run("status", "--json"))["warnings"] == []

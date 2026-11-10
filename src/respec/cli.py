@@ -1240,10 +1240,11 @@ def restore(
             typer.echo(f"{entry.name}  {', '.join(entry.targets)}  {kind}".rstrip())
         return
     try:
-        waiting = journal.pending(homes.respec_home)
-        # Running the restore again finishes the interrupted one.
-        finished = waiting is not None and waiting.operation == "restore"
-        if finished:
+        state = load_state(homes.respec_home)
+        waiting = state.journal
+        # Running the same restore again finishes the interrupted one.
+        finished = waiting is not None and waiting.get("operation") == "restore"
+        if finished and _check_same_restore(homes, waiting, backup):
             journal.recover(homes.respec_home, homes.user_home)
     except RespecError as error:
         _fail(error)
@@ -1325,6 +1326,26 @@ def restore(
     for path in result.left:
         typer.echo(f"Left {path} in place: hidden, not in the backup")
     typer.echo("respec released its folders; no profile is active.")
+
+
+def _check_same_restore(
+    homes: Homes, waiting: dict[str, Any], backup: str | None
+) -> bool:
+    """Refuse to start another restore while a different one is interrupted."""
+    pending_run = waiting.get("backup")
+    asked = (
+        Path(restore_backups.find_run(homes.respec_home, backup)).name
+        if backup is not None
+        else None
+    )
+    if asked != pending_run:
+        which = f"backup {pending_run!r}" if pending_run else "the takeover backups"
+        raise RespecError(
+            f"an interrupted restore of {which} waits; finish it first with "
+            "'respec recover' (or run that same restore again), then restore "
+            "another backup"
+        )
+    return True
 
 
 def _restore_payload(

@@ -286,14 +286,16 @@ def set_active(
     )
     if after != before:
         journal.ready(respec_home, user_home)
-        profiles.save_profile(after)
-        if change.active and not profiles.exclusivity_conflicts(after):
-            items.refresh_active(
-                respec_home,
-                user_home,
-                change,
-                lambda: profiles.restore_profile(before),
-            )
+        with items.journaled(respec_home, after, change.active):
+            profiles.save_profile(after)
+            journal.checkpoint("profile-saved")
+            if change.active and not profiles.exclusivity_conflicts(after):
+                items.refresh_active(
+                    respec_home,
+                    user_home,
+                    change,
+                    lambda: profiles.restore_profile(before),
+                )
     return change
 
 
@@ -365,7 +367,13 @@ def _repair_links(
     journal.ready(respec_home, user_home)
     state = load_state(respec_home)
     try:
-        with journal.begin(respec_home, "links", state=state, profile=after.name):
+        with journal.begin(
+            respec_home,
+            "links",
+            state=state,
+            profile=after.name,
+            profile_digest=journal.file_digest(after.path / profiles.PROFILE_FILE),
+        ):
             profiles.save_profile(after)
             journal.checkpoint("profile-saved")
             for item in list(state.installed):

@@ -122,3 +122,63 @@ def assert_no_nulls():
         return data
 
     return check
+
+
+# Runs the CLI in a child process that SIGKILLs itself at a step boundary:
+# ``point`` is a checkpoint name (killed at its ``nth`` pass), ``#`` (killed at
+# the ``nth`` checkpoint of any name) or ``after-save-profile`` (killed right
+# after the ``nth`` profile.yaml write). Nothing in the child handles the kill.
+KILL_SCRIPT = """
+import os, signal, sys
+from respec import global_skills, journal, profiles
+point, nth = sys.argv[1], int(sys.argv[2])
+if os.environ.get("RESPEC_TEST_NO_SHIPPED"):
+    global_skills.shipped_names = lambda: ()
+seen = []
+def die():
+    os.kill(os.getpid(), signal.SIGKILL)
+def fault(name):
+    seen.append(name)
+    if (point == "#" and len(seen) == nth) or (
+        name == point and seen.count(name) == nth
+    ):
+        die()
+journal._fault = fault
+if point == "after-save-profile":
+    real = profiles.save_profile
+    saved = []
+    def save(profile):
+        real(profile)
+        saved.append(profile)
+        if len(saved) == nth:
+            die()
+    profiles.save_profile = save
+from respec.cli import app
+app(sys.argv[3:])
+"""
+
+
+@pytest.fixture
+def killed(request):
+    """``killed(point, nth, *cli_args)``: run the CLI and kill it at ``point``;
+    returns False when the command finished before reaching it."""
+    import signal
+    import subprocess
+    import sys
+
+    def kill(point: str, nth: int, *args: str) -> bool:
+        env = os.environ.copy()  # read now: a test may move the homes
+        if request.node.get_closest_marker("shipped") is None:
+            env["RESPEC_TEST_NO_SHIPPED"] = "1"
+        done = subprocess.run(
+            [sys.executable, "-c", KILL_SCRIPT, point, str(nth), *args],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if done.returncode == -signal.SIGKILL:
+            return True
+        assert done.returncode in (0, 1), done.stdout + done.stderr
+        return False
+
+    return kill

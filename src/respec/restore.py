@@ -120,6 +120,11 @@ def list_backups(respec_home: Path) -> list[Backup]:
     return found
 
 
+def find_run(respec_home: Path, name: str) -> Path:
+    """The backup run named ``name`` (by name or path)."""
+    return _find_run(respec_home, name)
+
+
 def _find_run(respec_home: Path, name: str) -> Path:
     root = switch.backups_dir(respec_home)
     for run in list_backups(respec_home):

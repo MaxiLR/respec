@@ -43,6 +43,7 @@ from typing import Any
 import yaml
 
 from respec.errors import RespecError
+from respec.state import sync_folder, write_durably
 from respec.targets import known_names, registry
 
 PROFILE_FILE = "profile.yaml"
@@ -623,8 +624,9 @@ def _write(profile: Profile, text: str) -> None:
     """Write ``profile.yaml`` atomically, so a crash never truncates it."""
     file = profile.path / PROFILE_FILE
     temporary = file.with_name(f".{PROFILE_FILE}.tmp")
-    temporary.write_text(text, "utf-8")
+    write_durably(temporary, text)
     os.replace(temporary, file)
+    sync_folder(file.parent)
     _touched[(profile.path, profile.name)] = None
 
 
