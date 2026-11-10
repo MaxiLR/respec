@@ -361,3 +361,4 @@ Test-isolation requirements to pass on: autouse temp HOME/RESPEC_HOME fixture (0
 - Final reviewer 3 aca155d1364df2d33 and final verify ae4b6930b257c1667 dispatched on a530f42.
 - Final verify 2 (ae4b6930b257c1667): PASS at a530f42 (589 tests; gates; offline fresh clone green; CLI smoke incl. profile remove). Report runs/final-verify-2.md. Waiting on final review 3.
 - Final review 3 (aca155d1364df2d33): spec PASS (7/7 stories, exclusions respected, fix-10 amendment met), quality PASS, 589 tests, 0 blocking. N1 wording: SKILL.md omits warnings in profile remove failure JSON. Final gates GREEN at a530f42. Proceeding with /to-pr.
+- /to-pr: committed board records (2a1000b), pushed codex/respec-v1 via coding-setup git push, opened draft PR https://github.com/MaxiLR/respec/pull/1 (base main). Shipping evidence added to tickets 001-011. 012 parked, 013 pending engineer. Engineer readies/merges manually.
