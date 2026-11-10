@@ -503,3 +503,122 @@ def test_layer_on_is_refused_only_for_its_own_conflict(run, conflict, profiles_r
 
     assert "cannot turn layer 'design-principles' on" in result.output
     assert "(a, b)" in result.output
+
+
+# Review round 4 regressions.
+
+
+@pytest.fixture
+def two_targets(run, isolated_homes):
+    """Active profile 'two' on claude-code and agents, with a read-only
+    (empty) agents folder so a relink fails after claude-code is linked."""
+    agents = isolated_homes.home / ".agents" / "skills"
+    agents.mkdir(parents=True)
+    (isolated_homes.home / ".claude" / "skills").mkdir(parents=True)
+    ok(run("profile", "new", "two", "-t", "claude-code", "-t", "agents"))
+    ok(run("use", "two"))
+    agents.chmod(0o555)
+    yield isolated_homes.home / ".claude" / "skills"
+    agents.chmod(0o755)
+
+
+def find_text(root, text):
+    return [
+        path
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink() and text in path.read_text()
+    ]
+
+
+def test_adopt_relink_failing_partway_never_loses_the_content(
+    run, two_targets, profiles_root, isolated_homes, tmp_path
+):
+    foreign = two_targets / "foreign"
+    foreign.mkdir()
+    (foreign / "SKILL.md").write_text("precious\n")
+
+    result = fails(run("adopt", "--add", "foreign"))
+
+    assert "did not complete" in result.output
+    assert find_text(tmp_path, "precious"), "the adopted content was deleted"
+    # The original is back as a real folder with its content.
+    assert not foreign.is_symlink()
+    assert (foreign / "SKILL.md").read_text() == "precious\n"
+    state = json.loads((isolated_homes.respec_home / "state.json").read_text())
+    assert str(foreign) not in [item["path"] for item in state["installed"]]
+    assert "foreign" not in read_yaml(profiles_root, "two")["skills"]
+
+
+def test_adopt_refusal_says_cannot_adopt(run, conflict, claude_dir):
+    foreign = claude_dir / "foreign"
+    foreign.mkdir()
+    (foreign / "SKILL.md").write_text("# foreign\n")
+
+    result = fails(run("adopt", "--add", "foreign"))
+
+    assert "cannot adopt" in result.output
+    assert "cannot switch" not in result.output
+
+
+def test_adopt_failure_reports_backups_made_earlier(run, two_targets, isolated_homes):
+    stray = two_targets / "a-stray"
+    stray.mkdir()
+    (stray / "SKILL.md").write_text("# stray\n")
+    foreign = two_targets / "foreign"
+    foreign.mkdir()
+    (foreign / "SKILL.md").write_text("precious\n")
+
+    result = fails(run("adopt", "--backup", "a-stray", "--add", "foreign"))
+
+    assert str(stray) in result.output
+    assert "backups" in result.output
+
+
+def test_adopt_relink_failing_in_copy_mode_keeps_the_original_unmanaged(
+    run, two_targets, profiles_root, isolated_homes, monkeypatch
+):
+    import os
+
+    foreign = two_targets / "foreign"
+    foreign.mkdir()
+    (foreign / "SKILL.md").write_text("precious\n")
+
+    def no_symlinks(*args, **kwargs):
+        raise OSError("symlinks refused for the test")
+
+    monkeypatch.setattr(os, "symlink", no_symlinks)
+
+    fails(run("adopt", "--add", "foreign"))
+
+    assert not foreign.is_symlink()
+    assert (foreign / "SKILL.md").read_text() == "precious\n"
+    state = json.loads((isolated_homes.respec_home / "state.json").read_text())
+    # Not recorded as respec's, so the next switch never deletes it.
+    assert str(foreign) not in [item["path"] for item in state["installed"]]
+    assert "foreign" not in read_yaml(profiles_root, "two")["skills"]
+    assert not (profiles_root / "two" / "skills" / "foreign").exists()
+
+
+def test_adopt_keeps_the_copy_when_the_original_path_holds_something_else(
+    run, two_targets, profiles_root, monkeypatch
+):
+    from respec import switch
+
+    foreign = two_targets / "foreign"
+    foreign.mkdir()
+    (foreign / "SKILL.md").write_text("precious\n")
+
+    def occupy_then_fail(*args, **kwargs):
+        foreign.mkdir()
+        (foreign / "SKILL.md").write_text("someone else\n")
+        raise switch.SwitchBlocked("cannot switch: refused for the test")
+
+    monkeypatch.setattr(switch, "use", occupy_then_fail)
+
+    result = fails(run("adopt", "--add", "foreign"))
+
+    copy = profiles_root / "two" / "skills" / "foreign"
+    assert (copy / "SKILL.md").read_text() == "precious\n"
+    assert str(copy) in result.output
+    assert read_yaml(profiles_root, "two")["skills"]["foreign"] == {"enabled": True}
+    assert (foreign / "SKILL.md").read_text() == "someone else\n"

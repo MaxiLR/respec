@@ -12,11 +12,14 @@ Each entry gets one of three choices:
 
 An original is only removed after its copy (in a profile or in a backup) is
 complete, so nothing is lost. A symlink entry is removed by unlinking it; what
-it points to is never touched.
+it points to is never touched. If re-linking the active profile fails after an
+add, the entry is put back; its profile copy is deleted only once the original
+is verifiably restored, and is otherwise kept in the profile.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 from collections.abc import Callable
@@ -85,32 +88,85 @@ def _add(respec_home: Path, resolution: Resolution, profile_name: str | None) ->
     return profile
 
 
+def _put_back(resolution: Resolution, copy: Path) -> bool:
+    """Restore an added entry at its original path from the profile copy.
+
+    Returns True only when the original is verifiably back: the moved folder
+    itself, a folder with the same content, or the same symlink. Whatever
+    respec placed there (its link to the copy, or its copy of it) is replaced.
+    Anything else at the original path is left alone and False is returned,
+    so the caller keeps the copy.
+    """
+    original = Path(resolution.entry.path)
+    link = resolution.link
+    if not copy.is_dir() or copy.is_symlink():
+        return False
+    if os.path.lexists(original):
+        if original.is_symlink():
+            if original.resolve() != copy.resolve():
+                return False
+            original.unlink()  # respec's link to the copy
+        elif original.is_dir() and unknown.digest(original) == unknown.digest(copy):
+            if link is None:
+                return True  # respec's copy holds exactly the original content
+            shutil.rmtree(original)  # respec's copy; the content is in ``copy``
+        else:
+            return False
+    if link is not None:
+        os.symlink(link, original)
+        return original.is_symlink() and os.readlink(original) == link
+    shutil.move(str(copy), str(original))
+    return original.is_dir() and not original.is_symlink() and not copy.exists()
+
+
 def _undo_adds(
     respec_home: Path,
     before: profiles.Profile,
     state_before: State,
     adds: list[Resolution],
-) -> None:
-    """Put added entries back where they were; restore the profile file and
-    the ``state.json`` records of those entries."""
+) -> list[str]:
+    """Put added entries back where they were, never losing their content.
+
+    A profile copy is deleted only after :func:`_put_back` verified the
+    original is restored; otherwise the copy stays in the profile (listed and
+    enabled) and a note says where. Returns those notes.
+    """
+    notes: list[str] = []
+    restored: set[Path] = set()
+    kept: list[str] = []
     for resolution in adds:
-        original = Path(resolution.entry.path)
-        copy = before.path / profiles.SKILLS_DIR / resolution.entry.name
-        if not os.path.lexists(original):
-            if resolution.link is not None:
-                os.symlink(resolution.link, original)
-            else:
-                shutil.copytree(copy, original, symlinks=True)
-        shutil.rmtree(copy, ignore_errors=True)
-    profiles.restore_profile(before)
-    paths = {unknown.real(r.entry.path) for r in adds}
+        name = resolution.entry.name
+        copy = before.path / profiles.SKILLS_DIR / name
+        try:
+            back = _put_back(resolution, copy)
+        except (OSError, shutil.Error):
+            back = False
+        if back:
+            restored.add(unknown.real(resolution.entry.path))
+            if copy.exists() or copy.is_symlink():
+                shutil.rmtree(copy, ignore_errors=True)
+        else:
+            kept.append(name)
+            notes.append(
+                f"could not put {resolution.entry.path} back; its content is kept "
+                f"in profile {before.name!r} at {copy}"
+            )
+    if kept:
+        skills = dict(before.skills)
+        for name in kept:
+            skills[name] = profiles.SkillEntry(enabled=True)
+        profiles.save_profile(dataclasses.replace(before, skills=skills))
+    else:
+        profiles.restore_profile(before)
     state = load_state(respec_home)
-    present = {unknown.real(item.path) for item in state.installed}
+    state.installed = [
+        item for item in state.installed if unknown.real(item.path) not in restored
+    ]
     for item in state_before.installed:
-        key = unknown.real(item.path)
-        if key in paths and key not in present:
+        if unknown.real(item.path) in restored:
             state.installed.append(item)
     save_state(respec_home, state)
+    return notes
 
 
 def _backup(respec_home: Path, entry: unknown.Unknown, run_dir: Path) -> str:
@@ -198,7 +254,7 @@ def adopt(
         decide = lambda entry: choices[entry.path]  # noqa: E731
         if "add" in choices.values():
             before = profiles.load_profile(respec_home, active)
-            switch.refuse_layer_conflicts(before)
+            switch.refuse_layer_conflicts(before, "adopt into")
     state_before = load_state(respec_home)
     result.resolved = resolve(respec_home, entries, decide, profile_name, now)
     adds = [r for r in result.resolved if r.choice == "add" and r.profile == active]
@@ -208,9 +264,19 @@ def adopt(
             applied = switch.use(
                 respec_home, user_home, active, now=now, on_unknown=lambda e: None
             )
-        except RespecError:
-            _undo_adds(respec_home, before, state_before, adds)
-            raise
+        except RespecError as error:
+            notes = _undo_adds(respec_home, before, state_before, adds)
+            notes += [
+                f"{r.entry.path} was backed up to {r.backup} and removed earlier "
+                "in this run"
+                for r in result.resolved
+                if r.choice == "backup"
+            ]
+            if not notes:
+                raise
+            raise RespecError(
+                f"{error}\n" + "\n".join(f"  - {note}" for note in notes)
+            ) from None
         removed = {item.path for item in applied.removed}
         result.linked = sorted(
             item.path for item in applied.installed if item.path not in removed
