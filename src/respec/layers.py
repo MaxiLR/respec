@@ -264,10 +264,7 @@ def set_active(
     )
     problems = profiles.exclusivity_problems(after)
     if problems:
-        raise RespecError(
-            f"cannot turn layer {name!r} on: {problems[0]} "
-            "(disable the others first)"
-        )
+        raise RespecError(f"cannot turn layer {name!r} on: {problems[0]}")
     change = LayerChange(
         profile=before.name, layer=name, action="on" if active else "off"
     )
@@ -284,19 +281,19 @@ def repair(
 ) -> LayerChange:
     """Leave one enabled skill in an exclusive layer that has several.
 
-    The kept skill is ``keep``, else the answer of ``choose`` (given the
-    enabled skills in layer order), else the first enabled skill. The others
-    are disabled. Returns a change with ``action`` ``repair`` and ``skill`` set
-    to the kept skill, or ``nothing`` when the layer had no conflict.
+    Works whether the layer is on or off, so a layer that ``layer on`` refuses
+    can be repaired first. The kept skill is ``keep``, else the answer of
+    ``choose`` (given the enabled skills in layer order), else the first
+    enabled skill; the others are disabled. Returns a change with ``action``
+    ``repair``, or ``additive`` / ``nothing`` when there is nothing to repair.
     """
     before = _load(respec_home, profile_name)
-    _layer(before, name)
-    conflict = next(
-        (c for c in profiles.exclusivity_conflicts(before) if c.layer == name), None
-    )
-    if conflict is None:
+    layer = _layer(before, name)
+    if not layer.exclusive:
+        return LayerChange(profile=before.name, layer=name, action="additive")
+    enabled = profiles.enabled_members(before, name)
+    if len(enabled) < 2:
         return LayerChange(profile=before.name, layer=name, action="nothing")
-    enabled = list(conflict.skills)
     if keep is None and choose is not None:
         keep = choose(enabled)
     if keep is None:
@@ -306,14 +303,13 @@ def repair(
             f"cannot keep {keep!r}: the enabled skills of layer {name!r} are "
             f"{', '.join(enabled)}"
         )
-    after = profiles.with_enabled(before, [keep], True)
+    disabled = [skill for skill in enabled if skill != keep]
+    after = profiles.with_enabled(before, disabled, False)
     change = LayerChange(
         profile=before.name,
         layer=name,
         action="repair",
         skill=keep,
-        disabled=[skill for skill in enabled if skill != keep],
+        disabled=disabled,
     )
-    _apply(respec_home, user_home, before, after, change)
-    profiles.discard_warning(before.name, name)
-    return change
+    return _apply(respec_home, user_home, before, after, change)

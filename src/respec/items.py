@@ -161,9 +161,10 @@ def commit(
     after: profiles.Profile,
     change: SkillChange,
 ) -> None:
-    """Save ``after`` and refresh an active profile; restore ``before`` if refused."""
+    """Save ``after`` and refresh an active profile; if refused, put back the
+    exact file ``before`` was loaded from."""
     profiles.save_profile(after)
-    _refresh(respec_home, user_home, change, lambda: profiles.save_profile(before))
+    _refresh(respec_home, user_home, change, lambda: profiles.restore_profile(before))
 
 
 def add(
@@ -183,7 +184,7 @@ def add(
     )
 
     def undo() -> None:
-        profiles.save_profile(before)
+        profiles.restore_profile(before)
         shutil.rmtree(folder, ignore_errors=True)
 
     _refresh(respec_home, user_home, change, undo)
@@ -254,7 +255,9 @@ def remove(
     }
     profiles.save_profile(dataclasses.replace(profile, skills=skills, layers=layers))
     try:
-        _refresh(respec_home, user_home, change, lambda: profiles.save_profile(profile))
+        _refresh(
+            respec_home, user_home, change, lambda: profiles.restore_profile(profile)
+        )
     except switch.SwitchBlocked:
         raise
     except RespecError:

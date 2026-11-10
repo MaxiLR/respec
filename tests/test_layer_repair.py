@@ -311,3 +311,72 @@ def test_validation_messages_name_the_skills_key(run, work, profiles_root):
 
     assert "layers.design-principles.skills: 'zzz' is not a skill" in result.output
     assert "layers.review.skills must be a list" in result.output
+
+
+# Review round 1 regressions.
+
+
+def test_repair_fixes_an_inactive_exclusive_layer_that_layer_on_refuses(
+    run, work, profiles_root, claude_dir
+):
+    ok(run("layer", "off", "design-principles"))
+    ok(run("layer", "add-skill", "design-principles", "a"))
+    ok(run("layer", "add-skill", "design-principles", "b"))
+    refused = fails(run("layer", "on", "design-principles"))
+    assert "respec layer repair design-principles" in refused.output
+
+    result = ok(run("layer", "repair", "design-principles", "--keep", "b"))
+
+    assert "disabled 'a'" in result.stdout.lower()
+    assert enabled_skills(profiles_root) == {"b", "c"}
+    assert linked(claude_dir) == {"b", "c"}
+    ok(run("layer", "on", "design-principles"))
+
+
+def test_repair_of_additive_layer_says_nothing_to_repair_accurately(
+    run, work, profiles_root
+):
+    ok(run("layer", "add", "review", "--additive", "-d", "Review"))
+    ok(run("layer", "add-skill", "review", "a"))
+    ok(run("layer", "add-skill", "review", "b"))
+    before = read_yaml(profiles_root)
+
+    result = ok(run("layer", "repair", "review"))
+
+    assert "additive" in result.stdout
+    assert read_yaml(profiles_root) == before
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("disable", "a"),
+        ("layer", "off", "design-principles"),
+        ("layer", "use", "design-principles", "b"),
+    ],
+)
+def test_resolving_the_conflict_another_way_leaves_no_stale_warning(
+    run, conflict, command
+):
+    result = ok(run(*command, "--json"))
+
+    assert json.loads(result.stdout)["warnings"] == []
+    assert "warning" not in result.stderr
+
+
+def test_refused_change_restores_legacy_file_bytes(run, work, profiles_root):
+    data = read_yaml(profiles_root)
+    data["layers"] = {
+        "review": {"exclusive": False, "description": "Review", "items": ["a"]}
+    }
+    write_yaml(profiles_root, data)
+    file = profiles_root / "work" / "profile.yaml"
+    original = file.read_bytes()
+    claude_dir = profiles_root.parent.parent / "home" / ".claude" / "skills"
+    (claude_dir / "stray").mkdir()  # an unknown entry blocks the refresh
+
+    fails(run("layer", "add-skill", "review", "b"))
+    assert file.read_bytes() == original
+
+    fails(run("disable", "a"))
+    assert file.read_bytes() == original

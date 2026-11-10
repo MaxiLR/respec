@@ -144,6 +144,8 @@ class Profile:
     targets: list[str]
     skills: dict[str, SkillEntry] = field(default_factory=dict)
     layers: dict[str, Layer] = field(default_factory=builtin_layers)
+    # The exact text this profile was loaded from, for byte-exact rollback.
+    loaded_text: str | None = field(default=None, compare=False, repr=False)
 
     def to_yaml_data(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -198,17 +200,22 @@ class LayerConflict:
         }
 
 
+def enabled_members(profile: Profile, layer_name: str) -> list[str]:
+    """The enabled skills of a layer, in layer order."""
+    return [
+        skill
+        for skill in profile.layers[layer_name].items
+        if skill in profile.skills and profile.skills[skill].enabled
+    ]
+
+
 def exclusivity_conflicts(profile: Profile) -> list[LayerConflict]:
     """Active exclusive layers with more than one enabled skill."""
     conflicts: list[LayerConflict] = []
     for name, layer in profile.layers.items():
         if not (layer.exclusive and layer.active):
             continue
-        enabled = [
-            skill
-            for skill in layer.items
-            if skill in profile.skills and profile.skills[skill].enabled
-        ]
+        enabled = enabled_members(profile, name)
         if len(enabled) > 1:
             conflicts.append(LayerConflict(profile.name, name, tuple(enabled)))
     return conflicts
@@ -219,25 +226,31 @@ def exclusivity_problems(profile: Profile) -> list[str]:
     return [conflict.message for conflict in exclusivity_conflicts(profile)]
 
 
-# Conflicts seen by load_profile since the last take_warnings(), in load order.
-_warnings: dict[tuple[str, str], LayerConflict] = {}
-
-
-def take_warnings() -> list[LayerConflict]:
-    """Return and forget the conflicts recorded by :func:`load_profile`."""
-    found = list(_warnings.values())
-    _warnings.clear()
-    return found
+# Profiles read by load_profile since the last take_warnings(), in load order.
+_loaded: dict[tuple[Path, str], None] = {}
 
 
 def peek_warnings() -> list[LayerConflict]:
-    """The recorded conflicts, without forgetting them."""
-    return list(_warnings.values())
+    """Conflicts of every profile loaded so far, as the profiles are now.
+
+    Each profile is read again, so a command that fixed (or caused) a conflict
+    reports the state it left behind. Profiles that no longer load are skipped.
+    """
+    found: list[LayerConflict] = []
+    for respec_home, name in _loaded:
+        try:
+            profile = _read_profile(respec_home, name)
+        except RespecError:
+            continue
+        found.extend(exclusivity_conflicts(profile))
+    return found
 
 
-def discard_warning(profile: str, layer: str) -> None:
-    """Forget a recorded conflict once it has been repaired."""
-    _warnings.pop((profile, layer), None)
+def take_warnings() -> list[LayerConflict]:
+    """:func:`peek_warnings`, then forget which profiles were loaded."""
+    found = peek_warnings()
+    _loaded.clear()
+    return found
 
 
 def with_enabled(profile: Profile, items: list[str], enabled: bool) -> Profile:
@@ -554,6 +567,13 @@ def parse_profile(name: str, folder: Path, data: Any) -> Profile:
 
 
 def load_profile(respec_home: Path, name: str) -> Profile:
+    """Read and validate a profile; its layer conflicts become warnings."""
+    profile = _read_profile(respec_home, name)
+    _loaded[(respec_home, name)] = None
+    return profile
+
+
+def _read_profile(respec_home: Path, name: str) -> Profile:
     validate_name(name)
     folder = profiles_dir(respec_home) / name
     file = folder / PROFILE_FILE
@@ -564,14 +584,12 @@ def load_profile(respec_home: Path, name: str) -> Profile:
         )
     if not file.is_file():
         raise ProfileError(file, [f"{PROFILE_FILE} is missing"])
+    text = file.read_text("utf-8")
     try:
-        data = yaml.safe_load(file.read_text("utf-8"))
+        data = yaml.safe_load(text)
     except yaml.YAMLError as error:
         raise ProfileError(file, [f"not valid YAML: {error}"]) from None
-    profile = parse_profile(name, folder, data)
-    for conflict in exclusivity_conflicts(profile):
-        _warnings[(conflict.profile, conflict.layer)] = conflict
-    return profile
+    return replace(parse_profile(name, folder, data), loaded_text=text)
 
 
 def list_profile_names(respec_home: Path) -> list[str]:
@@ -607,4 +625,15 @@ def save_profile(profile: Profile) -> None:
     temporary = file.with_name(f".{PROFILE_FILE}.tmp")
     text = yaml.safe_dump(profile.to_yaml_data(), sort_keys=False)
     temporary.write_text(text, "utf-8")
+    os.replace(temporary, file)
+
+
+def restore_profile(profile: Profile) -> None:
+    """Undo a save: write back the exact text ``profile`` was loaded from."""
+    if profile.loaded_text is None:
+        save_profile(profile)
+        return
+    file = profile.path / PROFILE_FILE
+    temporary = file.with_name(f".{PROFILE_FILE}.tmp")
+    temporary.write_text(profile.loaded_text, "utf-8")
     os.replace(temporary, file)

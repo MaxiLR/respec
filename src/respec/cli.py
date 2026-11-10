@@ -39,6 +39,7 @@ class Homes:
 def main(ctx: typer.Context) -> None:
     ctx.obj = Homes(respec_home=paths.respec_home(), user_home=paths.user_home())
     profiles.take_warnings()  # start clean; one process may run several commands
+    _failure.clear()
     ctx.call_on_close(_print_warnings)
     if ctx.invoked_subcommand is None:
         if not _interactive():
@@ -71,23 +72,31 @@ def _homes(ctx: typer.Context) -> Homes:
     return ctx.find_root().obj
 
 
+# Error text already printed by _fail; conflicts it explains are not repeated.
+_failure: list[str] = []
+
+
 def _print_warnings() -> None:
-    """Print each layer conflict seen while loading profiles to stderr."""
+    """Print the layer conflicts of every profile the command read, as left."""
+    explained = "\n".join(_failure)
+    _failure.clear()
     for conflict in profiles.take_warnings():
-        typer.echo(f"warning: {conflict.message}", err=True)
+        if conflict.message not in explained:
+            typer.echo(f"warning: {conflict.message}", err=True)
 
 
 def _fail(error: RespecError) -> NoReturn:
-    # A conflict the error already explains is not repeated as a warning.
-    for conflict in profiles.peek_warnings():
-        if conflict.message in str(error):
-            profiles.discard_warning(conflict.profile, conflict.layer)
+    _failure.append(str(error))
     typer.echo(f"error: {error}", err=True)
     raise typer.Exit(code=1)
 
 
 def _print_json(data: Any) -> None:
-    """Print ``data``; an object also carries the layer conflicts as warnings."""
+    """Print ``data``; an object always carries a ``warnings`` list.
+
+    ``warnings`` holds the layer conflicts of every profile the command read,
+    as the command left them (empty when there are none).
+    """
     if isinstance(data, dict):
         warnings = [conflict.to_dict() for conflict in profiles.peek_warnings()]
         data = {**data, "warnings": warnings}
@@ -543,6 +552,7 @@ def _report_layer_change(change: layers.LayerChange, as_json: bool) -> None:
         "off": f"Turned off {where}; its rules no longer apply",
         "repair": f"Repaired {where}: kept {change.skill!r}",
         "nothing": f"Nothing to repair in {where}: at most one skill is enabled",
+        "additive": f"Nothing to repair in {where}: it is additive",
     }
     typer.echo(messages[change.action])
     for skill in change.disabled:
